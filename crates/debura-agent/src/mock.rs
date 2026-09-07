@@ -6,14 +6,22 @@
 
 use anyhow::Result;
 
+use crate::challenge::{ChallengeHypothesisTask, ChallengeResult};
+use crate::resolution::{Resolution, ResolutionResult, ResolveContradictionTask};
 use crate::result::{InvestigationResult, ProposedHypothesis};
 use crate::task::AnalyzeFunctionTask;
 use crate::AgentProvider;
 
-/// Proposes `semantic_role = <name>` at low confidence, using whatever
-/// name Ghidra already assigned (the task's `has_name` observation). Useful
-/// only for exercising the harness's plumbing end-to-end -- it doesn't
-/// interpret anything, it just echoes back a fact that's already known.
+/// For AnalyzeFunction, proposes `semantic_role = <name>` at low confidence
+/// using whatever name Ghidra already assigned -- useful only for
+/// exercising the harness's plumbing, since it doesn't interpret anything.
+///
+/// For ChallengeHypothesis and ResolveContradiction it makes no real
+/// judgment at all: it reports "nothing found" and "survives unchanged"
+/// respectively. A hypothesis can therefore be marked as *having gone
+/// through* verification via this provider, but will never be genuinely
+/// scrutinized by it -- that's the honest line between "the plumbing
+/// works" and "the reasoning is real."
 pub struct EchoProvider;
 
 impl AgentProvider for EchoProvider {
@@ -40,6 +48,22 @@ impl AgentProvider for EchoProvider {
                 depends_on: Vec::new(),
             }],
             ..Default::default()
+        })
+    }
+
+    fn challenge(&self, _task: &ChallengeHypothesisTask) -> Result<ChallengeResult> {
+        Ok(ChallengeResult {
+            reasoning: "EchoProvider performs no real adversarial reasoning".to_string(),
+            ..Default::default()
+        })
+    }
+
+    fn resolve_contradiction(&self, task: &ResolveContradictionTask) -> Result<ResolutionResult> {
+        Ok(ResolutionResult {
+            resolution: Resolution::Survives {
+                confidence: task.hypothesis.confidence,
+            },
+            reasoning: "EchoProvider performs no real adversarial reasoning".to_string(),
         })
     }
 }

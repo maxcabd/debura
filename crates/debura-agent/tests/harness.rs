@@ -1,18 +1,37 @@
 use debura_agent::{
-    analyze_function, mock::EchoProvider, AgentProvider, AnalyzeFunctionTask, ConfidenceUpdate,
-    InvestigationResult, ProposedContradiction, ProposedHypothesis, ProposedObservation,
+    analyze_function, mock::EchoProvider, AgentProvider, AnalyzeFunctionTask,
+    ChallengeHypothesisTask, ChallengeResult, ConfidenceUpdate, InvestigationResult,
+    ProposedContradiction, ProposedHypothesis, ProposedObservation, Resolution, ResolutionResult,
+    ResolveContradictionTask,
 };
 use debura_knowledge::{HypothesisId, HypothesisStatus, KnowledgeGraph};
 
-/// A provider that always returns a fixed, caller-supplied result --
-/// standing in for whatever a real provider might say, so the harness's
-/// commit/validation logic can be tested independently of any actual
-/// reasoning.
+/// A provider that always returns a fixed, caller-supplied AnalyzeFunction
+/// result -- standing in for whatever a real provider might say, so the
+/// harness's commit/validation logic can be tested independently of any
+/// actual reasoning. challenge/resolve_contradiction aren't exercised by
+/// these tests (that's debura-verifier's job) so they're neutral no-ops.
 struct ScriptedProvider(InvestigationResult);
 
 impl AgentProvider for ScriptedProvider {
     fn investigate(&self, _task: &AnalyzeFunctionTask) -> anyhow::Result<InvestigationResult> {
         Ok(self.0.clone())
+    }
+
+    fn challenge(&self, _task: &ChallengeHypothesisTask) -> anyhow::Result<ChallengeResult> {
+        Ok(ChallengeResult::default())
+    }
+
+    fn resolve_contradiction(
+        &self,
+        task: &ResolveContradictionTask,
+    ) -> anyhow::Result<ResolutionResult> {
+        Ok(ResolutionResult {
+            resolution: Resolution::Survives {
+                confidence: task.hypothesis.confidence,
+            },
+            reasoning: String::new(),
+        })
     }
 }
 

@@ -1,8 +1,10 @@
 use chrono::Utc;
-use debura_knowledge::{DependencyKind, Investigation, InvestigationId, KnowledgeGraph};
+use debura_knowledge::{
+    DependencyKind, EvidenceId, HypothesisId, Investigation, InvestigationId, KnowledgeGraph,
+};
 
 use crate::provider::AgentProvider;
-use crate::result::InvestigationResult;
+use crate::result::{InvestigationResult, ProposedHypothesis};
 use crate::task::AnalyzeFunctionTask;
 
 /// Runs one bounded AnalyzeFunction investigation and commits whatever of
@@ -17,6 +19,73 @@ pub fn analyze_function(
     let task = AnalyzeFunctionTask::build(graph, subject);
     let result = provider.investigate(&task)?;
     Ok(commit(graph, &task, result))
+}
+
+/// Commits one proposed hypothesis onto `subject`, wiring any DEPENDS_ON
+/// edges it names. Shared by AnalyzeFunction's commit path and
+/// ChallengeHypothesis's "propose a better alternative" path (M5) so both
+/// validate dangling dependencies the same way.
+pub fn commit_hypothesis(
+    graph: &mut KnowledgeGraph,
+    subject: &str,
+    proposed: &ProposedHypothesis,
+    created_by: Option<InvestigationId>,
+) -> HypothesisId {
+    let id = graph.propose_hypothesis(
+        subject.to_string(),
+        proposed.predicate.clone(),
+        proposed.value.clone(),
+        proposed.confidence,
+        created_by,
+    );
+
+    for target in &proposed.depends_on {
+        if graph.hypothesis(*target).is_none() {
+            tracing::warn!(
+                hypothesis = %id,
+                missing = %target,
+                "dropping dependency on unknown hypothesis"
+            );
+            continue;
+        }
+        let _ = graph.add_dependency(id, *target, DependencyKind::DependsOn);
+    }
+
+    id
+}
+
+/// Turns a contradiction claim into a provenance-tracked Observation +
+/// Evidence pair (S7) and attaches it, moving `hypothesis` to CONTESTED
+/// (S4) -- rather than an untraceable side effect on its status. Shared by
+/// AnalyzeFunction's and ChallengeHypothesis's (M5) contradiction handling.
+/// Returns `None` (and logs) if `hypothesis` doesn't exist.
+pub fn commit_contradiction(
+    graph: &mut KnowledgeGraph,
+    hypothesis: HypothesisId,
+    reason: &str,
+    source: &str,
+) -> Option<EvidenceId> {
+    let Some(target) = graph.hypothesis(hypothesis) else {
+        tracing::warn!(%hypothesis, "contradiction against unknown hypothesis, skipping");
+        return None;
+    };
+    let subject = target.subject.clone();
+
+    let obs_id = graph.add_observation(
+        subject,
+        "agent_flagged_contradiction",
+        reason,
+        0.5,
+        source,
+        None,
+    );
+
+    let evidence_id = graph
+        .add_evidence(obs_id, reason, source, None, None)
+        .expect("observation was just created above");
+
+    let _ = graph.attach_contradicting_evidence(hypothesis, evidence_id);
+    Some(evidence_id)
 }
 
 /// PROJECT.md S11: "the harness validates this result before committing
@@ -65,26 +134,12 @@ fn commit(
 
     let mut hypotheses_created = Vec::new();
     for proposed in &result.hypotheses {
-        let id = graph.propose_hypothesis(
-            task.subject.clone(),
-            proposed.predicate.clone(),
-            proposed.value.clone(),
-            proposed.confidence,
+        hypotheses_created.push(commit_hypothesis(
+            graph,
+            &task.subject,
+            proposed,
             Some(investigation_id),
-        );
-        hypotheses_created.push(id);
-
-        for target in &proposed.depends_on {
-            if graph.hypothesis(*target).is_none() {
-                tracing::warn!(
-                    hypothesis = %id,
-                    missing = %target,
-                    "dropping dependency on unknown hypothesis"
-                );
-                continue;
-            }
-            let _ = graph.add_dependency(id, *target, DependencyKind::DependsOn);
-        }
+        ));
     }
 
     let mut hypotheses_modified = Vec::new();
@@ -102,40 +157,15 @@ fn commit(
 
     let mut evidence_created = Vec::new();
     for contradiction in &result.contradictions {
-        let Some(target) = graph.hypothesis(contradiction.hypothesis) else {
-            tracing::warn!(
-                hypothesis = %contradiction.hypothesis,
-                "contradiction against unknown hypothesis, skipping"
-            );
-            continue;
-        };
-
-        // The agent's own claim becomes a provenance-tracked Observation +
-        // Evidence pair (S7), not an untraceable side effect on the
-        // hypothesis's status.
-        let obs_id = graph.add_observation(
-            target.subject.clone(),
-            "agent_flagged_contradiction",
-            contradiction.reason.clone(),
-            0.5,
+        if let Some(evidence_id) = commit_contradiction(
+            graph,
+            contradiction.hypothesis,
+            &contradiction.reason,
             "agent:AnalyzeFunction",
-            None,
-        );
-        new_observations.push(obs_id);
-
-        let evidence_id = graph
-            .add_evidence(
-                obs_id,
-                contradiction.reason.clone(),
-                "agent:AnalyzeFunction",
-                None,
-                None,
-            )
-            .expect("observation was just created above");
-        evidence_created.push(evidence_id);
-
-        let _ = graph.attach_contradicting_evidence(contradiction.hypothesis, evidence_id);
-        hypotheses_modified.push(contradiction.hypothesis);
+        ) {
+            evidence_created.push(evidence_id);
+            hypotheses_modified.push(contradiction.hypothesis);
+        }
     }
 
     if let Some(investigation) = graph.investigation_mut(investigation_id) {
