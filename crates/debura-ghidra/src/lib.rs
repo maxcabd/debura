@@ -8,4 +8,7 @@ mod headless;
 pub mod model;
 
 pub use headless::analyze;
-pub use model::AnalysisResult;
+pub use model::{
+    AnalysisResult, ExportFact, FieldFact, FunctionFact, ImportFact, InheritanceFact, StringFact,
+    VirtualMethodFact, VtableFact, XrefFact,
+};
