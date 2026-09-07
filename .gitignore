@@ -2,5 +2,6 @@
 
 *.md
 !README.md
+!crates/debura-agent/skills/**/skill.md
 
 .env
