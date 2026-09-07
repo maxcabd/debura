@@ -37,6 +37,29 @@ fn runs_to_completion_with_the_echo_provider() {
     for h in graph.hypotheses() {
         assert!(h.last_verified_at.is_some());
     }
+    assert_eq!(summary.resolved_subjects, 2);
+    assert_eq!(summary.total_subjects, 2);
+}
+
+/// PROJECT.md M10: stop once enough of the binary is explained, instead
+/// of always grinding the queue to empty -- useful on a binary large
+/// enough that the last stragglers cost more than they're worth.
+#[test]
+fn coverage_target_stops_before_the_queue_empties() {
+    let mut graph = seeded_graph();
+    let budget = RunBudget {
+        coverage_target: Some(0.5),
+        ..Default::default()
+    };
+
+    let summary = run(&mut graph, &EchoProvider, &VerificationPolicy::default(), &budget, |_, _, _| {});
+
+    assert_eq!(summary.stopped_because, StopReason::CoverageReached);
+    // Full completion takes 4 iterations (see the unbounded test above);
+    // reaching 50% coverage (1 of 2 subjects resolved) must stop short of that.
+    assert!(summary.iterations < 4, "should stop once coverage is reached, not run to completion");
+    assert_eq!(summary.total_subjects, 2);
+    assert!(summary.resolved_subjects * 2 >= summary.total_subjects, "at least 50% must be resolved");
 }
 
 #[test]

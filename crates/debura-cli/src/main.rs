@@ -107,6 +107,11 @@ enum Command {
         /// provider reports usage yet)
         #[arg(long)]
         cost_budget: Option<f64>,
+        /// Stop once this fraction of seeded subjects (0.0-1.0) has
+        /// reached a settled state (accepted, or given up on after
+        /// max retries), even if tasks remain queued
+        #[arg(long)]
+        coverage_target: Option<f64>,
         /// How many tasks to run concurrently. Different subjects'/
         /// hypotheses' context never overlaps (PROJECT.md S23), so this is
         /// safe -- most of the wall-clock time with a real provider is
@@ -420,6 +425,7 @@ fn main() -> Result<()> {
             time_budget,
             token_budget,
             cost_budget,
+            coverage_target,
             concurrency,
         } => {
             let root = debura_core::config::projects_dir().join(&project);
@@ -434,6 +440,7 @@ fn main() -> Result<()> {
                 time_budget: time_budget.map(std::time::Duration::from_secs),
                 token_budget,
                 cost_budget,
+                coverage_target,
             };
 
             println!("Project: {project} (concurrency {concurrency})\n");
@@ -475,6 +482,14 @@ fn main() -> Result<()> {
                 );
             }
             println!("Stopped:    {:?}", summary.stopped_because);
+            if summary.total_subjects > 0 {
+                println!(
+                    "Coverage:   {}/{} ({:.1}%)",
+                    summary.resolved_subjects,
+                    summary.total_subjects,
+                    100.0 * summary.resolved_subjects as f64 / summary.total_subjects as f64
+                );
+            }
             println!("Hypotheses: {}", graph.hypotheses().count());
             for status in [
                 debura_knowledge::HypothesisStatus::Accepted,

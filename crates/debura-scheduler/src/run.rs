@@ -27,6 +27,62 @@ fn analysis_attempt_count(graph: &KnowledgeGraph, subject: &str) -> usize {
         .count()
 }
 
+/// A subject the scheduler has no more automatic work queued for right
+/// now: it has an ACCEPTED hypothesis (regardless of any other sibling's
+/// state), or every hypothesis on it has settled into a status the
+/// scheduler doesn't act on -- SUPPORTED, REJECTED, STALE, or a
+/// PROPOSED hypothesis that's already been through ChallengeHypothesis
+/// (`last_verified_at.is_some()`) but stayed PROPOSED because its
+/// confidence never reached `support_threshold` (M5's reevaluate_hypothesis)
+/// -- rather than one still awaiting a challenge/resolve step (an
+/// unverified PROPOSED, INVESTIGATING, or CONTESTED). A subject whose
+/// only hypothesis was *just* rejected and has a retry already queued
+/// for the next wave briefly counts as resolved here too -- it corrects
+/// itself once that retry's fresh hypothesis lands a wave later, so this
+/// is an approximate, reporting-grade signal, not a scheduler-state
+/// guarantee.
+fn is_resolved(graph: &KnowledgeGraph, subject: &str) -> bool {
+    let mut has_any = false;
+    let mut has_pending = false;
+    for h in graph.hypotheses().filter(|h| h.subject == subject) {
+        has_any = true;
+        if h.status == HypothesisStatus::Accepted {
+            return true;
+        }
+        let awaiting_first_challenge =
+            h.status == HypothesisStatus::Proposed && h.last_verified_at.is_none();
+        if awaiting_first_challenge
+            || matches!(h.status, HypothesisStatus::Investigating | HypothesisStatus::Contested)
+        {
+            has_pending = true;
+        }
+    }
+    has_any && !has_pending
+}
+
+/// `resolved`/`total` over every subject `seed_initial_tasks` proposed at
+/// the start of the run -- PROJECT.md M10's "how much of the binary did
+/// we actually explain," as an alternative to "is the queue empty" for
+/// deciding when a run has done enough. `total` is fixed at seed time
+/// (subjects already analyzed before this run started aren't included --
+/// same scope `seed_initial_tasks` itself uses); `resolved` is
+/// recomputed fresh each call.
+fn coverage(graph: &KnowledgeGraph, seeded_subjects: &[String]) -> (usize, usize) {
+    let resolved = seeded_subjects.iter().filter(|s| is_resolved(graph, s)).count();
+    (resolved, seeded_subjects.len())
+}
+
+fn seeded_subjects(graph: &KnowledgeGraph) -> Vec<String> {
+    seed_initial_tasks(graph)
+        .into_iter()
+        .map(|task| match task {
+            Task::AnalyzeFunction { subject } => subject,
+            // seed_initial_tasks only ever proposes AnalyzeFunction (seed.rs).
+            _ => unreachable!("seed_initial_tasks only produces AnalyzeFunction tasks"),
+        })
+        .collect()
+}
+
 /// After a ResolveContradiction, decide whether the (now REJECTED)
 /// subject is worth another AnalyzeFunction attempt. Shared by the
 /// sequential and parallel loops so the retry cap can't drift between them.
@@ -63,6 +119,12 @@ pub struct RunBudget {
     pub time_budget: Option<Duration>,
     pub token_budget: Option<u64>,
     pub cost_budget: Option<f64>,
+    /// Stop once `resolved/total` (see `coverage`) reaches this fraction,
+    /// even with tasks still queued -- trading completeness for cost on
+    /// a binary large enough that grinding out every last retry-capped
+    /// straggler isn't worth it. `None` means uncapped (today's
+    /// behavior: run to QueueEmpty or another budget).
+    pub coverage_target: Option<f64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,6 +132,7 @@ pub enum StopReason {
     QueueEmpty,
     MaxIterations,
     TimeBudget,
+    CoverageReached,
 }
 
 #[derive(Debug)]
@@ -81,6 +144,13 @@ pub struct RunSummary {
     /// reports usage yet), but it's the one cost dimension free to
     /// measure without provider cooperation.
     pub elapsed: Duration,
+    /// How many of `total_subjects` (everything seeded at the start of
+    /// this run) reached a state the scheduler considers settled (see
+    /// `is_resolved`), as of whenever the run stopped -- computed
+    /// regardless of *why* it stopped, so this is meaningful even for
+    /// `QueueEmpty` (should be 100%) as well as an early exit.
+    pub resolved_subjects: usize,
+    pub total_subjects: usize,
 }
 
 /// Runs the autonomous loop (PROJECT.md S24) until the task queue empties
@@ -104,9 +174,10 @@ pub fn run(
     budget: &RunBudget,
     mut on_iteration: impl FnMut(u64, &Task, &KnowledgeGraph),
 ) -> RunSummary {
+    let seeded = seeded_subjects(graph);
     let mut scheduler = Scheduler::new();
-    for task in seed_initial_tasks(graph) {
-        scheduler.enqueue(graph, task);
+    for subject in &seeded {
+        scheduler.enqueue(graph, Task::AnalyzeFunction { subject: subject.clone() });
     }
 
     let start = Instant::now();
@@ -118,6 +189,12 @@ pub fn run(
         }
         if budget.time_budget.is_some_and(|limit| start.elapsed() >= limit) {
             break StopReason::TimeBudget;
+        }
+        if budget
+            .coverage_target
+            .is_some_and(|target| coverage(graph, &seeded).0 as f64 / seeded.len().max(1) as f64 >= target)
+        {
+            break StopReason::CoverageReached;
         }
 
         let Some(task) = scheduler.pop() else {
@@ -132,10 +209,13 @@ pub fn run(
         on_iteration(iterations, &task, graph);
     };
 
+    let (resolved_subjects, total_subjects) = coverage(graph, &seeded);
     RunSummary {
         iterations,
         stopped_because,
         elapsed: start.elapsed(),
+        resolved_subjects,
+        total_subjects,
     }
 }
 
@@ -352,9 +432,10 @@ pub fn run_with_concurrency(
         .build()
         .expect("failed to build thread pool");
 
+    let seeded = seeded_subjects(graph);
     let mut scheduler = Scheduler::new();
-    for task in seed_initial_tasks(graph) {
-        scheduler.enqueue(graph, task);
+    for subject in &seeded {
+        scheduler.enqueue(graph, Task::AnalyzeFunction { subject: subject.clone() });
     }
 
     let start = Instant::now();
@@ -366,6 +447,12 @@ pub fn run_with_concurrency(
         }
         if budget.time_budget.is_some_and(|limit| start.elapsed() >= limit) {
             break StopReason::TimeBudget;
+        }
+        if budget
+            .coverage_target
+            .is_some_and(|target| coverage(graph, &seeded).0 as f64 / seeded.len().max(1) as f64 >= target)
+        {
+            break StopReason::CoverageReached;
         }
 
         let mut batch = Vec::new();
@@ -405,9 +492,12 @@ pub fn run_with_concurrency(
         }
     };
 
+    let (resolved_subjects, total_subjects) = coverage(graph, &seeded);
     RunSummary {
         iterations,
         stopped_because,
         elapsed: start.elapsed(),
+        resolved_subjects,
+        total_subjects,
     }
 }
