@@ -33,6 +33,15 @@ enum Command {
         /// Project id, as printed by `debura new`
         project: String,
     },
+    /// Run a bounded AnalyzeFunction investigation against one subject
+    /// (currently always via the deterministic mock provider -- no real
+    /// model is wired in yet)
+    Investigate {
+        /// Project id, as printed by `debura new`
+        project: String,
+        /// Subject address to investigate, e.g. 0x1400016e4
+        subject: String,
+    },
 }
 
 fn main() -> Result<()> {
@@ -111,6 +120,31 @@ fn main() -> Result<()> {
                 if count > 0 {
                     println!("  {status:?}: {count}");
                 }
+            }
+        }
+        Command::Investigate { project, subject } => {
+            let root = debura_core::config::projects_dir().join(&project);
+            anyhow::ensure!(root.is_dir(), "no such project: {project}");
+
+            let conn = debura_storage::init_project_db(&root.join("project.sqlite"))?;
+            let mut graph = debura_storage::knowledge::load(&conn)?;
+
+            let investigation_id =
+                debura_agent::analyze_function(&mut graph, &debura_agent::mock::EchoProvider, &subject)?;
+
+            debura_storage::knowledge::save(&conn, &graph)?;
+
+            let investigation = graph.investigation(investigation_id).unwrap();
+            println!("Investigation {investigation_id}\n");
+            println!("New hypotheses:  {}", investigation.hypotheses_created.len());
+            println!("Modified:        {}", investigation.hypotheses_modified.len());
+            println!("New evidence:    {}", investigation.evidence_created.len());
+            for id in &investigation.hypotheses_created {
+                let h = graph.hypothesis(*id).unwrap();
+                println!("\n  {id}: {} {} = {} (confidence {:.2}, {:?})", h.subject, h.predicate, h.value, h.confidence, h.status);
+            }
+            for task in &investigation.followup_tasks {
+                println!("\nFollow-up: {task}");
             }
         }
     }

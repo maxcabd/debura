@@ -13,6 +13,7 @@ debura-ghidra = { path = "../debura-ghidra" }
 debura-analysis = { path = "../debura-analysis" }
 debura-knowledge = { path = "../debura-knowledge" }
 debura-storage = { path = "../debura-storage" }
+debura-agent = { path = "../debura-agent" }
 clap.workspace = true
 anyhow.workspace = true
 serde_json.workspace = true
