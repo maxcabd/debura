@@ -114,6 +114,37 @@ pub enum Provenance {
 /// this needs no separate library-signature database. Returns 0.0 (never
 /// glue on this signal alone) for a subject with no recorded callees at
 /// all, rather than treating "nothing known" as "entirely library".
+///
+/// Known limitation, deliberately not fixed here (PROJECT.md M15): this
+/// only ever looks at each callee's own direct classification, one hop
+/// deep. A real run found the gap concretely: `formattedOutput` calls an
+/// address Ghidra named plain `operator<<` -- itself just a one-
+/// instruction thunk/trampoline to the *real* imported `operator<<` --
+/// which isn't reserved-identifier-shaped and isn't itself in the import
+/// table, so it reads as ordinary application code even though it's
+/// pure library glue one hop removed. Confirmed this is exactly what
+/// held `formattedOutput`'s ratio below `LIBRARY_GLUE_THRESHOLD` when it
+/// should have cleared it.
+///
+/// The right general fix, when this gets picked back up, is thunk
+/// *normalization* before classification runs at all, not a recursive
+/// classification walk (which would make this function's own behavior
+/// harder to reason about, and risks pulling arbitrarily distant/
+/// unrelated call chains into one subject's ratio): detect a thunk
+/// (a function whose entire body is a single tail call, structurally --
+/// the same shape Ghidra already marks with its own "indirect jump
+/// treated as call" warning), resolve it to its canonical target, and
+/// substitute that target everywhere the thunk would otherwise appear
+/// as a callee -- so `F -> thunk -> std::operator<<` collapses to
+/// `F -> std::operator<<` for every consumer of this classification,
+/// once, instead of teaching each consumer to chase through thunks
+/// itself. A narrow `operator<<`/`operator>>` name-based special case
+/// was considered and rejected: it would fix this one instance while
+/// accumulating exactly the kind of classifier-debt this module is
+/// trying to avoid (`operator=` is a real, application-authored method
+/// on `Drawable`/`Collideable` in the same binary, so name alone can't
+/// distinguish the thunk case from a genuine application operator
+/// overload -- only the thunk's own body shape can).
 pub fn library_callee_ratio(graph: &KnowledgeGraph, subject: &str) -> f64 {
     let callees: Vec<&str> = graph
         .observations()
