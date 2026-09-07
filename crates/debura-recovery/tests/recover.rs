@@ -405,6 +405,24 @@ fn a_base_constructor_call_after_local_declarations_is_still_found() {
     );
 }
 
+/// A real compile hit `*_refptr_...` (dereferencing the symbol directly)
+/// failing with "invalid type argument of unary '*'" against a plain
+/// byte declaration -- `_refptr_*` specifically means a synthesized
+/// pointer-to-a-relocated-global in Ghidra's own naming convention, so
+/// unlike `DAT_*`/`PTR_*` it needs to be declared as a pointer.
+#[test]
+fn refptr_symbols_are_declared_as_pointers_not_plain_bytes() {
+    let header = render_ghidra_symbols_header(&[
+        "DAT_140009070".to_string(),
+        "_refptr__ZN9SnakeGame6Screen7S_WIDTHE".to_string(),
+    ]);
+    assert!(header.contains("extern unsigned char DAT_140009070;"), "header:\n{header}");
+    assert!(
+        header.contains("extern unsigned char *_refptr__ZN9SnakeGame6Screen7S_WIDTHE;"),
+        "header:\n{header}"
+    );
+}
+
 /// A compact sanity check that the compat header actually declares what
 /// this session's real compile attempt against the Snake fixture showed
 /// was missing -- not exhaustive, just a guard against silently deleting
