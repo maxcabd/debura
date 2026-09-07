@@ -1,4 +1,4 @@
-use debura_knowledge::{HypothesisStatus, KnowledgeGraph};
+use crate::{HypothesisStatus, KnowledgeGraph};
 
 /// PROJECT.md M15: whether an ACCEPTED semantic_role hypothesis reflects
 /// real application logic, or is compiler/library machinery Debura merely
@@ -22,7 +22,11 @@ pub enum ClaimClass {
     LibraryOrCompiler,
 }
 
-fn is_reserved_identifier(name: &str) -> bool {
+/// Exposed directly (not just through `classify_subject`) for a caller
+/// that already has a name in hand -- e.g. debura-recovery excluding a
+/// class from the recovered C++ output by its own name, before there's
+/// any single subject address to look up.
+pub fn is_reserved_identifier(name: &str) -> bool {
     if name.contains("__") {
         return true;
     }

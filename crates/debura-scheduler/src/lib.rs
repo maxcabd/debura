@@ -5,7 +5,6 @@
 //! highest-priority task, enqueues whatever follows from it, and repeats
 //! until the queue empties or a budget trips.
 
-mod claims;
 mod fingerprint;
 mod priority;
 mod queue;
@@ -14,7 +13,10 @@ mod run;
 mod seed;
 mod task;
 
-pub use claims::{claim_breakdown, classify_subject, ClaimBreakdown, ClaimClass};
+// Re-exported for existing callers (the CLI's `stats` command) --
+// classification lives in debura-knowledge itself now so debura-recovery
+// can reuse it too, without an awkward recovery-depends-on-scheduler edge.
+pub use debura_knowledge::{claim_breakdown, classify_subject, ClaimBreakdown, ClaimClass};
 pub use fingerprint::fingerprint;
 pub use queue::Scheduler;
 pub use report::{investigation_report, InvestigationReport, TaskTypeStats};

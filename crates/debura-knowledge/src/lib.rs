@@ -4,6 +4,7 @@
 //! Everything here is in-memory hot state (PROJECT.md S16). SQLite backing
 //! for this graph is M3; the agent that actually populates it is M4.
 
+mod claims;
 mod dependency;
 mod error;
 mod evidence;
@@ -14,6 +15,7 @@ mod investigation;
 mod observation;
 mod program_model;
 
+pub use claims::{claim_breakdown, classify_subject, is_reserved_identifier, ClaimBreakdown, ClaimClass};
 pub use dependency::{Dependency, DependencyKind};
 pub use error::KnowledgeError;
 pub use evidence::Evidence;
