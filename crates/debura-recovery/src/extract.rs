@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use debura_knowledge::{
     classify_subject, is_reserved_identifier, ClaimClass, Hypothesis, HypothesisStatus,
@@ -250,11 +250,41 @@ fn identifier_tokens(s: &str) -> impl Iterator<Item = &str> {
 /// prefixes actually observed compiling the Snake fixture -- there are
 /// other Ghidra auto-name families (`UNK_`, `s_...` string labels) not
 /// included here since nothing yet demonstrated a real file needing them.
-const GHIDRA_DATA_SYMBOL_PREFIXES: &[&str] = &["DAT_", "PTR_", "_refptr_"];
+///
+/// `LAB_140001000` belongs here too, handled at the renderer level
+/// (PROJECT.md M15) rather than through the symbol table: a real run
+/// showed it isn't a goto target at all (that shape -- `goto LAB_x;`
+/// with a `LAB_x:` label already present in the same body -- was already
+/// valid C++ and needed no help) but the address of a *label* taken as a
+/// value (`(_invalid_parameter_handler)&LAB_140001000`, a real MinGW
+/// CRT startup idiom for registering an exception/parameter handler).
+/// C++ keeps goto-labels and ordinary identifiers in separate
+/// namespaces, so declaring `LAB_x` as an extern placeholder here can
+/// never collide with a real `LAB_x:` label statement elsewhere in the
+/// same function.
+const GHIDRA_DATA_SYMBOL_PREFIXES: &[&str] = &["DAT_", "PTR_", "_refptr_", "LAB_"];
 
 fn ghidra_data_symbol_tokens(text: &str) -> impl Iterator<Item = &str> {
     identifier_tokens(text)
         .filter(|token| GHIDRA_DATA_SYMBOL_PREFIXES.iter().any(|prefix| token.starts_with(prefix)))
+}
+
+/// Ghidra's own width-combining/splitting intrinsic names -- see
+/// `compat::render_ghidra_intrinsics` for what each family means.
+/// Recognized structurally (a known prefix followed by exactly two
+/// digits), the same reasoning as `ghidra_data_symbol_tokens`, so a new
+/// width pairing this project happens to need doesn't require touching
+/// this list at all.
+const GHIDRA_INTRINSIC_PREFIXES: &[&str] = &["CONCAT", "ZEXT", "SEXT", "SUB"];
+
+fn ghidra_intrinsic_tokens(text: &str) -> impl Iterator<Item = &str> {
+    identifier_tokens(text).filter(|token| {
+        GHIDRA_INTRINSIC_PREFIXES.iter().any(|prefix| {
+            token.strip_prefix(prefix).is_some_and(|rest| {
+                rest.len() == 2 && rest.chars().all(|c| c.is_ascii_digit())
+            })
+        })
+    })
 }
 
 /// Every other known class name `class` mentions in its own
@@ -311,6 +341,56 @@ fn find_function_references(functions: &[RecoveredFunction], class_names: &BTree
     refs.into_iter().collect()
 }
 
+/// PROJECT.md M15: two unrelated addresses independently earning the
+/// same generic mechanical_behavior-derived name (`invokeFunction`,
+/// `noOperation`) is common once naming leans conservative -- a real
+/// compile hit "redefinition" errors from exactly this, in
+/// `functions.cpp`'s single shared scope. Renaming only the ones that
+/// actually collide (same name *and* the same param list -- a genuine
+/// overload, with different params, is left alone) keeps an
+/// already-unique name untouched, only appending `_<address>` where two
+/// recovered symbols would otherwise conflict. Must run before the
+/// symbol table is built, so resolved call sites use the final,
+/// disambiguated name rather than the pre-rename one.
+fn disambiguate_function_names(functions: &mut [RecoveredFunction]) {
+    let mut counts: HashMap<(String, String), usize> = HashMap::new();
+    for f in functions.iter() {
+        *counts.entry((f.display_name.clone(), f.params.clone())).or_insert(0) += 1;
+    }
+    for f in functions.iter_mut() {
+        let key = (f.display_name.clone(), f.params.clone());
+        if counts[&key] > 1 {
+            let suffix = f.address.trim_start_matches("0x");
+            f.display_name = format!("{}_{}", f.display_name, suffix);
+        }
+    }
+}
+
+/// Same reasoning as `disambiguate_function_names`, scoped to one
+/// class's own methods instead of the whole program -- a plain (non-
+/// ctor/dtor) method name colliding with a sibling method's name and
+/// param list in the same class is the same kind of C++ redefinition.
+/// Constructors/destructors are skipped: their name is fixed by the
+/// language (the class's own name), not something this can rename, and
+/// genuine constructor overloading at different addresses is expected,
+/// not a bug.
+fn disambiguate_method_names(methods: &mut [RecoveredMethod]) {
+    let mut counts: HashMap<(String, String), usize> = HashMap::new();
+    for m in methods.iter().filter(|m| !m.is_constructor && !m.is_destructor) {
+        *counts.entry((m.display_name.clone(), m.params.clone())).or_insert(0) += 1;
+    }
+    for m in methods.iter_mut() {
+        if m.is_constructor || m.is_destructor {
+            continue;
+        }
+        let key = (m.display_name.clone(), m.params.clone());
+        if counts[&key] > 1 {
+            let suffix = m.address.trim_start_matches("0x");
+            m.display_name = format!("{}_{}", m.display_name, suffix);
+        }
+    }
+}
+
 /// Extracts everything Debura currently has grounds to recover (PROJECT.md
 /// M9): every class with a detected vtable (M7) *or* with at least one
 /// method/constructor/destructor of its own (a real class the binary
@@ -351,6 +431,9 @@ pub fn extract(graph: &KnowledgeGraph) -> RecoveredProgram {
 
     let mut classes: Vec<RecoveredClass> =
         class_names.iter().map(|name| build_class(graph, name)).collect();
+    for class in &mut classes {
+        disambiguate_method_names(&mut class.methods);
+    }
 
     // One entry per *subject*, not per hypothesis: several ACCEPTED
     // semantic_role hypotheses can exist for the same address (see
@@ -405,6 +488,7 @@ pub fn extract(graph: &KnowledgeGraph) -> RecoveredProgram {
         });
     }
     functions.sort_by(|a, b| a.address.cmp(&b.address));
+    disambiguate_function_names(&mut functions);
 
     // PROJECT.md M15: resolve every `FUN_<addr>`/`thunk_FUN_<addr>` call
     // site against the whole-program symbol table *before* anything else
@@ -432,13 +516,16 @@ pub fn extract(graph: &KnowledgeGraph) -> RecoveredProgram {
     let function_references = find_function_references(&functions, &class_names);
 
     let mut ghidra_data_symbols: BTreeSet<String> = BTreeSet::new();
+    let mut ghidra_intrinsics: BTreeSet<String> = BTreeSet::new();
     for class in &classes {
         for m in &class.methods {
             ghidra_data_symbols.extend(ghidra_data_symbol_tokens(&m.decompilation).map(str::to_string));
+            ghidra_intrinsics.extend(ghidra_intrinsic_tokens(&m.decompilation).map(str::to_string));
         }
     }
     for f in &functions {
         ghidra_data_symbols.extend(ghidra_data_symbol_tokens(&f.decompilation).map(str::to_string));
+        ghidra_intrinsics.extend(ghidra_intrinsic_tokens(&f.decompilation).map(str::to_string));
     }
 
     RecoveredProgram {
@@ -446,6 +533,7 @@ pub fn extract(graph: &KnowledgeGraph) -> RecoveredProgram {
         functions,
         function_references,
         ghidra_data_symbols: ghidra_data_symbols.into_iter().collect(),
+        ghidra_intrinsics: ghidra_intrinsics.into_iter().collect(),
         unresolved_calls: unresolved_calls.into_iter().collect(),
     }
 }

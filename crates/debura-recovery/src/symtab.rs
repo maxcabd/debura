@@ -31,6 +31,27 @@ pub struct RecoveredSymbol {
     /// class name itself for Constructor/Destructor (C++ doesn't let a
     /// constructor/destructor be named any other way).
     pub display_name: String,
+    /// How many arguments a call site naming this address should have,
+    /// counting the this/ptr argument Ghidra's own C-shaped call always
+    /// includes for Method/Constructor (0 for FreeFunction, which has no
+    /// such argument; always 1 for Destructor, which the language
+    /// guarantees takes no parameters of its own).
+    pub expected_args: usize,
+}
+
+/// Counts a recovered signature's own parameters -- `""`/`"void"` mean
+/// zero, matching how `parse_signature` already renders a no-argument
+/// C++ parameter list. A plain top-level comma count is enough here:
+/// unlike a call site's arguments (which can nest other calls needing
+/// balanced-paren-aware splitting), a *parameter list*'s own types don't
+/// contain call syntax.
+fn count_params(params: &str) -> usize {
+    let trimmed = params.trim();
+    if trimmed.is_empty() || trimmed == "void" {
+        0
+    } else {
+        trimmed.split(',').count()
+    }
 }
 
 pub type SymbolTable = HashMap<String, RecoveredSymbol>;
@@ -58,9 +79,14 @@ pub fn build_symbol_table(classes: &[RecoveredClass], functions: &[RecoveredFunc
             } else {
                 m.display_name.clone()
             };
+            // Destructors take no parameters of their own by language
+            // rule, regardless of what `m.params` says (Ghidra's own
+            // signature parsing doesn't specially distinguish them) --
+            // only the this/ptr argument is ever expected.
+            let expected_args = if m.is_destructor { 1 } else { count_params(&m.params) + 1 };
             table.insert(
                 m.address.clone(),
-                RecoveredSymbol { kind, owner: class.name.clone(), display_name },
+                RecoveredSymbol { kind, owner: class.name.clone(), display_name, expected_args },
             );
         }
     }
@@ -71,6 +97,7 @@ pub fn build_symbol_table(classes: &[RecoveredClass], functions: &[RecoveredFunc
                 kind: SymbolKind::FreeFunction,
                 owner: String::new(),
                 display_name: f.display_name.clone(),
+                expected_args: count_params(&f.params),
             },
         );
     }
@@ -225,7 +252,18 @@ pub fn rewrite_call_sites(text: &str, table: &SymbolTable, unresolved: &mut BTre
             .into_iter()
             .map(|a| rewrite_call_sites(a, table, unresolved))
             .collect();
-        match table.get(addr) {
+        // PROJECT.md M15: don't blindly forward Ghidra's raw argument
+        // count into a constructor/method call whose recovered
+        // declaration expects a different number -- an arity mismatch
+        // means the call site doesn't actually match this symbol as
+        // cleanly as its address alone suggested (an overload at a
+        // different address, a variadic-shaped call, or a genuinely
+        // wrong resolution), and rendering it anyway produces invalid
+        // C++ (or silently wrong C++, which is worse). Falling back to
+        // "unresolved" here is the conservative choice: a permissive
+        // fallback prototype that at least compiles beats confidently
+        // wrong or invalid call syntax.
+        match table.get(addr).filter(|sym| args.len() == sym.expected_args) {
             Some(sym) => match sym.kind {
                 SymbolKind::FreeFunction => {
                     out.push_str(&sym.display_name);
@@ -270,14 +308,20 @@ mod tests {
     use super::*;
     use crate::model::{NameSource, RecoveredField, RecoveredMethod};
 
-    fn method(address: &str, display_name: &str, is_constructor: bool, is_destructor: bool) -> RecoveredMethod {
+    fn method(
+        address: &str,
+        display_name: &str,
+        params: &str,
+        is_constructor: bool,
+        is_destructor: bool,
+    ) -> RecoveredMethod {
         RecoveredMethod {
             address: address.to_string(),
             raw_name: format!("FUN_{}", &address[2..]),
             display_name: display_name.to_string(),
             name_source: NameSource::Raw,
             return_type: "void".to_string(),
-            params: String::new(),
+            params: params.to_string(),
             is_constructor,
             is_destructor,
             decompilation: String::new(),
@@ -297,7 +341,7 @@ mod tests {
 
     #[test]
     fn constructor_call_becomes_placement_new() {
-        let classes = vec![class_with("Section", vec![method("0x1", "Section", true, false)])];
+        let classes = vec![class_with("Section", vec![method("0x1", "Section", "int,int", true, false)])];
         let table = build_symbol_table(&classes, &[]);
         let mut unresolved = BTreeSet::new();
 
@@ -308,7 +352,7 @@ mod tests {
 
     #[test]
     fn destructor_call_becomes_explicit_destructor_call() {
-        let classes = vec![class_with("Snake", vec![method("0x2", "Snake", false, true)])];
+        let classes = vec![class_with("Snake", vec![method("0x2", "Snake", "", false, true)])];
         let table = build_symbol_table(&classes, &[]);
         let mut unresolved = BTreeSet::new();
 
@@ -318,7 +362,7 @@ mod tests {
 
     #[test]
     fn method_call_dispatches_through_cast_this_pointer() {
-        let classes = vec![class_with("Snake", vec![method("0x3", "move", false, false)])];
+        let classes = vec![class_with("Snake", vec![method("0x3", "move", "int,int", false, false)])];
         let table = build_symbol_table(&classes, &[]);
         let mut unresolved = BTreeSet::new();
 
@@ -334,7 +378,7 @@ mod tests {
             display_name: "calculateOffset".to_string(),
             name_source: NameSource::Raw,
             return_type: "int".to_string(),
-            params: String::new(),
+            params: "int,int".to_string(),
             decompilation: String::new(),
         }];
         let table = build_symbol_table(&[], &functions);
@@ -342,6 +386,20 @@ mod tests {
 
         let rewritten = rewrite_call_sites("x = FUN_4(a,b);", &table, &mut unresolved);
         assert_eq!(rewritten, "x = calculateOffset(a,b);");
+    }
+
+    #[test]
+    fn arity_mismatch_falls_back_to_unresolved_instead_of_wrong_call() {
+        // Recovered signature says Section's constructor takes 2 ints,
+        // but this call site only supplies 1 -- don't render a
+        // confidently wrong `Section(1)`.
+        let classes = vec![class_with("Section", vec![method("0x1", "Section", "int,int", true, false)])];
+        let table = build_symbol_table(&classes, &[]);
+        let mut unresolved = BTreeSet::new();
+
+        let rewritten = rewrite_call_sites("FUN_1(this,1);", &table, &mut unresolved);
+        assert_eq!(rewritten, "FUN_1(this,1);");
+        assert!(unresolved.contains("FUN_1"));
     }
 
     #[test]
@@ -356,7 +414,7 @@ mod tests {
 
     #[test]
     fn nested_calls_and_multiple_call_sites_all_resolve() {
-        let classes = vec![class_with("Wall", vec![method("0x5", "draw", false, false)])];
+        let classes = vec![class_with("Wall", vec![method("0x5", "draw", "int,int", false, false)])];
         let table = build_symbol_table(&classes, &[]);
         let mut unresolved = BTreeSet::new();
 
