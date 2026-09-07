@@ -75,4 +75,8 @@ pub struct RecoveredFunction {
 pub struct RecoveredProgram {
     pub classes: Vec<RecoveredClass>,
     pub functions: Vec<RecoveredFunction>,
+    /// Ghidra's own auto-generated data-symbol names (`DAT_...`,
+    /// `PTR_...`, `_refptr_...`) referenced somewhere in a recovered
+    /// body but never declared anywhere else in the output.
+    pub ghidra_data_symbols: Vec<String>,
 }

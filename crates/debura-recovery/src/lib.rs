@@ -12,6 +12,7 @@ mod compat;
 mod extract;
 mod model;
 mod render;
+mod symbols;
 mod write;
 
 pub use compat::{GHIDRA_COMPAT_HEADER, GHIDRA_COMPAT_HEADER_NAME};
@@ -21,6 +22,7 @@ pub use model::{
     RecoveredProgram,
 };
 pub use render::{render_functions_source, render_header, render_source};
+pub use symbols::{render_ghidra_symbols_header, GHIDRA_SYMBOLS_HEADER_NAME};
 pub use write::{write_to_disk, RecoverySummary};
 
 use std::path::Path;

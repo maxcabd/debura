@@ -103,19 +103,39 @@ fn parse_signature(signature: &str, raw_name: &str) -> ParsedSignature {
     }
 }
 
-fn build_method(graph: &KnowledgeGraph, address: &str, is_constructor: bool, is_destructor: bool) -> Option<RecoveredMethod> {
+fn build_method(
+    graph: &KnowledgeGraph,
+    address: &str,
+    class_name: &str,
+    is_constructor: bool,
+    is_destructor: bool,
+) -> Option<RecoveredMethod> {
     let raw_name = latest(graph, address, "has_name")?.value.clone();
     let signature = latest(graph, address, "has_signature").map(|o| o.value.clone()).unwrap_or_default();
     let decompilation = latest(graph, address, "decompiles_to").map(|o| o.value.clone()).unwrap_or_default();
     let (display_name, name_source) = name_source(graph, address).unwrap_or_else(|| (raw_name.clone(), NameSource::Raw));
     let parsed = parse_signature(&signature, &raw_name);
 
+    // Itanium ABI's calling convention returns `this` in the return
+    // register for `operator=`, which Ghidra always decompiles as
+    // `return this;` -- but Ghidra can't tell a pointer return from a
+    // reference return apart at that level, so it leaves the return
+    // type as `undefined` (real compile hit exactly this: `undefined`
+    // can't hold a class pointer, `invalid conversion from 'Drawable*'
+    // to 'undefined'`). `ClassName *` matches what the body actually
+    // returns.
+    let return_type = if raw_name == "operator=" {
+        format!("{class_name} *")
+    } else {
+        parsed.return_type
+    };
+
     Some(RecoveredMethod {
         address: address.to_string(),
         raw_name,
         display_name,
         name_source,
-        return_type: parsed.return_type,
+        return_type,
         params: parsed.params,
         is_constructor,
         is_destructor,
@@ -192,7 +212,7 @@ fn build_class(graph: &KnowledgeGraph, name: &str) -> RecoveredClass {
 
     let methods = all_addresses
         .into_iter()
-        .filter_map(|addr| build_method(graph, addr, ctor_addresses.contains(addr), dtor_addresses.contains(addr)))
+        .filter_map(|addr| build_method(graph, addr, name, ctor_addresses.contains(addr), dtor_addresses.contains(addr)))
         .collect();
 
     RecoveredClass {
@@ -216,6 +236,22 @@ fn build_class(graph: &KnowledgeGraph, name: &str) -> RecoveredClass {
 fn identifier_tokens(s: &str) -> impl Iterator<Item = &str> {
     s.split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
         .filter(|t| !t.is_empty())
+}
+
+/// Ghidra's own auto-generated names for data it found referenced but
+/// couldn't otherwise identify -- `DAT_140009070` (an address holding a
+/// value, type unknown), `PTR_draw_140009a40` (an address holding a
+/// pointer, likely a vtable slot), `_refptr__ZN...E` (a reference thunk
+/// to a relocated global). None of these are declared anywhere in
+/// recovered output otherwise, so referencing one fails outright. Real
+/// prefixes actually observed compiling the Snake fixture -- there are
+/// other Ghidra auto-name families (`UNK_`, `s_...` string labels) not
+/// included here since nothing yet demonstrated a real file needing them.
+const GHIDRA_DATA_SYMBOL_PREFIXES: &[&str] = &["DAT_", "PTR_", "_refptr_"];
+
+fn ghidra_data_symbol_tokens(text: &str) -> impl Iterator<Item = &str> {
+    identifier_tokens(text)
+        .filter(|token| GHIDRA_DATA_SYMBOL_PREFIXES.iter().any(|prefix| token.starts_with(prefix)))
 }
 
 /// Every other known class name `class` mentions in its own
@@ -329,5 +365,19 @@ pub fn extract(graph: &KnowledgeGraph) -> RecoveredProgram {
     }
     functions.sort_by(|a, b| a.address.cmp(&b.address));
 
-    RecoveredProgram { classes, functions }
+    let mut ghidra_data_symbols: BTreeSet<String> = BTreeSet::new();
+    for class in &classes {
+        for m in &class.methods {
+            ghidra_data_symbols.extend(ghidra_data_symbol_tokens(&m.decompilation).map(str::to_string));
+        }
+    }
+    for f in &functions {
+        ghidra_data_symbols.extend(ghidra_data_symbol_tokens(&f.decompilation).map(str::to_string));
+    }
+
+    RecoveredProgram {
+        classes,
+        functions,
+        ghidra_data_symbols: ghidra_data_symbols.into_iter().collect(),
+    }
 }
