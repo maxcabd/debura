@@ -37,6 +37,18 @@ pub(crate) fn analyze_headless_binary() -> Result<PathBuf> {
     Ok(candidate)
 }
 
+/// `debura new` already creates an empty `ghidra/project/` directory
+/// (PROJECT.md S18's layout), so the directory existing is not evidence a
+/// Ghidra project actually lives there -- only the project file Ghidra
+/// itself creates on import is. A real bug (M10) checked directory
+/// existence alone and tried `-process` against an empty directory on
+/// every brand-new project.
+fn is_already_imported(ghidra_project_dir: &Path) -> bool {
+    ghidra_project_dir
+        .join(format!("{GHIDRA_PROJECT_NAME}.gpr"))
+        .is_file()
+}
+
 /// Runs headless Ghidra against `binary_path`, extracting deterministic
 /// facts (functions, strings, imports, exports, xrefs, decompilation) into
 /// `<project_root>/artifacts/analysis.json` (PROJECT.md S21, M1).
@@ -52,7 +64,7 @@ pub fn analyze(project_root: &Path, binary_path: &Path) -> Result<AnalysisResult
 
     let ghidra_dir = project_root.join("ghidra");
     let ghidra_project_dir = ghidra_dir.join("project");
-    let already_imported = ghidra_project_dir.is_dir();
+    let already_imported = is_already_imported(&ghidra_project_dir);
     fs::create_dir_all(&ghidra_project_dir)?;
 
     let scripts_dir = ghidra_dir.join("scripts");
@@ -179,4 +191,29 @@ pub fn reextract(project_root: &Path, binary_name: &str) -> Result<AnalysisResul
     tracing::info!(functions = result.functions.len(), "re-extraction complete");
 
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_project_directory_is_not_mistaken_for_an_imported_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let ghidra_project_dir = dir.path().join("ghidra").join("project");
+        // `debura new` creates exactly this: an empty directory, nothing else.
+        fs::create_dir_all(&ghidra_project_dir).unwrap();
+
+        assert!(!is_already_imported(&ghidra_project_dir));
+    }
+
+    #[test]
+    fn a_real_gpr_file_is_recognized_as_already_imported() {
+        let dir = tempfile::tempdir().unwrap();
+        let ghidra_project_dir = dir.path().join("ghidra").join("project");
+        fs::create_dir_all(&ghidra_project_dir).unwrap();
+        fs::write(ghidra_project_dir.join(format!("{GHIDRA_PROJECT_NAME}.gpr")), "").unwrap();
+
+        assert!(is_already_imported(&ghidra_project_dir));
+    }
 }
