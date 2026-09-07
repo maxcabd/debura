@@ -310,4 +310,60 @@ impl KnowledgeGraph {
                 .collect(),
         }
     }
+
+    // --- Iteration (for persistence / summaries) ----------------------------
+
+    pub fn observations(&self) -> impl Iterator<Item = &Observation> {
+        self.observations.values()
+    }
+
+    pub fn all_evidence(&self) -> impl Iterator<Item = &Evidence> {
+        self.evidence.values()
+    }
+
+    pub fn hypotheses(&self) -> impl Iterator<Item = &Hypothesis> {
+        self.hypotheses.values()
+    }
+
+    pub fn dependencies(&self) -> &[Dependency] {
+        &self.dependencies
+    }
+
+    // --- Restoration (for loading persisted state) --------------------------
+    //
+    // These bypass id generation and status-transition rules: they trust the
+    // caller (debura-storage, reading back exactly what was saved) rather
+    // than simulating new reasoning events. `add_*`/`set_*` above are for
+    // live operation; `insert_*` below are for reconstructing prior state.
+
+    pub fn insert_observation(&mut self, observation: Observation) {
+        self.next_observation_id = self.next_observation_id.max(observation.id.0);
+        self.observations.insert(observation.id, observation);
+    }
+
+    pub fn insert_evidence(&mut self, evidence: Evidence) {
+        self.next_evidence_id = self.next_evidence_id.max(evidence.id.0);
+        self.evidence.insert(evidence.id, evidence);
+    }
+
+    pub fn insert_hypothesis(&mut self, hypothesis: Hypothesis) {
+        self.next_hypothesis_id = self.next_hypothesis_id.max(hypothesis.id.0);
+        self.hypotheses.insert(hypothesis.id, hypothesis);
+    }
+
+    /// Restores a dependency edge, rebuilding the `dependents_of` index and
+    /// the owning hypothesis's `dependencies` list. Call only after all
+    /// hypotheses have been inserted.
+    pub fn insert_dependency(&mut self, dependency: Dependency) {
+        if dependency.kind == DependencyKind::DependsOn {
+            self.dependents_of
+                .entry(dependency.target)
+                .or_default()
+                .push(dependency.source);
+            if let Some(h) = self.hypotheses.get_mut(&dependency.source) {
+                h.dependencies.push(dependency.target);
+            }
+        }
+        self.dependencies.push(dependency);
+    }
 }
