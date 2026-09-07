@@ -19,7 +19,9 @@ pub mod mock;
 pub mod openai;
 
 pub use challenge::{ChallengeHypothesisTask, ChallengeResult};
-pub use harness::{analyze_function, commit_contradiction, commit_hypothesis};
+pub use harness::{
+    analyze_function, commit_contradiction, commit_hypothesis, commit_investigation, investigate,
+};
 pub use provider::AgentProvider;
 pub use resolution::{Resolution, ResolutionResult, ResolveContradictionTask};
 pub use result::{

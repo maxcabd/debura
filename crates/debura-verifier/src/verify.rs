@@ -2,7 +2,7 @@ use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use debura_agent::{
     commit_contradiction, commit_hypothesis, AgentProvider, ChallengeHypothesisTask,
-    Resolution, ResolveContradictionTask,
+    ChallengeResult, Resolution, ResolutionResult, ResolveContradictionTask,
 };
 use debura_knowledge::{
     DependencyKind, HypothesisId, HypothesisStatus, Investigation, InvestigationId, KnowledgeGraph,
@@ -11,18 +11,16 @@ use debura_knowledge::{
 use crate::policy::VerificationPolicy;
 use crate::reevaluate::reevaluate_hypothesis;
 
-/// PROJECT.md S12: actively try to falsify `hypothesis`. Always stamps
-/// `last_verified_at` when it finishes, regardless of verdict -- an
-/// attempt was made, which is what "verified" means for M5's acceptance
-/// gate. If a contradiction is found, CONTESTED wins over any confidence
-/// recommendation the challenger also returned; reaching ACCEPTED still
-/// requires clearing that via `resolve_contradiction`.
-pub fn challenge_hypothesis(
-    graph: &mut KnowledgeGraph,
+/// The non-mutating half of `challenge_hypothesis`: builds the task and
+/// calls the provider, touching the graph only through `&KnowledgeGraph`.
+/// Task context is always scoped to one hypothesis's own subject
+/// (PROJECT.md S23), so this is safe to run concurrently across different
+/// hypotheses (M10) -- only `commit_challenge` needs exclusive access.
+pub fn challenge(
+    graph: &KnowledgeGraph,
     provider: &dyn AgentProvider,
     hypothesis: HypothesisId,
-    policy: &VerificationPolicy,
-) -> Result<InvestigationId> {
+) -> Result<(ChallengeHypothesisTask, ChallengeResult)> {
     let target = graph
         .hypothesis(hypothesis)
         .with_context(|| format!("unknown hypothesis: {hypothesis}"))?
@@ -30,7 +28,18 @@ pub fn challenge_hypothesis(
 
     let task = ChallengeHypothesisTask::build(graph, &target);
     let result = provider.challenge(&task)?;
+    Ok((task, result))
+}
 
+/// The mutating half of `challenge_hypothesis` -- call with exclusive
+/// access after `challenge` returns (from any thread).
+pub fn commit_challenge(
+    graph: &mut KnowledgeGraph,
+    hypothesis: HypothesisId,
+    task: &ChallengeHypothesisTask,
+    result: ChallengeResult,
+    policy: &VerificationPolicy,
+) -> Result<InvestigationId> {
     let investigation_id = graph.record_investigation(Investigation {
         id: InvestigationId(0),
         task: "ChallengeHypothesis".to_string(),
@@ -61,7 +70,11 @@ pub fn challenge_hypothesis(
 
     let mut hypotheses_created = Vec::new();
     if let Some(alternative) = &result.alternative {
-        let alt_id = commit_hypothesis(graph, &target.subject, alternative, Some(investigation_id));
+        let subject = graph
+            .hypothesis(hypothesis)
+            .map(|h| h.subject.clone())
+            .unwrap_or_default();
+        let alt_id = commit_hypothesis(graph, &subject, alternative, Some(investigation_id));
         let _ = graph.add_dependency(alt_id, hypothesis, DependencyKind::Contradicts);
         reevaluate_hypothesis(graph, alt_id, policy);
         hypotheses_created.push(alt_id);
@@ -86,18 +99,29 @@ pub fn challenge_hypothesis(
     Ok(investigation_id)
 }
 
-/// PROJECT.md S28: given a CONTESTED hypothesis, decide whether the
-/// contradiction actually holds up. `Survives` clears CONTESTED and
-/// re-runs it through the same threshold logic as any other verification
-/// pass (S10) -- surviving a challenge doesn't mean ACCEPTED, it means
-/// eligible to be judged on confidence and verification like anything
-/// else. `Rejected` is terminal, same as everywhere else in the graph (S4).
-pub fn resolve_contradiction(
+/// PROJECT.md S12: actively try to falsify `hypothesis`. Always stamps
+/// `last_verified_at` when it finishes, regardless of verdict -- an
+/// attempt was made, which is what "verified" means for M5's acceptance
+/// gate. If a contradiction is found, CONTESTED wins over any confidence
+/// recommendation the challenger also returned; reaching ACCEPTED still
+/// requires clearing that via `resolve_contradiction`.
+pub fn challenge_hypothesis(
     graph: &mut KnowledgeGraph,
     provider: &dyn AgentProvider,
     hypothesis: HypothesisId,
     policy: &VerificationPolicy,
 ) -> Result<InvestigationId> {
+    let (task, result) = challenge(graph, provider, hypothesis)?;
+    commit_challenge(graph, hypothesis, &task, result, policy)
+}
+
+/// The non-mutating half of `resolve_contradiction`. See `challenge` --
+/// same shape, same concurrency guarantee.
+pub fn resolve(
+    graph: &KnowledgeGraph,
+    provider: &dyn AgentProvider,
+    hypothesis: HypothesisId,
+) -> Result<(ResolveContradictionTask, ResolutionResult)> {
     let target = graph
         .hypothesis(hypothesis)
         .with_context(|| format!("unknown hypothesis: {hypothesis}"))?
@@ -112,7 +136,18 @@ pub fn resolve_contradiction(
 
     let task = ResolveContradictionTask::build(graph, &target);
     let result = provider.resolve_contradiction(&task)?;
+    Ok((task, result))
+}
 
+/// The mutating half of `resolve_contradiction` -- call with exclusive
+/// access after `resolve` returns (from any thread).
+pub fn commit_resolution(
+    graph: &mut KnowledgeGraph,
+    hypothesis: HypothesisId,
+    task: &ResolveContradictionTask,
+    result: ResolutionResult,
+    policy: &VerificationPolicy,
+) -> Result<InvestigationId> {
     let investigation_id = graph.record_investigation(Investigation {
         id: InvestigationId(0),
         task: "ResolveContradiction".to_string(),
@@ -147,4 +182,20 @@ pub fn resolve_contradiction(
     }
 
     Ok(investigation_id)
+}
+
+/// PROJECT.md S28: given a CONTESTED hypothesis, decide whether the
+/// contradiction actually holds up. `Survives` clears CONTESTED and
+/// re-runs it through the same threshold logic as any other verification
+/// pass (S10) -- surviving a challenge doesn't mean ACCEPTED, it means
+/// eligible to be judged on confidence and verification like anything
+/// else. `Rejected` is terminal, same as everywhere else in the graph (S4).
+pub fn resolve_contradiction(
+    graph: &mut KnowledgeGraph,
+    provider: &dyn AgentProvider,
+    hypothesis: HypothesisId,
+    policy: &VerificationPolicy,
+) -> Result<InvestigationId> {
+    let (task, result) = resolve(graph, provider, hypothesis)?;
+    commit_resolution(graph, hypothesis, &task, result, policy)
 }

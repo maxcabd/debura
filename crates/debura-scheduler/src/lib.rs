@@ -12,6 +12,6 @@ mod seed;
 mod task;
 
 pub use queue::Scheduler;
-pub use run::{run, RunBudget, RunSummary, StopReason};
+pub use run::{run, run_with_concurrency, RunBudget, RunSummary, StopReason};
 pub use seed::seed_initial_tasks;
 pub use task::Task;

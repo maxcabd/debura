@@ -29,7 +29,7 @@ enum ProviderChoice {
     Openai,
 }
 
-fn make_provider(choice: ProviderChoice) -> Result<Box<dyn AgentProvider>> {
+fn make_provider(choice: ProviderChoice) -> Result<Box<dyn AgentProvider + Sync>> {
     Ok(match choice {
         ProviderChoice::Mock => Box::new(debura_agent::mock::EchoProvider),
         ProviderChoice::Openai => Box::new(debura_agent::openai::OpenAiProvider::from_env()?),
@@ -107,6 +107,12 @@ enum Command {
         /// provider reports usage yet)
         #[arg(long)]
         cost_budget: Option<f64>,
+        /// How many tasks to run concurrently. Different subjects'/
+        /// hypotheses' context never overlaps (PROJECT.md S23), so this is
+        /// safe -- most of the wall-clock time with a real provider is
+        /// network waiting, not computing, so this can exceed core count.
+        #[arg(long, default_value_t = 16)]
+        concurrency: usize,
     },
 }
 
@@ -414,6 +420,7 @@ fn main() -> Result<()> {
             time_budget,
             token_budget,
             cost_budget,
+            concurrency,
         } => {
             let root = debura_core::config::projects_dir().join(&project);
             anyhow::ensure!(root.is_dir(), "no such project: {project}");
@@ -429,20 +436,35 @@ fn main() -> Result<()> {
                 cost_budget,
             };
 
-            println!("Project: {project}\n");
+            println!("Project: {project} (concurrency {concurrency})\n");
 
-            let summary = debura_scheduler::run(
+            // A full checkpoint is a full-graph rewrite (M3); at the scale
+            // a real binary's function count reaches, doing that on every
+            // single committed result -- now arriving in bursts thanks to
+            // concurrency -- would trade the network bottleneck we just
+            // removed for an I/O one. Every 10th result plus a final
+            // checkpoint keeps the cost down without leaving much
+            // uncheckpointed work if the process is interrupted.
+            const CHECKPOINT_EVERY: u64 = 10;
+            let summary = debura_scheduler::run_with_concurrency(
                 &mut graph,
                 provider.as_ref(),
                 &debura_verifier::VerificationPolicy::default(),
                 &budget,
+                concurrency,
                 |iteration, task, graph| {
                     println!("[{iteration}] {task:?}");
-                    if let Err(error) = debura_storage::knowledge::save(&conn, graph) {
-                        tracing::warn!(%error, "failed to checkpoint after iteration");
+                    if iteration % CHECKPOINT_EVERY == 0 {
+                        if let Err(error) = debura_storage::knowledge::save(&conn, graph) {
+                            tracing::warn!(%error, "failed to checkpoint after iteration");
+                        }
                     }
                 },
             );
+
+            if let Err(error) = debura_storage::knowledge::save(&conn, &graph) {
+                tracing::warn!(%error, "failed to checkpoint after run completed");
+            }
 
             println!("\nIterations: {}", summary.iterations);
             println!("Stopped:    {:?}", summary.stopped_because);

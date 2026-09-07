@@ -16,9 +16,33 @@ pub fn analyze_function(
     provider: &dyn AgentProvider,
     subject: &str,
 ) -> anyhow::Result<InvestigationId> {
+    let (task, result) = investigate(graph, provider, subject);
+    Ok(commit_investigation(graph, &task, result?))
+}
+
+/// The non-mutating half of `analyze_function`: builds the task and calls
+/// the provider, touching the graph only through `&KnowledgeGraph`. Task
+/// context is always scoped to one subject's own data (PROJECT.md S23), so
+/// this is safe to run concurrently across different subjects (M10) --
+/// only `commit_investigation` needs exclusive access.
+pub fn investigate(
+    graph: &KnowledgeGraph,
+    provider: &dyn AgentProvider,
+    subject: &str,
+) -> (AnalyzeFunctionTask, anyhow::Result<InvestigationResult>) {
     let task = AnalyzeFunctionTask::build(graph, subject);
-    let result = provider.investigate(&task)?;
-    Ok(commit(graph, &task, result))
+    let result = provider.investigate(&task);
+    (task, result)
+}
+
+/// The mutating half of `analyze_function` -- call with exclusive access
+/// after `investigate` returns (from any thread).
+pub fn commit_investigation(
+    graph: &mut KnowledgeGraph,
+    task: &AnalyzeFunctionTask,
+    result: InvestigationResult,
+) -> InvestigationId {
+    commit(graph, task, result)
 }
 
 /// Commits one proposed hypothesis onto `subject`, wiring any DEPENDS_ON

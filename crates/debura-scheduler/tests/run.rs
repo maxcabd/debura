@@ -7,7 +7,7 @@ use debura_agent::{
     ResolveContradictionTask,
 };
 use debura_knowledge::{HypothesisStatus, KnowledgeGraph};
-use debura_scheduler::{run, RunBudget, StopReason};
+use debura_scheduler::{run, run_with_concurrency, RunBudget, StopReason};
 use debura_verifier::VerificationPolicy;
 
 fn seeded_graph() -> KnowledgeGraph {
@@ -199,4 +199,74 @@ fn retries_after_rejection_are_bounded_not_infinite() {
         .filter(|h| h.subject == "0x1" && h.status == HypothesisStatus::Rejected)
         .count();
     assert_eq!(rejected, 3, "every attempt's hypothesis was rejected");
+}
+
+/// The parallel loop (M10: real binaries are too big for one-at-a-time
+/// network round trips to be practical) must reach the same end state as
+/// the sequential one for the same provider -- concurrency changes wall
+/// clock time, not the outcome.
+#[test]
+fn parallel_run_reaches_the_same_outcome_as_sequential() {
+    let mut graph = seeded_graph();
+
+    let summary = run_with_concurrency(
+        &mut graph,
+        &EchoProvider,
+        &VerificationPolicy::default(),
+        &RunBudget::default(),
+        4,
+        |_, _, _| {},
+    );
+
+    assert_eq!(summary.stopped_because, StopReason::QueueEmpty);
+    assert_eq!(summary.iterations, 4);
+    assert_eq!(graph.hypotheses().count(), 2);
+    for h in graph.hypotheses() {
+        assert!(h.last_verified_at.is_some());
+    }
+}
+
+#[test]
+fn parallel_run_still_bounds_retries_after_rejection() {
+    let mut graph = seeded_graph();
+
+    let summary = run_with_concurrency(
+        &mut graph,
+        &NeverConverges,
+        &VerificationPolicy::default(),
+        &RunBudget::default(),
+        4,
+        |_, _, _| {},
+    );
+
+    assert_eq!(summary.stopped_because, StopReason::QueueEmpty);
+    // Two subjects this time (both seeded), same 3-attempt cap each.
+    for subject in ["0x1", "0x2"] {
+        let attempts = graph
+            .investigations()
+            .filter(|i| i.task == "AnalyzeFunction" && i.target == subject)
+            .count();
+        assert_eq!(attempts, 3, "must stop retrying after the bounded max");
+    }
+}
+
+#[test]
+fn parallel_run_respects_max_iterations() {
+    let mut graph = seeded_graph();
+    let budget = RunBudget {
+        max_iterations: Some(3),
+        ..Default::default()
+    };
+
+    let summary = run_with_concurrency(
+        &mut graph,
+        &EchoProvider,
+        &VerificationPolicy::default(),
+        &budget,
+        4,
+        |_, _, _| {},
+    );
+
+    assert_eq!(summary.stopped_because, StopReason::MaxIterations);
+    assert_eq!(summary.iterations, 3);
 }

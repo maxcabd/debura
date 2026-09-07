@@ -1,8 +1,13 @@
 use std::time::{Duration, Instant};
 
+use debura_agent::{
+    AnalyzeFunctionTask, ChallengeHypothesisTask, ChallengeResult, InvestigationResult,
+    ResolutionResult, ResolveContradictionTask,
+};
 use debura_agent::AgentProvider;
-use debura_knowledge::{HypothesisStatus, KnowledgeGraph};
+use debura_knowledge::{HypothesisId, HypothesisStatus, KnowledgeGraph};
 use debura_verifier::VerificationPolicy;
+use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
 use crate::queue::Scheduler;
 use crate::seed::seed_initial_tasks;
@@ -20,6 +25,31 @@ fn analysis_attempt_count(graph: &KnowledgeGraph, subject: &str) -> usize {
         .investigations()
         .filter(|i| i.task == "AnalyzeFunction" && i.target == subject)
         .count()
+}
+
+/// After a ResolveContradiction, decide whether the (now REJECTED)
+/// subject is worth another AnalyzeFunction attempt. Shared by the
+/// sequential and parallel loops so the retry cap can't drift between them.
+fn retry_after_rejection(graph: &KnowledgeGraph, hypothesis: HypothesisId) -> Vec<Task> {
+    let Some(h) = graph.hypothesis(hypothesis) else {
+        return Vec::new();
+    };
+    if h.status != HypothesisStatus::Rejected {
+        return Vec::new();
+    }
+    let subject = h.subject.clone();
+
+    let attempts = analysis_attempt_count(graph, &subject);
+    if attempts < MAX_ANALYSIS_ATTEMPTS {
+        vec![Task::AnalyzeFunction { subject }]
+    } else {
+        tracing::info!(
+            %subject,
+            attempts,
+            "giving up on subject after max AnalyzeFunction attempts"
+        );
+        Vec::new()
+    }
 }
 
 /// PROJECT.md M6's four stopping conditions. `token_budget`/`cost_budget`
@@ -49,11 +79,19 @@ pub struct RunSummary {
 }
 
 /// Runs the autonomous loop (PROJECT.md S24) until the task queue empties
-/// or a budget trips. Ghidra feedback (`ghidra.apply(...)` in S24's
-/// pseudocode) isn't wired in -- that arrives at M8. `on_iteration` is
-/// called after each task so the caller can checkpoint to storage and
-/// report progress without this crate knowing anything about SQLite or a
-/// terminal.
+/// or a budget trips, one task at a time. Ghidra feedback
+/// (`ghidra.apply(...)` in S24's pseudocode) isn't wired in -- that's M8,
+/// invoked separately via `debura apply`. `on_iteration` is called after
+/// each task so the caller can checkpoint to storage and report progress
+/// without this crate knowing anything about SQLite or a terminal.
+///
+/// For a large binary, most of the wall-clock time here is a real model
+/// waiting on a network round trip -- and different subjects'/hypotheses'
+/// task context is always scoped to their own data (PROJECT.md S23), so
+/// those round trips don't actually depend on each other. `run_with_concurrency`
+/// runs the same loop but overlaps that waiting across several tasks at
+/// once; use this one when strict single-task-at-a-time ordering matters
+/// more than throughput (e.g. tests).
 pub fn run(
     graph: &mut KnowledgeGraph,
     provider: &dyn AgentProvider,
@@ -157,33 +195,212 @@ fn execute(
         }
 
         Task::ResolveContradiction { hypothesis } => {
-            let subject = graph.hypothesis(*hypothesis).map(|h| h.subject.clone());
-
-            if let Err(error) =
-                debura_verifier::resolve_contradiction(graph, provider, *hypothesis, policy)
-            {
-                tracing::warn!(%hypothesis, %error, "ResolveContradiction failed");
-                return Vec::new();
-            }
-
-            let rejected = graph.hypothesis(*hypothesis).map(|h| h.status)
-                == Some(HypothesisStatus::Rejected);
-
-            let Some(subject) = subject.filter(|_| rejected) else {
-                return Vec::new();
-            };
-
-            let attempts = analysis_attempt_count(graph, &subject);
-            if attempts < MAX_ANALYSIS_ATTEMPTS {
-                vec![Task::AnalyzeFunction { subject }]
-            } else {
-                tracing::info!(
-                    %subject,
-                    attempts,
-                    "giving up on subject after max AnalyzeFunction attempts"
-                );
-                Vec::new()
+            match debura_verifier::resolve_contradiction(graph, provider, *hypothesis, policy) {
+                Ok(_) => retry_after_rejection(graph, *hypothesis),
+                Err(error) => {
+                    tracing::warn!(%hypothesis, %error, "ResolveContradiction failed");
+                    Vec::new()
+                }
             }
         }
+    }
+}
+
+/// The result of the non-mutating (build task + call provider) half of one
+/// task, computed off the main thread. Mirrors `Task`'s three variants.
+enum PendingOutcome {
+    AnalyzeFunction {
+        subject: String,
+        outcome: anyhow::Result<(AnalyzeFunctionTask, InvestigationResult)>,
+    },
+    ChallengeHypothesis {
+        hypothesis: HypothesisId,
+        outcome: anyhow::Result<(ChallengeHypothesisTask, ChallengeResult)>,
+    },
+    ResolveContradiction {
+        hypothesis: HypothesisId,
+        outcome: anyhow::Result<(ResolveContradictionTask, ResolutionResult)>,
+    },
+}
+
+fn resolve_one(
+    graph: &KnowledgeGraph,
+    provider: &(dyn AgentProvider + Sync),
+    task: &Task,
+) -> PendingOutcome {
+    match task {
+        Task::AnalyzeFunction { subject } => {
+            let (built, result) = debura_agent::investigate(graph, provider, subject);
+            PendingOutcome::AnalyzeFunction {
+                subject: subject.clone(),
+                outcome: result.map(|r| (built, r)),
+            }
+        }
+        Task::ChallengeHypothesis { hypothesis } => PendingOutcome::ChallengeHypothesis {
+            hypothesis: *hypothesis,
+            outcome: debura_verifier::challenge(graph, provider, *hypothesis),
+        },
+        Task::ResolveContradiction { hypothesis } => PendingOutcome::ResolveContradiction {
+            hypothesis: *hypothesis,
+            outcome: debura_verifier::resolve(graph, provider, *hypothesis),
+        },
+    }
+}
+
+/// The mutating half: commits whatever `resolve_one` produced. Always
+/// called on the main thread, one outcome at a time -- this is the only
+/// part of a wave that touches `&mut KnowledgeGraph`.
+fn commit_one(graph: &mut KnowledgeGraph, policy: &VerificationPolicy, outcome: PendingOutcome) -> Vec<Task> {
+    match outcome {
+        PendingOutcome::AnalyzeFunction { subject, outcome } => match outcome {
+            Ok((task, result)) => {
+                let investigation_id = debura_agent::commit_investigation(graph, &task, result);
+                let created = graph
+                    .investigation(investigation_id)
+                    .map(|i| i.hypotheses_created.clone())
+                    .unwrap_or_default();
+                for id in &created {
+                    debura_verifier::reevaluate_hypothesis(graph, *id, policy);
+                }
+                created
+                    .into_iter()
+                    .map(|hypothesis| Task::ChallengeHypothesis { hypothesis })
+                    .collect()
+            }
+            Err(error) => {
+                tracing::warn!(%subject, %error, "AnalyzeFunction failed");
+                Vec::new()
+            }
+        },
+
+        PendingOutcome::ChallengeHypothesis { hypothesis, outcome } => match outcome {
+            Ok((task, result)) => {
+                match debura_verifier::commit_challenge(graph, hypothesis, &task, result, policy) {
+                    Ok(investigation_id) => {
+                        let mut followups: Vec<Task> = graph
+                            .investigation(investigation_id)
+                            .map(|i| i.hypotheses_created.clone())
+                            .unwrap_or_default()
+                            .into_iter()
+                            .map(|alternative| Task::ChallengeHypothesis {
+                                hypothesis: alternative,
+                            })
+                            .collect();
+
+                        if graph.hypothesis(hypothesis).map(|h| h.status)
+                            == Some(HypothesisStatus::Contested)
+                        {
+                            followups.push(Task::ResolveContradiction { hypothesis });
+                        }
+                        followups
+                    }
+                    Err(error) => {
+                        tracing::warn!(%hypothesis, %error, "commit_challenge failed");
+                        Vec::new()
+                    }
+                }
+            }
+            Err(error) => {
+                tracing::warn!(%hypothesis, %error, "ChallengeHypothesis failed");
+                Vec::new()
+            }
+        },
+
+        PendingOutcome::ResolveContradiction { hypothesis, outcome } => match outcome {
+            Ok((task, result)) => {
+                match debura_verifier::commit_resolution(graph, hypothesis, &task, result, policy) {
+                    Ok(_) => retry_after_rejection(graph, hypothesis),
+                    Err(error) => {
+                        tracing::warn!(%hypothesis, %error, "commit_resolution failed");
+                        Vec::new()
+                    }
+                }
+            }
+            Err(error) => {
+                tracing::warn!(%hypothesis, %error, "ResolveContradiction failed");
+                Vec::new()
+            }
+        },
+    }
+}
+
+/// Same loop as `run`, but processes up to `concurrency` tasks per wave:
+/// building each task's context and calling the provider run in parallel
+/// (both touch the graph only through `&KnowledgeGraph` -- PROJECT.md S23
+/// guarantees task context never crosses subjects, so this never races),
+/// then every result in the wave is committed one at a time on the calling
+/// thread. Uses a dedicated thread pool sized for `concurrency` rather than
+/// rayon's CPU-count default, since the work here is waiting on network
+/// I/O, not computing -- there's no reason to cap it at core count.
+pub fn run_with_concurrency(
+    graph: &mut KnowledgeGraph,
+    provider: &(dyn AgentProvider + Sync),
+    policy: &VerificationPolicy,
+    budget: &RunBudget,
+    concurrency: usize,
+    mut on_iteration: impl FnMut(u64, &Task, &KnowledgeGraph),
+) -> RunSummary {
+    let concurrency = concurrency.max(1);
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(concurrency)
+        .build()
+        .expect("failed to build thread pool");
+
+    let mut scheduler = Scheduler::new();
+    for task in seed_initial_tasks(graph) {
+        scheduler.enqueue(graph, task);
+    }
+
+    let start = Instant::now();
+    let mut iterations = 0u64;
+
+    let stopped_because = loop {
+        if budget.max_iterations.is_some_and(|max| iterations >= max) {
+            break StopReason::MaxIterations;
+        }
+        if budget.time_budget.is_some_and(|limit| start.elapsed() >= limit) {
+            break StopReason::TimeBudget;
+        }
+
+        let mut batch = Vec::new();
+        while batch.len() < concurrency {
+            if budget
+                .max_iterations
+                .is_some_and(|max| iterations + batch.len() as u64 >= max)
+            {
+                break;
+            }
+            match scheduler.pop() {
+                Some(task) => batch.push(task),
+                None => break,
+            }
+        }
+        if batch.is_empty() {
+            break StopReason::QueueEmpty;
+        }
+
+        let graph_ref: &KnowledgeGraph = graph;
+        let outcomes: Vec<(Task, PendingOutcome)> = pool.install(|| {
+            batch
+                .into_par_iter()
+                .map(|task| {
+                    let outcome = resolve_one(graph_ref, provider, &task);
+                    (task, outcome)
+                })
+                .collect()
+        });
+
+        for (task, outcome) in outcomes {
+            for followup in commit_one(graph, policy, outcome) {
+                scheduler.enqueue(graph, followup);
+            }
+            iterations += 1;
+            on_iteration(iterations, &task, graph);
+        }
+    };
+
+    RunSummary {
+        iterations,
+        stopped_because,
     }
 }
