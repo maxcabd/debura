@@ -159,3 +159,51 @@ fn functions_without_an_accepted_hypothesis_are_not_recovered() {
     assert!(program.functions.is_empty());
     assert!(program.classes.is_empty());
 }
+
+/// A real run hit this: a retry after a *sibling* hypothesis (a
+/// different predicate from the same investigation) gets rejected
+/// re-runs AnalyzeFunction on the whole subject, and a fresh
+/// semantic_role proposal that re-confirms the same name is itself
+/// ACCEPTED again rather than replacing the earlier one -- so one
+/// subject ended up with three separate ACCEPTED semantic_role
+/// hypotheses, and each was rendered as its own function definition with
+/// the identical name. Not valid C++: only the latest should count.
+#[test]
+fn a_subject_with_several_accepted_semantic_role_hypotheses_recovers_once() {
+    let mut graph = KnowledgeGraph::new();
+    graph.add_observation("0x1bf2", "has_name", "processEvents", 0.95, "ghidra:function", None);
+
+    for _ in 0..3 {
+        let h = graph.propose_hypothesis("0x1bf2", "semantic_role", "processEvents", 0.95, None);
+        graph.mark_verified(h, Utc::now()).unwrap();
+        graph.set_status(h, HypothesisStatus::Accepted).unwrap();
+    }
+
+    let program = extract(&graph);
+    assert_eq!(program.functions.len(), 1, "one subject must recover to one function, not one per hypothesis");
+}
+
+/// The model is told to give semantic_role an identifier-style value,
+/// but nothing enforces that -- a real run had an ACCEPTED hypothesis
+/// whose value was a full sentence. Used as a C++ name that doesn't
+/// compile, so it must fall back to Ghidra's raw name instead, the same
+/// as having no accepted hypothesis at all.
+#[test]
+fn a_non_identifier_accepted_value_falls_back_to_the_raw_name() {
+    let mut graph = KnowledgeGraph::new();
+    graph.add_observation("0x1", "has_name", "FUN_drawtext", 0.95, "ghidra:function", None);
+    let h = graph.propose_hypothesis(
+        "0x1",
+        "semantic_role",
+        "draws text and other visual elements on a screen",
+        0.9,
+        None,
+    );
+    graph.mark_verified(h, Utc::now()).unwrap();
+    graph.set_status(h, HypothesisStatus::Accepted).unwrap();
+
+    let program = extract(&graph);
+    let function = program.functions.iter().find(|f| f.address == "0x1").unwrap();
+    assert_eq!(function.display_name, "FUN_drawtext");
+    assert!(matches!(function.name_source, NameSource::Raw));
+}

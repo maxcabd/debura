@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use debura_knowledge::{HypothesisStatus, KnowledgeGraph, Observation};
+use debura_knowledge::{Hypothesis, HypothesisStatus, KnowledgeGraph, Observation};
 
 use crate::model::{NameSource, RecoveredClass, RecoveredField, RecoveredFunction, RecoveredMethod, RecoveredProgram};
 
@@ -16,15 +16,40 @@ fn latest<'a>(graph: &'a KnowledgeGraph, subject: &str, predicate: &str) -> Opti
         .max_by_key(|o| o.id.0)
 }
 
-fn name_source(graph: &KnowledgeGraph, subject: &str) -> Option<(String, NameSource)> {
-    let accepted = graph
+/// The model is told to give `semantic_role` an identifier-style value,
+/// but nothing enforces that at the schema level -- a value like "perform
+/// graphical operations including drawing..." has been seen ACCEPTED in
+/// practice. Used directly as a C++ name, that doesn't compile, so it's
+/// treated the same as having no accepted hypothesis at all rather than
+/// emitted as-is.
+fn is_valid_cpp_identifier(s: &str) -> bool {
+    let mut chars = s.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// The single most-recently-ACCEPTED `semantic_role` hypothesis for
+/// `subject` with a usable value, if any. More than one can exist: a
+/// retry after a *sibling* hypothesis (a different predicate from the
+/// same investigation) gets rejected re-runs AnalyzeFunction on the whole
+/// subject, and a fresh `semantic_role` proposal that re-confirms the
+/// same name is itself accepted again rather than replacing the old one
+/// in place -- so only the latest counts as authoritative, matching
+/// every other "most recent observation wins" lookup in this crate.
+fn accepted_name<'a>(graph: &'a KnowledgeGraph, subject: &str) -> Option<&'a Hypothesis> {
+    graph
         .hypotheses()
         .filter(|h| {
-            h.subject == subject && h.predicate == "semantic_role" && h.status == HypothesisStatus::Accepted
+            h.subject == subject
+                && h.predicate == "semantic_role"
+                && h.status == HypothesisStatus::Accepted
+                && is_valid_cpp_identifier(&h.value)
         })
-        .max_by_key(|h| h.id.0);
+        .max_by_key(|h| h.id.0)
+}
 
-    if let Some(h) = accepted {
+fn name_source(graph: &KnowledgeGraph, subject: &str) -> Option<(String, NameSource)> {
+    if let Some(h) = accepted_name(graph, subject) {
         return Some((
             h.value.clone(),
             NameSource::Accepted {
@@ -200,33 +225,46 @@ pub fn extract(graph: &KnowledgeGraph) -> RecoveredProgram {
 
     let classes = class_names.iter().map(|name| build_class(graph, name)).collect();
 
-    let mut functions = Vec::new();
+    // One entry per *subject*, not per hypothesis: several ACCEPTED
+    // semantic_role hypotheses can exist for the same address (see
+    // `accepted_name`'s doc comment), and rendering all of them produced
+    // duplicate function definitions with identical names in the same
+    // file -- not valid C++.
+    let mut subjects: BTreeSet<String> = BTreeSet::new();
     for h in graph
         .hypotheses()
         .filter(|h| h.predicate == "semantic_role" && h.status == HypothesisStatus::Accepted)
     {
-        if class_method_addresses.contains(&h.subject) {
+        subjects.insert(h.subject.clone());
+    }
+
+    let mut functions = Vec::new();
+    for subject in subjects {
+        if class_method_addresses.contains(&subject) {
             continue; // already represented as a class method
         }
-        let Some(raw_name) = latest(graph, &h.subject, "has_name").map(|o| o.value.clone()) else {
+        let Some(raw_name) = latest(graph, &subject, "has_name").map(|o| o.value.clone()) else {
             continue; // not a function subject at all
         };
-        let signature = latest(graph, &h.subject, "has_signature")
+        // It earned ACCEPTED on some semantic_role proposal (that's why
+        // it's in `subjects`), but that specific value might not be a
+        // usable identifier -- name_source() falls back to Ghidra's raw
+        // name rather than losing the function entirely in that case.
+        let (display_name, name_source) =
+            name_source(graph, &subject).unwrap_or_else(|| (raw_name.clone(), NameSource::Raw));
+        let signature = latest(graph, &subject, "has_signature")
             .map(|o| o.value.clone())
             .unwrap_or_default();
-        let decompilation = latest(graph, &h.subject, "decompiles_to")
+        let decompilation = latest(graph, &subject, "decompiles_to")
             .map(|o| o.value.clone())
             .unwrap_or_default();
         let parsed = parse_signature(&signature, &raw_name);
 
         functions.push(RecoveredFunction {
-            address: h.subject.clone(),
+            address: subject,
             raw_name,
-            display_name: h.value.clone(),
-            name_source: NameSource::Accepted {
-                hypothesis: h.id,
-                confidence: h.confidence,
-            },
+            display_name,
+            name_source,
             return_type: parsed.return_type,
             params: parsed.params,
             decompilation,
