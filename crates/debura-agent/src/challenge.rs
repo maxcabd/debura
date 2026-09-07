@@ -20,9 +20,15 @@ impl ChallengeHypothesisTask {
     pub fn build(graph: &KnowledgeGraph, hypothesis: &Hypothesis) -> Self {
         Self {
             supporting_evidence: evidence_view::resolve(graph, &hypothesis.supporting_evidence),
+            // Excludes `agent_flagged_contradiction`: that's this
+            // subject's own past-contradiction bookkeeping (harness.rs's
+            // `commit_contradiction`), unbounded and purely historical --
+            // a fresh challenge needs the subject's real facts, not a
+            // growing transcript of every previous verdict against it.
             other_observations: graph
                 .observations()
                 .filter(|o| o.subject == hypothesis.subject)
+                .filter(|o| o.predicate != "agent_flagged_contradiction")
                 .cloned()
                 .collect(),
             hypothesis: hypothesis.clone(),

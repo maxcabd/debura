@@ -52,6 +52,15 @@ impl AnalyzeFunctionTask {
             observations: graph
                 .observations()
                 .filter(|o| o.subject == subject)
+                // Every past contradiction is already surfaced, scoped to
+                // the specific hypothesis it invalidated, via
+                // `rejection_reasons` above -- also sending it here as a
+                // generic observation would resend the exact same text a
+                // second time, and keep resending it on every future
+                // attempt for this subject too, growing without bound as
+                // retries accumulate (measured: one heavily-contested
+                // subject reached 12KB of mostly-repeated text this way).
+                .filter(|o| o.predicate != "agent_flagged_contradiction")
                 .cloned()
                 .collect(),
             existing_hypotheses,

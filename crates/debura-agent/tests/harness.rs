@@ -67,6 +67,46 @@ fn rejection_reasons_are_surfaced_for_contested_or_rejected_hypotheses() {
     assert_eq!(reasons, &vec!["no GameEntity exists in the evidence".to_string()]);
 }
 
+/// A subject re-investigated after several rejections shouldn't resend
+/// every past contradiction as a generic observation too -- that's the
+/// exact same text `rejection_reasons` already surfaces, scoped to the
+/// hypothesis it invalidated, and unlike that map it never stops growing
+/// as retries accumulate (measured on a real run: one contested subject
+/// reached 12KB of it after 4 attempts).
+#[test]
+fn past_contradictions_are_not_resent_as_generic_observations() {
+    let mut graph = KnowledgeGraph::new();
+    graph.add_observation("Player", "has_name", "compute", 0.95, "ghidra:function", None);
+    let h = graph.propose_hypothesis("Player", "is_a", "GameEntity", 0.9, None);
+    commit_contradiction(&mut graph, h, "no GameEntity exists in the evidence", "test");
+
+    let task = AnalyzeFunctionTask::build(&graph, "Player");
+
+    assert!(
+        task.observations.iter().all(|o| o.predicate != "agent_flagged_contradiction"),
+        "past contradictions belong in rejection_reasons, not the generic observation list"
+    );
+}
+
+/// Same growth problem, same fix, for a fresh challenge on a hypothesis
+/// whose subject already has past contradictions recorded against it.
+#[test]
+fn challenge_task_does_not_resend_past_contradictions_either() {
+    let mut graph = KnowledgeGraph::new();
+    graph.add_observation("Player", "has_name", "compute", 0.95, "ghidra:function", None);
+    let h1 = graph.propose_hypothesis("Player", "is_a", "GameEntity", 0.9, None);
+    commit_contradiction(&mut graph, h1, "no GameEntity exists in the evidence", "test");
+    let h2 = graph.propose_hypothesis("Player", "is_a", "Character", 0.9, None);
+    let hypothesis = graph.hypothesis(h2).unwrap().clone();
+
+    let task = ChallengeHypothesisTask::build(&graph, &hypothesis);
+
+    assert!(
+        task.other_observations.iter().all(|o| o.predicate != "agent_flagged_contradiction"),
+        "a fresh challenge shouldn't see every past verdict against this subject"
+    );
+}
+
 #[test]
 fn echo_provider_proposes_semantic_role_from_ghidra_name() {
     let mut graph = KnowledgeGraph::new();
