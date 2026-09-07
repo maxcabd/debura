@@ -76,6 +76,11 @@ pub enum StopReason {
 pub struct RunSummary {
     pub iterations: u64,
     pub stopped_because: StopReason,
+    /// Wall-clock time from seeding to the stop condition tripping. Not
+    /// the same as token/cost spend (still unenforced -- no provider
+    /// reports usage yet), but it's the one cost dimension free to
+    /// measure without provider cooperation.
+    pub elapsed: Duration,
 }
 
 /// Runs the autonomous loop (PROJECT.md S24) until the task queue empties
@@ -130,6 +135,7 @@ pub fn run(
     RunSummary {
         iterations,
         stopped_because,
+        elapsed: start.elapsed(),
     }
 }
 
@@ -402,5 +408,6 @@ pub fn run_with_concurrency(
     RunSummary {
         iterations,
         stopped_because,
+        elapsed: start.elapsed(),
     }
 }

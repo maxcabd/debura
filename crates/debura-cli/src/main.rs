@@ -467,8 +467,28 @@ fn main() -> Result<()> {
             }
 
             println!("\nIterations: {}", summary.iterations);
+            println!("Elapsed:    {:.1}s", summary.elapsed.as_secs_f64());
+            if summary.iterations > 0 {
+                println!(
+                    "Rate:       {:.2}s/iteration",
+                    summary.elapsed.as_secs_f64() / summary.iterations as f64
+                );
+            }
             println!("Stopped:    {:?}", summary.stopped_because);
             println!("Hypotheses: {}", graph.hypotheses().count());
+            for status in [
+                debura_knowledge::HypothesisStatus::Accepted,
+                debura_knowledge::HypothesisStatus::Supported,
+                debura_knowledge::HypothesisStatus::Contested,
+                debura_knowledge::HypothesisStatus::Proposed,
+                debura_knowledge::HypothesisStatus::Stale,
+                debura_knowledge::HypothesisStatus::Rejected,
+            ] {
+                let count = graph.hypotheses().filter(|h| h.status == status).count();
+                if count > 0 {
+                    println!("  {status:?}: {count}");
+                }
+            }
         }
     }
 
