@@ -8,6 +8,20 @@ use crate::queue::Scheduler;
 use crate::seed::seed_initial_tasks;
 use crate::task::Task;
 
+/// How many times AnalyzeFunction will be re-run for the same subject after
+/// its hypothesis gets REJECTED, before giving up on it. Bounded so a
+/// provider that never converges on a subject can't loop (and spend)
+/// forever -- counted from persisted Investigation records (survives a
+/// restart mid-run), not an in-memory counter.
+const MAX_ANALYSIS_ATTEMPTS: usize = 3;
+
+fn analysis_attempt_count(graph: &KnowledgeGraph, subject: &str) -> usize {
+    graph
+        .investigations()
+        .filter(|i| i.task == "AnalyzeFunction" && i.target == subject)
+        .count()
+}
+
 /// PROJECT.md M6's four stopping conditions. `token_budget`/`cost_budget`
 /// are accepted but not yet enforced: no `AgentProvider` implementation
 /// (real or mock) reports usage yet, so there's nothing to check them
@@ -143,12 +157,33 @@ fn execute(
         }
 
         Task::ResolveContradiction { hypothesis } => {
+            let subject = graph.hypothesis(*hypothesis).map(|h| h.subject.clone());
+
             if let Err(error) =
                 debura_verifier::resolve_contradiction(graph, provider, *hypothesis, policy)
             {
                 tracing::warn!(%hypothesis, %error, "ResolveContradiction failed");
+                return Vec::new();
             }
-            Vec::new()
+
+            let rejected = graph.hypothesis(*hypothesis).map(|h| h.status)
+                == Some(HypothesisStatus::Rejected);
+
+            let Some(subject) = subject.filter(|_| rejected) else {
+                return Vec::new();
+            };
+
+            let attempts = analysis_attempt_count(graph, &subject);
+            if attempts < MAX_ANALYSIS_ATTEMPTS {
+                vec![Task::AnalyzeFunction { subject }]
+            } else {
+                tracing::info!(
+                    %subject,
+                    attempts,
+                    "giving up on subject after max AnalyzeFunction attempts"
+                );
+                Vec::new()
+            }
         }
     }
 }

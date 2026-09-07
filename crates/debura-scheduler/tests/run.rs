@@ -3,7 +3,8 @@ use std::time::Duration;
 use debura_agent::mock::EchoProvider;
 use debura_agent::{
     AgentProvider, AnalyzeFunctionTask, ChallengeHypothesisTask, ChallengeResult,
-    InvestigationResult, Resolution, ResolutionResult, ResolveContradictionTask,
+    InvestigationResult, ProposedHypothesis, Resolution, ResolutionResult,
+    ResolveContradictionTask,
 };
 use debura_knowledge::{HypothesisStatus, KnowledgeGraph};
 use debura_scheduler::{run, RunBudget, StopReason};
@@ -129,4 +130,73 @@ fn contested_hypotheses_get_a_resolve_contradiction_followup() {
             "Survives at 0.95 + verified should clear both M5 gates"
         );
     }
+}
+
+/// A provider that always proposes the same claim, always finds a
+/// (fabricated) contradiction on challenge, and always rejects on
+/// resolution -- i.e. never converges. Stands in for a provider that keeps
+/// making the same mistake, to prove the retry loop actually stops instead
+/// of spending forever.
+struct NeverConverges;
+
+impl AgentProvider for NeverConverges {
+    fn investigate(&self, _task: &AnalyzeFunctionTask) -> anyhow::Result<InvestigationResult> {
+        Ok(InvestigationResult {
+            hypotheses: vec![ProposedHypothesis {
+                predicate: "is_a".to_string(),
+                value: "GameEntity".to_string(),
+                confidence: 0.9,
+                depends_on: Vec::new(),
+            }],
+            ..Default::default()
+        })
+    }
+
+    fn challenge(&self, _task: &ChallengeHypothesisTask) -> anyhow::Result<ChallengeResult> {
+        Ok(ChallengeResult {
+            contradiction: Some("fabricated claim, no such evidence".to_string()),
+            reasoning: "test".to_string(),
+            ..Default::default()
+        })
+    }
+
+    fn resolve_contradiction(
+        &self,
+        _task: &ResolveContradictionTask,
+    ) -> anyhow::Result<ResolutionResult> {
+        Ok(ResolutionResult {
+            resolution: Resolution::Rejected,
+            reasoning: "test".to_string(),
+        })
+    }
+}
+
+#[test]
+fn retries_after_rejection_are_bounded_not_infinite() {
+    let mut graph = KnowledgeGraph::new();
+    graph.add_observation("0x1", "has_name", "mystery", 0.95, "ghidra:function", None);
+
+    let summary = run(
+        &mut graph,
+        &NeverConverges,
+        &VerificationPolicy::default(),
+        &RunBudget::default(),
+        |_, _, _| {},
+    );
+
+    assert_eq!(summary.stopped_because, StopReason::QueueEmpty);
+    // 3 attempts x (AnalyzeFunction + ChallengeHypothesis + ResolveContradiction)
+    assert_eq!(summary.iterations, 9);
+
+    let attempts = graph
+        .investigations()
+        .filter(|i| i.task == "AnalyzeFunction" && i.target == "0x1")
+        .count();
+    assert_eq!(attempts, 3, "must stop retrying after the bounded max");
+
+    let rejected = graph
+        .hypotheses()
+        .filter(|h| h.subject == "0x1" && h.status == HypothesisStatus::Rejected)
+        .count();
+    assert_eq!(rejected, 3, "every attempt's hypothesis was rejected");
 }
