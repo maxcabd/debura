@@ -83,6 +83,12 @@ enum Command {
         /// Project id, as printed by `debura new`
         project: String,
     },
+    /// Generate recovered C++ from the accepted program model into
+    /// <project>/recovered/{include,src}
+    Recover {
+        /// Project id, as printed by `debura new`
+        project: String,
+    },
     /// Run the autonomous loop
     Run {
         /// Project id, as printed by `debura new`
@@ -154,15 +160,22 @@ fn main() -> Result<()> {
             println!("Exports:   {}", result.exports.len());
             println!("Xrefs:     {}", result.xrefs.len());
 
-            let mut graph = debura_knowledge::KnowledgeGraph::new();
-            debura_analysis::ingest(&mut graph, &result, "artifacts/analysis.json");
-
+            // Load whatever knowledge already exists (hypotheses, evidence,
+            // investigations from prior runs) rather than starting from an
+            // empty graph -- a repeat `analyze` used to silently discard
+            // all of it. `ingest` is idempotent, so this only ever adds
+            // genuinely new or changed facts.
             let conn = debura_storage::init_project_db(&root.join("project.sqlite"))?;
+            let mut graph = debura_storage::knowledge::load(&conn)?;
+            let hypotheses_before = graph.hypotheses().count();
+
+            debura_analysis::ingest(&mut graph, &result, "artifacts/analysis.json");
             debura_storage::knowledge::save(&conn, &graph)?;
 
             println!(
-                "\nPersisted {} observations to project.sqlite",
-                graph.observations().count()
+                "\nPersisted {} observations ({} preserved hypotheses) to project.sqlite",
+                graph.observations().count(),
+                hypotheses_before
             );
         }
         Command::Status { project } => {
@@ -381,6 +394,19 @@ fn main() -> Result<()> {
             if candidates.is_empty() && to_revert.is_empty() {
                 println!("Nothing to apply or revert.");
             }
+        }
+        Command::Recover { project } => {
+            let root = debura_core::config::projects_dir().join(&project);
+            anyhow::ensure!(root.is_dir(), "no such project: {project}");
+
+            let conn = debura_storage::init_project_db(&root.join("project.sqlite"))?;
+            let graph = debura_storage::knowledge::load(&conn)?;
+
+            let summary = debura_recovery::recover(&graph, &root)?;
+
+            println!("Classes recovered:   {}", summary.classes_written);
+            println!("Functions recovered: {}", summary.functions_written);
+            println!("Written to: {}", root.join("recovered").display());
         }
         Command::Run {
             project,

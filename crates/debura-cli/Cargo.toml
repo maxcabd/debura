@@ -16,6 +16,7 @@ debura-storage = { path = "../debura-storage" }
 debura-agent = { path = "../debura-agent", features = ["openai"] }
 debura-verifier = { path = "../debura-verifier" }
 debura-scheduler = { path = "../debura-scheduler" }
+debura-recovery = { path = "../debura-recovery" }
 clap.workspace = true
 anyhow.workspace = true
 serde_json.workspace = true

@@ -265,6 +265,7 @@ dependencies = [
  "debura-core",
  "debura-ghidra",
  "debura-knowledge",
+ "debura-recovery",
  "debura-scheduler",
  "debura-storage",
  "debura-verifier",
@@ -312,6 +313,11 @@ dependencies = [
 [[package]]
 name = "debura-recovery"
 version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "debura-knowledge",
+]
 
 [[package]]
 name = "debura-scheduler"
