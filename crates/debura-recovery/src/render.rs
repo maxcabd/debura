@@ -42,16 +42,67 @@ fn patch_known_idioms(text: &str) -> String {
     // real compile hit "is not a template" for exactly this: a local
     // variable declared `basic_stringstream<char,...> local_1a8 [16];`.
     // Dropping the redundant explicit arguments (they name the exact
-    // instantiation the bare alias already is) satisfies both shapes.
-    let text = text.replace(
+    // instantiation the bare alias already is) satisfies both shapes --
+    // but only for the *bare* occurrence: a `std::`/`std::__cxx11::`-
+    // qualified one names the real template directly, which does need
+    // its arguments, and a first version of this that stripped them
+    // unconditionally broke exactly that (`std::basic_ostream::
+    // operator<<` with no arguments at all, "used without template
+    // arguments").
+    let text = strip_redundant_template_args(
+        &text,
         "basic_stringstream<char,std::char_traits<char>,std::allocator<char>>",
         "basic_stringstream",
     );
-    let text = text.replace(
+    let text = strip_redundant_template_args(
+        &text,
         "basic_string<char,std::char_traits<char>,std::allocator<char>>",
         "basic_string",
     );
-    text.replace("basic_ostream<char,std::char_traits<char>>", "basic_ostream")
+    strip_redundant_template_args(&text, "basic_ostream<char,std::char_traits<char>>", "basic_ostream")
+}
+
+/// Replaces `templated` with `bare` everywhere it appears *without* a
+/// `::`-qualification immediately before it (a bare occurrence, meant
+/// for `ghidra_compat.hpp`'s own non-template alias) -- leaving any
+/// `std::`/`std::__cxx11::`-qualified occurrence (naming the real
+/// template directly, which still needs its arguments) untouched.
+fn strip_redundant_template_args(text: &str, templated: &str, bare: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(pos) = rest.find(templated) {
+        let (before, after) = (&rest[..pos], &rest[pos + templated.len()..]);
+        out.push_str(before);
+        out.push_str(if before.ends_with("::") { templated } else { bare });
+        rest = after;
+    }
+    out.push_str(rest);
+    out
+}
+
+#[cfg(test)]
+mod idiom_tests {
+    use super::*;
+
+    #[test]
+    fn bare_occurrence_loses_its_redundant_template_args() {
+        let text = "basic_ostream<char,std::char_traits<char>> *pbVar1;";
+        assert_eq!(patch_known_idioms(text), "basic_ostream *pbVar1;");
+    }
+
+    /// A real compile hit this as a regression: the first version of
+    /// this fix stripped template arguments unconditionally, breaking a
+    /// fully `std::`-qualified reference to the real template (which
+    /// still needs them) into `std::basic_ostream::operator<<` -- "used
+    /// without template arguments".
+    #[test]
+    fn std_qualified_occurrence_keeps_its_template_args() {
+        let text = "std::basic_ostream<char,std::char_traits<char>>::operator<<(x, y);";
+        assert_eq!(
+            patch_known_idioms(text),
+            "std::basic_ostream<char,std::char_traits<char>>::operator<<(x, y);"
+        );
+    }
 }
 
 fn name_comment(source: &NameSource) -> String {
