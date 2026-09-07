@@ -6,7 +6,7 @@ use anyhow::Result;
 use crate::compat::{GHIDRA_COMPAT_HEADER, GHIDRA_COMPAT_HEADER_NAME};
 use crate::model::RecoveredProgram;
 use crate::render::{render_functions_source, render_header, render_source};
-use crate::symbols::{render_ghidra_symbols_header, GHIDRA_SYMBOLS_HEADER_NAME};
+use crate::symbols::{render_function_declarations, render_ghidra_symbols_header, GHIDRA_SYMBOLS_HEADER_NAME};
 
 #[derive(Debug, Default)]
 pub struct RecoverySummary {
@@ -25,9 +25,18 @@ pub fn write_to_disk(project_root: &Path, program: &RecoveredProgram) -> Result<
     fs::create_dir_all(&src_dir)?;
 
     fs::write(include_dir.join(GHIDRA_COMPAT_HEADER_NAME), GHIDRA_COMPAT_HEADER)?;
+    let function_declarations: Vec<(String, String, String)> = program
+        .functions
+        .iter()
+        .map(|f| (f.return_type.clone(), f.display_name.clone(), f.params.clone()))
+        .collect();
     fs::write(
         include_dir.join(GHIDRA_SYMBOLS_HEADER_NAME),
-        render_ghidra_symbols_header(&program.ghidra_data_symbols),
+        render_ghidra_symbols_header(
+            &program.ghidra_data_symbols,
+            &program.unresolved_calls,
+            &render_function_declarations(&function_declarations),
+        ),
     )?;
 
     for class in &program.classes {
@@ -44,7 +53,7 @@ pub fn write_to_disk(project_root: &Path, program: &RecoveredProgram) -> Result<
     if !program.functions.is_empty() {
         fs::write(
             src_dir.join("functions.cpp"),
-            render_functions_source(&program.functions),
+            render_functions_source(&program.functions, &program.function_references),
         )?;
     }
 

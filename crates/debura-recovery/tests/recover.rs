@@ -1,8 +1,8 @@
 use chrono::Utc;
 use debura_knowledge::{HypothesisStatus, KnowledgeGraph};
 use debura_recovery::{
-    extract, render_ghidra_symbols_header, render_header, render_source, NameSource,
-    GHIDRA_COMPAT_HEADER, GHIDRA_COMPAT_HEADER_NAME,
+    extract, render_function_declarations, render_ghidra_symbols_header, render_header,
+    render_source, NameSource, GHIDRA_COMPAT_HEADER, GHIDRA_COMPAT_HEADER_NAME,
 };
 
 /// Builds a graph shaped like real debura-analysis output for the
@@ -451,10 +451,14 @@ fn a_base_constructor_call_after_local_declarations_is_still_found() {
 /// unlike `DAT_*`/`PTR_*` it needs to be declared as a pointer.
 #[test]
 fn refptr_symbols_are_declared_as_pointers_not_plain_bytes() {
-    let header = render_ghidra_symbols_header(&[
-        "DAT_140009070".to_string(),
-        "_refptr__ZN9SnakeGame6Screen7S_WIDTHE".to_string(),
-    ]);
+    let header = render_ghidra_symbols_header(
+        &[
+            "DAT_140009070".to_string(),
+            "_refptr__ZN9SnakeGame6Screen7S_WIDTHE".to_string(),
+        ],
+        &[],
+        "",
+    );
     assert!(header.contains("extern unsigned char DAT_140009070;"), "header:\n{header}");
     assert!(
         header.contains("extern unsigned char *_refptr__ZN9SnakeGame6Screen7S_WIDTHE;"),
@@ -504,7 +508,7 @@ fn ghidra_data_symbols_are_collected_and_declared() {
     let program = extract(&graph);
     assert_eq!(program.ghidra_data_symbols, vec!["DAT_140009a60".to_string()]);
 
-    let header = render_ghidra_symbols_header(&program.ghidra_data_symbols);
+    let header = render_ghidra_symbols_header(&program.ghidra_data_symbols, &program.unresolved_calls, "");
     assert!(header.contains("extern unsigned char DAT_140009a60;"), "header:\n{header}");
 
     let drawable = program.classes.iter().find(|c| c.name == "Drawable").unwrap();
@@ -542,4 +546,77 @@ fn operator_equals_returns_a_pointer_to_its_own_class_not_undefined() {
     let op_eq = &drawable.methods[0];
 
     assert_eq!(op_eq.return_type, "Drawable *");
+}
+
+/// PROJECT.md M15: a real compile against Snake's stripped binary had
+/// 262 "not declared" errors from exactly this shape -- every recovered
+/// standalone function lands in one shared `functions.cpp`, sorted by
+/// *address*, so a lower-address function calling a higher-address one
+/// (an entirely ordinary thing for real code to do) failed to compile
+/// for plain forward-declaration reasons once M15's symbol-resolution
+/// pass (`symtab.rs`) had already renamed the raw `FUN_<addr>` call to
+/// its real name. `render_function_declarations` (included via
+/// `ghidra_symbols.hpp`, which every generated file already includes)
+/// is the fix: declare every recovered function once, in the one place
+/// every file already sees.
+#[test]
+fn standalone_functions_forward_declare_each_other_regardless_of_address_order() {
+    let mut graph = KnowledgeGraph::new();
+    // Lower address, but calls the higher-address one below.
+    graph.add_observation("0x1", "has_name", "FUN_1", 0.95, "ghidra:function", None);
+    graph.add_observation("0x1", "has_signature", "void FUN_1(void)", 0.95, "ghidra:function", None);
+    graph.add_observation("0x1", "decompiles_to", "void FUN_1(void)\n\n{\n  FUN_2();\n  return;\n}", 0.95, "ghidra:decompiler", None);
+    let h1 = graph.propose_hypothesis("0x1", "semantic_role", "runFirst", 0.95, None);
+    graph.mark_verified(h1, Utc::now()).unwrap();
+    graph.set_status(h1, HypothesisStatus::Accepted).unwrap();
+
+    graph.add_observation("0x2", "has_name", "FUN_2", 0.95, "ghidra:function", None);
+    graph.add_observation("0x2", "has_signature", "void FUN_2(void)", 0.95, "ghidra:function", None);
+    graph.add_observation("0x2", "decompiles_to", "void FUN_2(void)\n\n{\n  return;\n}", 0.95, "ghidra:decompiler", None);
+    let h2 = graph.propose_hypothesis("0x2", "semantic_role", "runSecond", 0.95, None);
+    graph.mark_verified(h2, Utc::now()).unwrap();
+    graph.set_status(h2, HypothesisStatus::Accepted).unwrap();
+
+    let program = extract(&graph);
+    let run_first = program.functions.iter().find(|f| f.display_name == "runFirst").unwrap();
+    assert!(
+        run_first.decompilation.contains("runSecond();"),
+        "call site must be renamed to the real recovered name: {}",
+        run_first.decompilation
+    );
+
+    let declarations: Vec<(String, String, String)> = program
+        .functions
+        .iter()
+        .map(|f| (f.return_type.clone(), f.display_name.clone(), f.params.clone()))
+        .collect();
+    let header = render_function_declarations(&declarations);
+    assert!(header.contains("void runSecond(void);"), "header:\n{header}");
+    assert!(header.contains("void runFirst(void);"), "header:\n{header}");
+}
+
+/// A real run had a standalone function's M15-resolved body construct a
+/// real recovered class (`new (ptr) Wall(...)`, from a raw `FUN_ctor`
+/// call) with nothing in `functions.cpp` ever including `Wall.hpp`.
+#[test]
+fn standalone_functions_reference_a_class_their_resolved_body_constructs() {
+    let mut graph = KnowledgeGraph::new();
+    graph.add_observation("0x1", "has_vtable_at", "0x100", 1.0, "ghidra:vtable", None);
+    graph.add_observation("0x1", "is_constructor_of", "Wall", 0.95, "ghidra:function", None);
+    graph.add_observation("0x1", "has_name", "Wall", 0.95, "ghidra:function", None);
+    graph.add_observation("0x1", "has_signature", "void Wall(Wall * this)", 0.95, "ghidra:function", None);
+    graph.add_observation("0x1", "decompiles_to", "void Wall(Wall *this)\n\n{\n  return;\n}", 0.95, "ghidra:decompiler", None);
+
+    graph.add_observation("0x2", "has_name", "FUN_2", 0.95, "ghidra:function", None);
+    graph.add_observation("0x2", "has_signature", "void FUN_2(void * ptr)", 0.95, "ghidra:function", None);
+    graph.add_observation("0x2", "decompiles_to", "void FUN_2(void *ptr)\n\n{\n  FUN_1(ptr);\n  return;\n}", 0.95, "ghidra:decompiler", None);
+    let h = graph.propose_hypothesis("0x2", "semantic_role", "spawnWall", 0.95, None);
+    graph.mark_verified(h, Utc::now()).unwrap();
+    graph.set_status(h, HypothesisStatus::Accepted).unwrap();
+
+    let program = extract(&graph);
+    assert!(program.function_references.contains(&"Wall".to_string()), "{:?}", program.function_references);
+
+    let spawn = program.functions.iter().find(|f| f.display_name == "spawnWall").unwrap();
+    assert!(spawn.decompilation.contains("new ((void *)(ptr)) Wall()"), "{}", spawn.decompilation);
 }

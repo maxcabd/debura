@@ -222,13 +222,20 @@ pub fn render_source(class: &RecoveredClass) -> String {
     out
 }
 
-pub fn render_functions_source(functions: &[RecoveredFunction]) -> String {
+pub fn render_functions_source(functions: &[RecoveredFunction], references: &[String]) -> String {
     let mut out = String::new();
     out.push_str("// Recovered by Debura: standalone functions with an ACCEPTED semantic\n");
     out.push_str("// name (PROJECT.md M5). Bodies are Ghidra's decompiled output, unmodified\n");
     out.push_str("// beyond substituting the recovered name for Ghidra's raw one.\n");
     out.push_str(&format!("#include \"{GHIDRA_COMPAT_HEADER_NAME}\"\n"));
-    out.push_str(&format!("#include \"{GHIDRA_SYMBOLS_HEADER_NAME}\"\n\n"));
+    out.push_str(&format!("#include \"{GHIDRA_SYMBOLS_HEADER_NAME}\"\n"));
+    // A real run had a standalone function's M15-resolved body construct
+    // a real class (`new (ptr) Wall(...)`) with nothing including
+    // `Wall.hpp` anywhere in this file.
+    for reference in references {
+        out.push_str(&format!("#include \"{reference}.hpp\"\n"));
+    }
+    out.push('\n');
 
     for f in functions {
         out.push_str(&format!("// {}\n", name_comment(&f.name_source)));

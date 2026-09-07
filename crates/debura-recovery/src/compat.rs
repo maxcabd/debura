@@ -81,6 +81,7 @@ typedef unsigned char byte;
 typedef signed char sbyte;
 typedef unsigned char uchar;
 typedef unsigned short ushort;
+typedef unsigned short word;
 typedef unsigned int uint;
 typedef unsigned long long ulonglong;
 typedef long long longlong;
@@ -88,6 +89,20 @@ typedef long long longlong;
 // Ghidra's type for "this address holds executable code" -- almost
 // always seen only as `code *`, i.e. an opaque function pointer.
 typedef void code;
+
+// A real compile showed Ghidra's own signature/decompilation text names
+// these STL types bare -- neither `std::`-qualified nor carrying their
+// real template arguments (`allocator`, not `std::allocator<char>`;
+// `basic_ostream`, not `std::basic_ostream<char, std::char_traits<char>>`)
+// -- since Ghidra's type recovery for library templates is partial. Real
+// aliases, not placeholders: each names the one instantiation that
+// actually shows up in practice (`char`-based, the only one MinGW
+// libstdc++ output has needed here so far).
+using allocator = std::allocator<char>;
+using basic_string = std::basic_string<char, std::char_traits<char>, std::allocator<char>>;
+using basic_ostream = std::basic_ostream<char, std::char_traits<char>>;
+using basic_stringstream =
+    std::basic_stringstream<char, std::char_traits<char>, std::allocator<char>>;
 
 // Calling-convention keyword from Ghidra's x86-32 heritage; x86-64 has
 // exactly one calling convention, so this is a no-op here.
