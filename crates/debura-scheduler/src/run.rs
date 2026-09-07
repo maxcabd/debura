@@ -1,0 +1,154 @@
+use std::time::{Duration, Instant};
+
+use debura_agent::AgentProvider;
+use debura_knowledge::{HypothesisStatus, KnowledgeGraph};
+use debura_verifier::VerificationPolicy;
+
+use crate::queue::Scheduler;
+use crate::seed::seed_initial_tasks;
+use crate::task::Task;
+
+/// PROJECT.md M6's four stopping conditions. `token_budget`/`cost_budget`
+/// are accepted but not yet enforced: no `AgentProvider` implementation
+/// (real or mock) reports usage yet, so there's nothing to check them
+/// against. `max_iterations` and `time_budget` need no cooperation from the
+/// provider and are enforced for real.
+#[derive(Debug, Clone, Default)]
+pub struct RunBudget {
+    pub max_iterations: Option<u64>,
+    pub time_budget: Option<Duration>,
+    pub token_budget: Option<u64>,
+    pub cost_budget: Option<f64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopReason {
+    QueueEmpty,
+    MaxIterations,
+    TimeBudget,
+}
+
+#[derive(Debug)]
+pub struct RunSummary {
+    pub iterations: u64,
+    pub stopped_because: StopReason,
+}
+
+/// Runs the autonomous loop (PROJECT.md S24) until the task queue empties
+/// or a budget trips. Ghidra feedback (`ghidra.apply(...)` in S24's
+/// pseudocode) isn't wired in -- that arrives at M8. `on_iteration` is
+/// called after each task so the caller can checkpoint to storage and
+/// report progress without this crate knowing anything about SQLite or a
+/// terminal.
+pub fn run(
+    graph: &mut KnowledgeGraph,
+    provider: &dyn AgentProvider,
+    policy: &VerificationPolicy,
+    budget: &RunBudget,
+    mut on_iteration: impl FnMut(u64, &Task, &KnowledgeGraph),
+) -> RunSummary {
+    let mut scheduler = Scheduler::new();
+    for task in seed_initial_tasks(graph) {
+        scheduler.enqueue(graph, task);
+    }
+
+    let start = Instant::now();
+    let mut iterations = 0u64;
+
+    let stopped_because = loop {
+        if budget.max_iterations.is_some_and(|max| iterations >= max) {
+            break StopReason::MaxIterations;
+        }
+        if budget.time_budget.is_some_and(|limit| start.elapsed() >= limit) {
+            break StopReason::TimeBudget;
+        }
+
+        let Some(task) = scheduler.pop() else {
+            break StopReason::QueueEmpty;
+        };
+
+        for followup in execute(graph, provider, policy, &task) {
+            scheduler.enqueue(graph, followup);
+        }
+
+        iterations += 1;
+        on_iteration(iterations, &task, graph);
+    };
+
+    RunSummary {
+        iterations,
+        stopped_because,
+    }
+}
+
+fn execute(
+    graph: &mut KnowledgeGraph,
+    provider: &dyn AgentProvider,
+    policy: &VerificationPolicy,
+    task: &Task,
+) -> Vec<Task> {
+    match task {
+        Task::AnalyzeFunction { subject } => {
+            match debura_agent::analyze_function(graph, provider, subject) {
+                Ok(investigation_id) => {
+                    let created = graph
+                        .investigation(investigation_id)
+                        .map(|i| i.hypotheses_created.clone())
+                        .unwrap_or_default();
+
+                    for id in &created {
+                        debura_verifier::reevaluate_hypothesis(graph, *id, policy);
+                    }
+
+                    created
+                        .into_iter()
+                        .map(|hypothesis| Task::ChallengeHypothesis { hypothesis })
+                        .collect()
+                }
+                Err(error) => {
+                    tracing::warn!(%subject, %error, "AnalyzeFunction failed");
+                    Vec::new()
+                }
+            }
+        }
+
+        Task::ChallengeHypothesis { hypothesis } => {
+            match debura_verifier::challenge_hypothesis(graph, provider, *hypothesis, policy) {
+                Ok(investigation_id) => {
+                    let mut followups: Vec<Task> = graph
+                        .investigation(investigation_id)
+                        .map(|i| i.hypotheses_created.clone())
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|alternative| Task::ChallengeHypothesis {
+                            hypothesis: alternative,
+                        })
+                        .collect();
+
+                    if graph.hypothesis(*hypothesis).map(|h| h.status)
+                        == Some(HypothesisStatus::Contested)
+                    {
+                        followups.push(Task::ResolveContradiction {
+                            hypothesis: *hypothesis,
+                        });
+                    }
+
+                    followups
+                }
+                Err(error) => {
+                    tracing::warn!(%hypothesis, %error, "ChallengeHypothesis failed");
+                    Vec::new()
+                }
+            }
+        }
+
+        Task::ResolveContradiction { hypothesis } => {
+            if let Err(error) =
+                debura_verifier::resolve_contradiction(graph, provider, *hypothesis, policy)
+            {
+                tracing::warn!(%hypothesis, %error, "ResolveContradiction failed");
+            }
+            Vec::new()
+        }
+    }
+}
