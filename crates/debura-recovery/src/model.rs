@@ -49,6 +49,11 @@ pub struct RecoveredClass {
     pub vtable_address: String,
     pub fields: Vec<RecoveredField>,
     pub methods: Vec<RecoveredMethod>,
+    /// Other recovered classes this one's own method/field signatures
+    /// name (e.g. `Food::draw(Screen *)`), excluding `base` (already
+    /// its own `#include`). A real compile of this output hit the
+    /// referenced-but-never-declared case for exactly this reason.
+    pub references: Vec<String>,
 }
 
 #[derive(Debug, Clone)]

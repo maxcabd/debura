@@ -201,13 +201,65 @@ fn build_class(graph: &KnowledgeGraph, name: &str) -> RecoveredClass {
         vtable_address,
         fields,
         methods,
+        // Filled in by `extract()` once every class's name is known --
+        // finding a *reference* to another class requires the full set,
+        // not just this one class's own facts.
+        references: Vec::new(),
     }
 }
 
+/// Splits on anything that isn't part of a C identifier, the same shape
+/// a type name or parameter list is made of (`Screen *`, `int, Screen *`,
+/// ...) -- used to find other recovered classes' names inside a
+/// method's params/return type/field candidate types without needing a
+/// real C++ parser.
+fn identifier_tokens(s: &str) -> impl Iterator<Item = &str> {
+    s.split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .filter(|t| !t.is_empty())
+}
+
+/// Every other known class name `class` mentions in its own
+/// methods'/fields' signatures -- what needs its own `#include` beyond
+/// `class.base` (handled separately, since that relationship also needs
+/// `class ... : public Base`, not just an include).
+fn find_references(class: &RecoveredClass, class_names: &BTreeSet<String>) -> Vec<String> {
+    let mut refs: BTreeSet<String> = BTreeSet::new();
+    let mut consider = |text: &str| {
+        for token in identifier_tokens(text) {
+            if token != class.name
+                && Some(token) != class.base.as_deref()
+                && class_names.contains(token)
+            {
+                refs.insert(token.to_string());
+            }
+        }
+    };
+    for m in &class.methods {
+        consider(&m.params);
+        consider(&m.return_type);
+        // A class can be used only inside a method's body (e.g.
+        // constructing one) without ever appearing in that method's own
+        // signature -- Snake's addSection doing `new Section(...)` is a
+        // real instance of this, and needs the same #include.
+        consider(&m.decompilation);
+    }
+    for f in &class.fields {
+        for t in &f.candidate_types {
+            consider(t);
+        }
+    }
+    refs.into_iter().collect()
+}
+
 /// Extracts everything Debura currently has grounds to recover (PROJECT.md
-/// M9): every class with a detected vtable (M7), and every standalone
-/// function that has actually earned an ACCEPTED semantic name (M5) --
-/// nothing else counts as "recovered".
+/// M9): every class with a detected vtable (M7) *or* with at least one
+/// method/constructor/destructor of its own (a real class the binary
+/// defines, just not a polymorphic one -- `has_vtable_at` alone missed
+/// this: a real run had non-polymorphic classes referenced by name in an
+/// already-recovered class's method signatures, e.g. `Food::draw(Screen
+/// *)`, with `Screen` itself never declared anywhere in the output), and
+/// every standalone function that has actually earned an ACCEPTED
+/// semantic name (M5) -- nothing else counts as "recovered".
 pub fn extract(graph: &KnowledgeGraph) -> RecoveredProgram {
     let mut class_names: BTreeSet<String> = BTreeSet::new();
     let mut class_method_addresses: BTreeSet<String> = BTreeSet::new();
@@ -218,12 +270,17 @@ pub fn extract(graph: &KnowledgeGraph) -> RecoveredProgram {
             }
             "is_method_of" | "is_constructor_of" | "is_destructor_of" => {
                 class_method_addresses.insert(o.subject.clone());
+                class_names.insert(o.value.clone());
             }
             _ => {}
         }
     }
 
-    let classes = class_names.iter().map(|name| build_class(graph, name)).collect();
+    let mut classes: Vec<RecoveredClass> =
+        class_names.iter().map(|name| build_class(graph, name)).collect();
+    for class in &mut classes {
+        class.references = find_references(class, &class_names);
+    }
 
     // One entry per *subject*, not per hypothesis: several ACCEPTED
     // semantic_role hypotheses can exist for the same address (see
