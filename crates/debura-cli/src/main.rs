@@ -75,6 +75,14 @@ enum Command {
         /// Hypothesis id, e.g. H1
         hypothesis: String,
     },
+    /// Apply high-confidence findings to Ghidra (renames only, for now),
+    /// reverting any previously-applied rename whose source hypothesis has
+    /// since been rejected, then re-extracting so improved decompilation
+    /// becomes new evidence
+    Apply {
+        /// Project id, as printed by `debura new`
+        project: String,
+    },
     /// Run the autonomous loop
     Run {
         /// Project id, as printed by `debura new`
@@ -258,6 +266,121 @@ fn main() -> Result<()> {
                 "{id}: {} {} = {} (confidence {:.2}, {:?})",
                 h.subject, h.predicate, h.value, h.confidence, h.status
             );
+        }
+        Command::Apply { project } => {
+            let root = debura_core::config::projects_dir().join(&project);
+            anyhow::ensure!(root.is_dir(), "no such project: {project}");
+
+            let state: ProjectState = serde_json::from_str(
+                &std::fs::read_to_string(root.join("state.json"))
+                    .context("reading project state.json")?,
+            )?;
+
+            let conn = debura_storage::init_project_db(&root.join("project.sqlite"))?;
+            let mut graph = debura_storage::knowledge::load(&conn)?;
+
+            // Revert any previously-applied rename whose source hypothesis
+            // is now REJECTED -- a mutation must not permanently poison the
+            // decompiler state once the belief it rested on has been
+            // rejected (PROJECT.md S30).
+            let unreverted = debura_storage::mutations::list_unreverted(&conn)?;
+            let to_revert: Vec<_> = unreverted
+                .iter()
+                .filter(|m| {
+                    graph.hypothesis(m.hypothesis_id).map(|h| h.status)
+                        == Some(debura_knowledge::HypothesisStatus::Rejected)
+                })
+                .collect();
+
+            let mut changed_any = false;
+
+            if !to_revert.is_empty() {
+                let requests: Vec<debura_ghidra::RenameRequest> = to_revert
+                    .iter()
+                    .map(|m| debura_ghidra::RenameRequest {
+                        address: m.target_address.clone(),
+                        new_name: m.previous_value.clone(),
+                    })
+                    .collect();
+                let outcomes = debura_ghidra::apply_renames(&root, &state.binary_name, &requests)?;
+                for (mutation, outcome) in to_revert.iter().zip(outcomes.iter()) {
+                    if outcome.applied {
+                        debura_storage::mutations::mark_reverted(&conn, mutation.id, chrono::Utc::now())?;
+                        println!(
+                            "Reverted mutation {} ({} -> {})",
+                            mutation.id, mutation.new_value, mutation.previous_value
+                        );
+                        changed_any = true;
+                    } else {
+                        tracing::warn!(mutation = mutation.id, error = ?outcome.error, "revert failed");
+                    }
+                }
+            }
+
+            // Apply high-confidence findings: ACCEPTED semantic_role
+            // hypotheses on a real function address, not already mutated.
+            let already_mutated: std::collections::HashSet<_> = debura_storage::mutations::list_unreverted(&conn)?
+                .into_iter()
+                .map(|m| m.hypothesis_id)
+                .collect();
+
+            let candidates: Vec<_> = graph
+                .hypotheses()
+                .filter(|h| {
+                    h.status == debura_knowledge::HypothesisStatus::Accepted
+                        && h.predicate == "semantic_role"
+                        && h.subject.starts_with("0x")
+                        && !already_mutated.contains(&h.id)
+                })
+                .cloned()
+                .collect();
+
+            for h in &candidates {
+                if !debura_ghidra::is_valid_symbol_name(&h.value) {
+                    println!("Skipping {}: {:?} is not a valid symbol name", h.id, h.value);
+                    continue;
+                }
+
+                let outcomes = debura_ghidra::apply_renames(
+                    &root,
+                    &state.binary_name,
+                    &[debura_ghidra::RenameRequest {
+                        address: h.subject.clone(),
+                        new_name: h.value.clone(),
+                    }],
+                )?;
+
+                let Some(outcome) = outcomes.into_iter().next() else {
+                    continue;
+                };
+
+                if outcome.applied {
+                    let previous = outcome.previous_name.unwrap_or_default();
+                    debura_storage::mutations::record(
+                        &conn,
+                        h.id,
+                        debura_storage::mutations::MutationKind::RenameFunction,
+                        &h.subject,
+                        &previous,
+                        &h.value,
+                    )?;
+                    println!("Applied {}: {} -> {}", h.id, previous, h.value);
+                    changed_any = true;
+                } else {
+                    println!("Failed to apply {}: {:?}", h.id, outcome.error);
+                }
+            }
+
+            if changed_any {
+                let result = debura_ghidra::reextract(&root, &state.binary_name)?;
+                debura_analysis::ingest(&mut graph, &result, "artifacts/analysis.json");
+            }
+
+            debura_storage::knowledge::save(&conn, &graph)?;
+
+            if candidates.is_empty() && to_revert.is_empty() {
+                println!("Nothing to apply or revert.");
+            }
         }
         Command::Run {
             project,
