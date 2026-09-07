@@ -1,3 +1,4 @@
+use chrono::Utc;
 use debura_knowledge::{DependencyKind, HypothesisStatus, KnowledgeGraph};
 
 /// PROJECT.md S8: H4 DEPENDS_ON H3 DEPENDS_ON H2 DEPENDS_ON H1.
@@ -54,6 +55,31 @@ fn rejected_hypotheses_are_never_resurrected_by_cascade() {
         kg.hypothesis(dependent).unwrap().status,
         HypothesisStatus::Rejected
     );
+}
+
+/// PROJECT.md M5: a hypothesis's prior verification only covered the world
+/// as it stood then. If something it depends on changes, that
+/// verification must not keep counting -- otherwise the M5 acceptance gate
+/// could be satisfied by a check that's now meaningless.
+#[test]
+fn stale_cascade_clears_prior_verification() {
+    let mut kg = KnowledgeGraph::new();
+
+    let target = kg.propose_hypothesis("subject", "pred", "value", 0.9, None);
+    let dependent = kg.propose_hypothesis("subject2", "pred2", "value2", 0.9, None);
+    kg.add_dependency(dependent, target, DependencyKind::DependsOn)
+        .unwrap();
+
+    kg.mark_verified(dependent, Utc::now()).unwrap();
+    assert!(kg.hypothesis(dependent).unwrap().last_verified_at.is_some());
+
+    kg.set_confidence(target, 0.1).unwrap();
+
+    assert_eq!(
+        kg.hypothesis(dependent).unwrap().status,
+        HypothesisStatus::Stale
+    );
+    assert!(kg.hypothesis(dependent).unwrap().last_verified_at.is_none());
 }
 
 /// A cyclic dependency graph must not hang the propagation traversal.

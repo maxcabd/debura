@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 
 use crate::dependency::{Dependency, DependencyKind};
 use crate::error::KnowledgeError;
@@ -213,6 +213,17 @@ impl KnowledgeGraph {
         Ok(self.mark_stale_dependents(hypothesis))
     }
 
+    /// Records that a real verification attempt (ChallengeHypothesis, M5)
+    /// happened, regardless of its verdict. This is what "verified" means
+    /// for the M5 acceptance gate -- an attempt was made, not that it
+    /// succeeded.
+    pub fn mark_verified(&mut self, hypothesis: HypothesisId, at: DateTime<Utc>) -> Result<()> {
+        let h = self.hypothesis_mut(hypothesis)?;
+        h.last_verified_at = Some(at);
+        h.updated_at = at;
+        Ok(())
+    }
+
     // --- Dependency ----------------------------------------------------------
 
     /// Records `source <kind> target` (e.g. `source DEPENDS_ON target`).
@@ -251,6 +262,12 @@ impl KnowledgeGraph {
     /// status is terminal, not a step Debura ever walks back from via
     /// cascade. Returns the set of hypotheses newly marked STALE, for a
     /// scheduler to later enqueue for verification (M6).
+    ///
+    /// Also clears `last_verified_at`: a prior ChallengeHypothesis pass
+    /// (M5) only verified this hypothesis against the world as it stood
+    /// then. If something it depends on has since changed, that
+    /// verification no longer means anything, and M5's acceptance gate
+    /// must not keep treating it as settled.
     pub fn mark_stale_dependents(&mut self, changed: HypothesisId) -> Vec<HypothesisId> {
         let mut newly_stale = Vec::new();
         // Seed with `changed` itself so a cycle in the dependency graph
@@ -272,6 +289,7 @@ impl KnowledgeGraph {
             if let Some(h) = self.hypotheses.get_mut(&id) {
                 if h.status != HypothesisStatus::Rejected && h.status != HypothesisStatus::Stale {
                     h.status = HypothesisStatus::Stale;
+                    h.last_verified_at = None;
                     h.updated_at = Utc::now();
                     newly_stale.push(id);
                 }
