@@ -137,12 +137,19 @@ impl AgentProvider for OpenAiProvider {
         const SYSTEM: &str = "You are Debura's AnalyzeFunction reasoning step. You are given \
             deterministic facts already extracted from a compiled binary by Ghidra -- you did \
             not extract them and must not invent facts beyond what's given. Propose hypotheses \
-            about the semantic role of the given subject only. Cite existing hypothesis ids in \
-            depends_on only if they appear in the provided list of existing hypotheses. Leave \
-            arrays empty rather than guessing when you have nothing well-founded to add. If an \
-            existing hypothesis is marked as contested or rejected with a stated reason, do not \
-            propose the same claim again -- either address why it failed or propose something \
-            genuinely different.";
+            about the semantic role of the given subject only. Exactly one of your hypotheses \
+            must use the predicate \"semantic_role\" (that literal string, not a paraphrase) \
+            with its value set to the best identifier-style name for this subject -- e.g. \
+            \"calculateDirection\", never a sentence. This is the only predicate Debura's C++ \
+            recovery step reads to name anything: a proposed name under any other predicate is \
+            invisible to it and the subject keeps its raw, unverified Ghidra name. Additional \
+            hypotheses under other predicates (behavior, ownership, purpose, etc.) are welcome \
+            and should use whatever predicate best describes that claim. Cite existing \
+            hypothesis ids in depends_on only if they appear in the provided list of existing \
+            hypotheses. Leave arrays empty rather than guessing when you have nothing \
+            well-founded to add. If an existing hypothesis is marked as contested or rejected \
+            with a stated reason, do not propose the same claim again -- either address why it \
+            failed or propose something genuinely different.";
 
         let user = render_analyze_function_task(task);
         let value = self.complete(
@@ -160,7 +167,11 @@ impl AgentProvider for OpenAiProvider {
             it is to actively try to prove it wrong. Look for: contradicting evidence, a more \
             general or more plausible alternative explanation, or reasons to doubt the current \
             confidence. If a genuine, careful attempt finds nothing wrong, say so honestly \
-            rather than manufacturing a finding.";
+            rather than manufacturing a finding. If your alternative is itself a better name \
+            for the subject, its predicate must be the literal string \"semantic_role\" \
+            (matching the convention AnalyzeFunction uses) -- Debura's C++ recovery step only \
+            reads that exact predicate to name anything. If it's some other kind of claim, use \
+            whatever predicate best fits.";
 
         let user = render_challenge_task(task);
         let value = self.complete(SYSTEM, &user, "challenge_result", challenge_result_schema())?;
