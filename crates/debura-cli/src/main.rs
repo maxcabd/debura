@@ -260,6 +260,16 @@ fn main() -> Result<()> {
                 report.total_investigations,
                 100.0 * report.productive_rate()
             );
+
+            // PROJECT.md M15: a blended "accepted" count can't tell a
+            // library-recognition win from real semantic recovery -- a
+            // real run's headline "8x more accepted knowledge" hid that
+            // most of it was libstdc++ internals, not game logic.
+            let claims = debura_scheduler::claim_breakdown(&graph);
+            println!();
+            println!("Accepted semantic_role claims, by class:");
+            println!("  Application:         {}", claims.application_accepted);
+            println!("  Library/compiler:    {}", claims.library_or_compiler_accepted);
         }
         Command::Investigate { project, subject } => {
             let root = debura_core::config::projects_dir().join(&project);

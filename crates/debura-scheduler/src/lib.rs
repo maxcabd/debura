@@ -5,6 +5,7 @@
 //! highest-priority task, enqueues whatever follows from it, and repeats
 //! until the queue empties or a budget trips.
 
+mod claims;
 mod fingerprint;
 mod priority;
 mod queue;
@@ -13,6 +14,7 @@ mod run;
 mod seed;
 mod task;
 
+pub use claims::{claim_breakdown, classify_subject, ClaimBreakdown, ClaimClass};
 pub use fingerprint::fingerprint;
 pub use queue::Scheduler;
 pub use report::{investigation_report, InvestigationReport, TaskTypeStats};
