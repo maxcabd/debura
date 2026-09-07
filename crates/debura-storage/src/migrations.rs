@@ -5,15 +5,63 @@ use rusqlite::Connection;
 ///
 /// Each entry runs at most once per database, tracked via `schema_migrations`.
 /// M2/M3 add the observation/evidence/hypothesis/dependency tables here.
-const MIGRATIONS: &[(&str, &str)] = &[(
-    "0001_init",
-    r#"
-    CREATE TABLE IF NOT EXISTS project_meta (
-        key   TEXT PRIMARY KEY,
-        value TEXT NOT NULL
-    );
-    "#,
-)];
+const MIGRATIONS: &[(&str, &str)] = &[
+    (
+        "0001_init",
+        r#"
+        CREATE TABLE IF NOT EXISTS project_meta (
+            key   TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+        "#,
+    ),
+    (
+        "0002_knowledge",
+        r#"
+        CREATE TABLE observations (
+            id          INTEGER PRIMARY KEY,
+            subject     TEXT NOT NULL,
+            predicate   TEXT NOT NULL,
+            value       TEXT NOT NULL,
+            confidence  REAL NOT NULL,
+            source      TEXT NOT NULL,
+            artifact    TEXT,
+            created_at  TEXT NOT NULL
+        );
+
+        CREATE TABLE evidence (
+            id                  INTEGER PRIMARY KEY,
+            observation_id      INTEGER NOT NULL REFERENCES observations(id),
+            relevance           TEXT NOT NULL,
+            source              TEXT NOT NULL,
+            location            TEXT,
+            artifact_reference  TEXT
+        );
+
+        CREATE TABLE hypotheses (
+            id                      INTEGER PRIMARY KEY,
+            subject                 TEXT NOT NULL,
+            predicate               TEXT NOT NULL,
+            value                   TEXT NOT NULL,
+            confidence              REAL NOT NULL,
+            status                  TEXT NOT NULL,
+            supporting_evidence     TEXT NOT NULL,
+            contradicting_evidence  TEXT NOT NULL,
+            created_by              INTEGER,
+            created_at              TEXT NOT NULL,
+            updated_at              TEXT NOT NULL,
+            last_verified_at        TEXT
+        );
+
+        CREATE TABLE dependencies (
+            source_hypothesis  INTEGER NOT NULL REFERENCES hypotheses(id),
+            target_hypothesis  INTEGER NOT NULL REFERENCES hypotheses(id),
+            kind               TEXT NOT NULL,
+            PRIMARY KEY (source_hypothesis, target_hypothesis, kind)
+        );
+        "#,
+    ),
+];
 
 pub fn run(conn: &Connection) -> Result<()> {
     conn.execute_batch(
