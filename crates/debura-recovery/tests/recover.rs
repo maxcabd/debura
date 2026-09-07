@@ -364,6 +364,47 @@ fn a_leading_base_constructor_call_becomes_a_real_initializer_list() {
     );
 }
 
+/// A real run's `Food::Food()` had Ghidra hoist local variable
+/// declarations (its usual C89-style convention) *before* the
+/// base-constructor call, which the first version of this rewrite --
+/// requiring the call to be the very first statement -- missed
+/// entirely, leaving the illegal C-style call in the body and breaking
+/// the compile with "no matching function for call to
+/// 'Collideable::Collideable()'" (the implicit no-arg default the
+/// compiler was left needing). The call must be found and spliced out
+/// wherever it actually is.
+#[test]
+fn a_base_constructor_call_after_local_declarations_is_still_found() {
+    let mut graph = KnowledgeGraph::new();
+    graph.add_observation("Collideable", "has_vtable_at", "0x980", 1.0, "ghidra:vtable", None);
+    graph.add_observation("Food", "has_vtable_at", "0x9c0", 1.0, "ghidra:vtable", None);
+    graph.add_observation("Food", "inherits_from", "Collideable", 1.0, "ghidra:rtti", None);
+
+    graph.add_observation("0x1", "has_name", "Food", 0.95, "ghidra:function", None);
+    graph.add_observation("0x1", "has_signature", "void Food(Food * this)", 0.95, "ghidra:function", None);
+    graph.add_observation(
+        "0x1",
+        "decompiles_to",
+        "void __thiscall Food::Food(Food *this)\n\n{\n  double dVar1;\n  int iVar2;\n  \n  Collideable::Collideable((Collideable *)this,0,0);\n  iVar2 = rand();\n  return;\n}",
+        0.95,
+        "ghidra:decompiler",
+        None,
+    );
+    graph.add_observation("0x1", "is_constructor_of", "Food", 0.95, "ghidra:function", None);
+
+    let program = extract(&graph);
+    let food = program.classes.iter().find(|c| c.name == "Food").unwrap();
+
+    let source = render_source(food);
+    assert!(source.contains("Food::Food() : Collideable(0,0)"), "source:\n{source}");
+    assert!(source.contains("double dVar1;"), "local declarations before the call must survive: {source}");
+    assert!(source.contains("iVar2 = rand();"), "statements after the call must survive: {source}");
+    assert!(
+        !source.contains("Collideable::Collideable((Collideable *)this"),
+        "the raw base-constructor call must not remain in the body: {source}"
+    );
+}
+
 /// A compact sanity check that the compat header actually declares what
 /// this session's real compile attempt against the Snake fixture showed
 /// was missing -- not exhaustive, just a guard against silently deleting

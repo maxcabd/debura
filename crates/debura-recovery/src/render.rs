@@ -129,15 +129,20 @@ pub fn render_header(class: &RecoveredClass) -> String {
 /// like an ordinary function on an object that already exists, and a
 /// real C++ constructor already default-constructs its base *before*
 /// the body even runs, so the call would be redundant even if it
-/// somehow compiled. This recognizes exactly that leading-statement
-/// shape and splits it into (initializer-list args, remaining body) so
-/// the caller can turn it into a real `: Base(args)`. Returns `None` for
-/// any body that doesn't open with precisely this pattern -- narrower
-/// than a real C parser, but this is the one shape Ghidra actually
-/// produces for it.
-fn extract_base_constructor_call<'a>(body: &'a str, base: &str) -> Option<(&'a str, &'a str)> {
-    let after_brace = body[body.find('{')? + 1..].trim_start();
-    let call_args = after_brace.strip_prefix(&format!("{base}::{base}("))?;
+/// somehow compiled. Finds exactly that call statement -- anywhere in
+/// the body, not just as the very first statement: a real run had
+/// constructors that hoist local variable declarations (Ghidra's usual
+/// C89-style convention) before the base-constructor call, which the
+/// first version of this only matching a leading statement missed
+/// entirely -- and splits it into (initializer-list args, body with
+/// that one statement spliced out, everything else left in place). Only
+/// a call shaped exactly like Ghidra's own idiom counts; anything else
+/// returns `None` and the body is left untouched, narrower than a real
+/// C parser but matching what Ghidra actually produces for this.
+fn extract_base_constructor_call(body: &str, base: &str) -> Option<(String, String)> {
+    let needle = format!("{base}::{base}(");
+    let start = body.find(&needle)?;
+    let call_args = &body[start + needle.len()..];
 
     let mut depth = 1i32;
     let close = call_args.char_indices().find_map(|(i, c)| match c {
@@ -152,12 +157,16 @@ fn extract_base_constructor_call<'a>(body: &'a str, base: &str) -> Option<(&'a s
         _ => None,
     })?;
 
-    let rest = call_args[close + 1..].trim_start().strip_prefix(';')?;
+    let after_semicolon = call_args[close + 1..].strip_prefix(';')?;
     let args = call_args[..close]
         .strip_prefix(&format!("({base} *)this"))?
         .trim_start_matches(',')
-        .trim();
-    Some((args, rest))
+        .trim()
+        .to_string();
+
+    let mut remaining_body = body[..start].to_string();
+    remaining_body.push_str(after_semicolon);
+    Some((args, remaining_body))
 }
 
 pub fn render_source(class: &RecoveredClass) -> String {
@@ -195,9 +204,9 @@ pub fn render_source(class: &RecoveredClass) -> String {
         }).flatten();
 
         let (initializer_list, body) = match base_init {
-            Some((args, rest)) => (
+            Some((args, patched)) => (
                 format!(" : {}({args})", class.base.as_ref().unwrap()),
-                format!("{{\n{rest}"),
+                extract_body(&patched),
             ),
             None => (String::new(), extract_body(&decompilation)),
         };
