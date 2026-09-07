@@ -80,6 +80,21 @@ const MIGRATIONS: &[(&str, &str)] = &[
         );
         "#,
     ),
+    (
+        "0004_ghidra_mutations",
+        r#"
+        CREATE TABLE ghidra_mutations (
+            id               INTEGER PRIMARY KEY,
+            hypothesis_id    INTEGER NOT NULL,
+            kind             TEXT NOT NULL,
+            target_address   TEXT NOT NULL,
+            previous_value   TEXT NOT NULL,
+            new_value        TEXT NOT NULL,
+            applied_at       TEXT NOT NULL,
+            reverted_at      TEXT
+        );
+        "#,
+    ),
 ];
 
 pub fn run(conn: &Connection) -> Result<()> {

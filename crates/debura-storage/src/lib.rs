@@ -1,5 +1,6 @@
 pub mod knowledge;
 mod migrations;
+pub mod mutations;
 
 use std::path::Path;
 
