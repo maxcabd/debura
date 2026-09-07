@@ -1,0 +1,6 @@
+[package]
+name = "debura-recovery"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
