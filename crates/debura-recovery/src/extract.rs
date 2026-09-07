@@ -1,8 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use debura_knowledge::{
-    classify_subject, is_reserved_identifier, ClaimClass, Hypothesis, HypothesisStatus,
-    KnowledgeGraph, Observation,
+    classify_provenance, is_reserved_identifier, Hypothesis, HypothesisStatus, KnowledgeGraph,
+    Observation, Provenance,
 };
 
 use crate::model::{NameSource, RecoveredClass, RecoveredField, RecoveredFunction, RecoveredMethod, RecoveredProgram};
@@ -453,11 +453,16 @@ pub fn extract(graph: &KnowledgeGraph) -> RecoveredProgram {
         if class_method_addresses.contains(&subject) {
             continue; // already represented as a class method
         }
-        if classify_subject(graph, &subject) == ClaimClass::LibraryOrCompiler {
-            // Same reasoning as the class-name filter above: a standalone
-            // function Ghidra's own name identifies as CRT/library
-            // machinery (`__p___argc`, `_cexit`, `operator_new`) doesn't
-            // need recovering -- a real g++ build already supplies it.
+        if classify_provenance(graph, &subject) == Provenance::CompilerLibraryGlue {
+            // Same reasoning as the class-name filter above, extended to
+            // the harder case: a standalone function whose own name
+            // looks like application code, but whose behavior is really
+            // an inlined library/compiler instantiation (a real run's
+            // `constructString`, whose entire body was calls into
+            // std::string's own private `_M_create`/`_M_data`/
+            // `_M_capacity`/`_M_set_length`) doesn't need recovering
+            // either -- a real g++ build already supplies whatever
+            // std::string itself does.
             continue;
         }
         let Some(raw_name) = latest(graph, &subject, "has_name").map(|o| o.value.clone()) else {

@@ -15,7 +15,10 @@ mod investigation;
 mod observation;
 mod program_model;
 
-pub use claims::{claim_breakdown, classify_subject, is_reserved_identifier, ClaimBreakdown, ClaimClass};
+pub use claims::{
+    claim_breakdown, classify_provenance, classify_subject, is_reserved_identifier,
+    library_callee_ratio, ClaimBreakdown, ClaimClass, Provenance,
+};
 pub use dependency::{Dependency, DependencyKind};
 pub use error::KnowledgeError;
 pub use evidence::Evidence;

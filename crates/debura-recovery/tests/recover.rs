@@ -242,6 +242,39 @@ fn libstdcxx_and_crt_standalone_functions_are_not_recovered() {
     assert!(program.functions.is_empty());
 }
 
+/// PROJECT.md M15: the harder case name-shape alone can't catch. A real
+/// run's `constructString` earned an ACCEPTED semantic_role and looked
+/// like application code by name -- but its entire body was calls into
+/// std::string's own private implementation (`_M_create`, `_M_data`,
+/// `_M_capacity`, `_M_set_length`), an inlined instantiation of the
+/// standard library's own logic, not anything the binary's author
+/// wrote. Recovering it produced qualified-id calls into libstdc++
+/// internals with no object, none of which a real g++ build accepts.
+#[test]
+fn functions_dominated_by_library_callees_are_not_recovered_despite_an_application_looking_name() {
+    let mut graph = KnowledgeGraph::new();
+    graph.add_observation("0x1", "has_name", "constructString", 0.95, "ghidra:function", None);
+    graph.add_observation("0x1", "has_signature", "void constructString(void)", 0.95, "ghidra:function", None);
+    graph.add_observation("0x1", "decompiles_to", "void constructString(void)\n\n{\n  return;\n}", 0.95, "ghidra:decompiler", None);
+    for callee in ["0x2", "0x3", "0x4", "0x5"] {
+        graph.add_observation("0x1", "calls", callee, 0.95, "ghidra:call_graph", None);
+    }
+    for (addr, name) in [
+        ("0x2", "_M_create"),
+        ("0x3", "_M_data"),
+        ("0x4", "_M_capacity"),
+        ("0x5", "_M_set_length"),
+    ] {
+        graph.add_observation(addr, "has_name", name, 0.95, "ghidra:function", None);
+    }
+    let h = graph.propose_hypothesis("0x1", "semantic_role", "constructString", 0.95, None);
+    graph.mark_verified(h, Utc::now()).unwrap();
+    graph.set_status(h, HypothesisStatus::Accepted).unwrap();
+
+    let program = extract(&graph);
+    assert!(program.functions.is_empty(), "{:?}", program.functions);
+}
+
 /// A real run had two unrelated addresses independently earn the exact
 /// same generic name (`invokeFunction`) from a conservative
 /// mechanical-behavior-style guess -- both landing in `functions.cpp`'s
