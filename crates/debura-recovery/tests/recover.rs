@@ -1,8 +1,8 @@
 use chrono::Utc;
 use debura_knowledge::{HypothesisStatus, KnowledgeGraph};
 use debura_recovery::{
-    extract, render_header, render_source, NameSource, GHIDRA_COMPAT_HEADER,
-    GHIDRA_COMPAT_HEADER_NAME,
+    extract, render_ghidra_symbols_header, render_header, render_source, NameSource,
+    GHIDRA_COMPAT_HEADER, GHIDRA_COMPAT_HEADER_NAME,
 };
 
 /// Builds a graph shaped like real debura-analysis output for the
@@ -312,8 +312,56 @@ fn a_class_includes_every_other_recovered_class_it_references() {
 
     assert_eq!(food.references, vec!["Screen".to_string()]);
 
+    // The header forward-declares it (a real run showed two classes
+    // referencing each other -- Section <-> Screen <-> Snake -- turns a
+    // full #include here into a circular one); render_source() carries
+    // the real #include, where the class's members are actually used.
     let header = render_header(food);
-    assert!(header.contains("#include \"Screen.hpp\""), "header:\n{header}");
+    assert!(header.contains("class Screen;"), "header:\n{header}");
+    assert!(!header.contains("#include \"Screen.hpp\""), "header:\n{header}");
+
+    let source = render_source(food);
+    assert!(source.contains("#include \"Screen.hpp\""), "source:\n{source}");
+}
+
+/// A real run had every derived-class constructor's decompiled body
+/// open by C-calling its base constructor directly on `this`
+/// (`Collideable::Collideable((Collideable *)this,0,0);`), which isn't
+/// legal C++ and also breaks because the language already
+/// default-constructs the base before the body runs. That leading call
+/// must become a real member-initializer-list entry, and disappear from
+/// the body.
+#[test]
+fn a_leading_base_constructor_call_becomes_a_real_initializer_list() {
+    let mut graph = KnowledgeGraph::new();
+    graph.add_observation("Collideable", "has_vtable_at", "0x980", 1.0, "ghidra:vtable", None);
+    graph.add_observation("Wall", "has_vtable_at", "0x9b0", 1.0, "ghidra:vtable", None);
+    graph.add_observation("Wall", "inherits_from", "Collideable", 1.0, "ghidra:rtti", None);
+
+    graph.add_observation("0x1", "has_name", "Wall", 0.95, "ghidra:function", None);
+    graph.add_observation("0x1", "has_signature", "void Wall(Wall * this, int param_1, int param_2)", 0.95, "ghidra:function", None);
+    graph.add_observation(
+        "0x1",
+        "decompiles_to",
+        "void __thiscall Wall::Wall(Wall *this,int param_1,int param_2)\n\n{\n  Collideable::Collideable((Collideable *)this,param_1,param_2);\n  *(undefined ***)this = &PTR_draw_140009a20;\n  return;\n}",
+        0.95,
+        "ghidra:decompiler",
+        None,
+    );
+    graph.add_observation("0x1", "is_constructor_of", "Wall", 0.95, "ghidra:function", None);
+
+    let program = extract(&graph);
+    let wall = program.classes.iter().find(|c| c.name == "Wall").unwrap();
+
+    let source = render_source(wall);
+    assert!(
+        source.contains("Wall::Wall(int param_1, int param_2) : Collideable(param_1,param_2)"),
+        "source:\n{source}"
+    );
+    assert!(
+        !source.contains("Collideable::Collideable((Collideable *)this"),
+        "the raw base-constructor call must not remain in the body: {source}"
+    );
 }
 
 /// A compact sanity check that the compat header actually declares what
@@ -328,4 +376,69 @@ fn ghidra_compat_header_declares_the_types_a_real_compile_needed() {
             "compat header is missing {needed:?}, which a real g++ run against recovered Snake output required"
         );
     }
+}
+
+/// `DAT_140009070`, `PTR_draw_140009a40`, `_refptr__ZN...E` -- Ghidra's
+/// own auto-named data symbols -- were referenced in recovered bodies
+/// but never declared anywhere else in the output, so a real compile
+/// failed outright on "not declared in this scope". They must be
+/// collected across every class and standalone function and declared
+/// once each.
+#[test]
+fn ghidra_data_symbols_are_collected_and_declared() {
+    let mut graph = KnowledgeGraph::new();
+    graph.add_observation("Drawable", "has_vtable_at", "0x9a0", 1.0, "ghidra:vtable", None);
+    graph.add_observation("0x1", "has_name", "Drawable", 0.95, "ghidra:function", None);
+    graph.add_observation("0x1", "has_signature", "void Drawable(Drawable * this, int x, int y)", 0.95, "ghidra:function", None);
+    graph.add_observation(
+        "0x1",
+        "decompiles_to",
+        "void __thiscall Drawable::Drawable(Drawable *this,int x,int y)\n\n{\n  *(undefined ***)this = &DAT_140009a60;\n  return;\n}",
+        0.95,
+        "ghidra:decompiler",
+        None,
+    );
+    graph.add_observation("0x1", "is_constructor_of", "Drawable", 0.95, "ghidra:function", None);
+
+    let program = extract(&graph);
+    assert_eq!(program.ghidra_data_symbols, vec!["DAT_140009a60".to_string()]);
+
+    let header = render_ghidra_symbols_header(&program.ghidra_data_symbols);
+    assert!(header.contains("extern unsigned char DAT_140009a60;"), "header:\n{header}");
+
+    let drawable = program.classes.iter().find(|c| c.name == "Drawable").unwrap();
+    let source = render_source(drawable);
+    assert!(
+        source.contains("(undefined **)&DAT_140009a60"),
+        "the vtable-pointer-slot assignment must get an explicit cast so it compiles \
+         regardless of the placeholder symbol's declared type: {source}"
+    );
+}
+
+/// Itanium ABI returns `this` from `operator=` in the return register,
+/// which Ghidra always decompiles as `return this;` -- but leaves the
+/// declared return type as `undefined`, which can't actually hold a
+/// class pointer. A real compile hit exactly this ("invalid conversion
+/// from 'Drawable*' to 'undefined'").
+#[test]
+fn operator_equals_returns_a_pointer_to_its_own_class_not_undefined() {
+    let mut graph = KnowledgeGraph::new();
+    graph.add_observation("Drawable", "has_vtable_at", "0x9a0", 1.0, "ghidra:vtable", None);
+    graph.add_observation("0x1", "has_name", "operator=", 0.95, "ghidra:function", None);
+    graph.add_observation("0x1", "has_signature", "undefined operator=(Drawable * this, Drawable * param_1)", 0.95, "ghidra:function", None);
+    graph.add_observation(
+        "0x1",
+        "decompiles_to",
+        "undefined __thiscall Drawable::operator=(Drawable *this,Drawable *param_1)\n\n{\n  return this;\n}",
+        0.95,
+        "ghidra:decompiler",
+        None,
+    );
+    graph.add_observation("0x1", "is_method_of", "Drawable", 0.95, "ghidra:function", None);
+
+    let program = extract(&graph);
+    let drawable = program.classes.iter().find(|c| c.name == "Drawable").unwrap();
+    let op_eq = &drawable.methods[0];
+
+    assert_eq!(op_eq.return_type, "Drawable *");
 }
