@@ -205,11 +205,21 @@ def demangle_itanium_type_name(raw):
     """The Itanium ABI's typeinfo `name` field is the class's own <name>
     mangling component -- not a full mangled symbol, just length-prefixed
     identifiers, optionally wrapped in N...E for a qualified (namespaced)
-    name, e.g. "9SnakeGame4Food" -> "SnakeGame::Food". Only handles that
-    plain nested-name shape; template names mangle very differently and
-    fall back to None here, same as any other unparseable case -- narrower
-    than a real demangler, but this is the shape a user's own class
-    produces."""
+    name, e.g. "9SnakeGame4Food" -> "Food". Only the last component is
+    kept, dropping any enclosing namespace -- matching extract_vtables()'s
+    own symbol-based convention below (Ghidra's "vtable for X" labels are
+    already namespace-stripped the same way), which every downstream
+    consumer -- render.rs's file names and `class X {`/`~X()` syntax
+    included -- was written against. A real run confirmed why this
+    matters: emitting the full "SnakeGame::Food" here instead produced a
+    `::` in a Windows file name (an OS error) and an illegal
+    `class SnakeGame::Food {` class-opening line, neither of which
+    render.rs was ever built to handle, and neither of which the
+    symbol-based path could ever have produced in the first place. Only
+    handles the plain nested-name shape; template names mangle very
+    differently and fall back to None here, same as any other unparseable
+    case -- narrower than a real demangler, but this is the shape a
+    user's own class produces."""
     if not raw:
         return None
     body = raw[1:-1] if raw.startswith("N") and raw.endswith("E") else raw
@@ -225,7 +235,7 @@ def demangle_itanium_type_name(raw):
             return None
         parts.append(rest[:length])
         rest = rest[length:]
-    return "::".join(parts) if parts else None
+    return parts[-1] if parts else None
 
 
 def class_name_from_vtable(vfunc0_addr, mem, addr_factory):
