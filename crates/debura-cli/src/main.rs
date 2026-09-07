@@ -1,7 +1,8 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
+use debura_agent::AgentProvider;
 use debura_core::project::{Project, ProjectState};
 
 #[derive(Parser)]
@@ -11,8 +12,28 @@ use debura_core::project::{Project, ProjectState};
     about = "Autonomous program recovery from compiled binaries"
 )]
 struct Cli {
+    /// Reasoning backend for any command that calls an AgentProvider
+    #[arg(long, value_enum, global = true, default_value_t = ProviderChoice::Mock)]
+    provider: ProviderChoice,
+
     #[command(subcommand)]
     command: Command,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum ProviderChoice {
+    /// Deterministic, no network calls, no cost -- see debura_agent::mock
+    Mock,
+    /// Real reasoning via OpenAI. Costs money per call; needs
+    /// OPENAI_API_KEY (.env or a real env var).
+    Openai,
+}
+
+fn make_provider(choice: ProviderChoice) -> Result<Box<dyn AgentProvider>> {
+    Ok(match choice {
+        ProviderChoice::Mock => Box::new(debura_agent::mock::EchoProvider),
+        ProviderChoice::Openai => Box::new(debura_agent::openai::OpenAiProvider::from_env()?),
+    })
 }
 
 #[derive(Subcommand)]
@@ -34,30 +55,27 @@ enum Command {
         project: String,
     },
     /// Run a bounded AnalyzeFunction investigation against one subject
-    /// (currently always via the deterministic mock provider -- no real
-    /// model is wired in yet)
     Investigate {
         /// Project id, as printed by `debura new`
         project: String,
         /// Subject address to investigate, e.g. 0x1400016e4
         subject: String,
     },
-    /// Adversarially challenge one hypothesis (always via the mock
-    /// provider for now)
+    /// Adversarially challenge one hypothesis
     Challenge {
         /// Project id, as printed by `debura new`
         project: String,
         /// Hypothesis id, e.g. H1 (as printed by `debura investigate`)
         hypothesis: String,
     },
-    /// Resolve a CONTESTED hypothesis (always via the mock provider for now)
+    /// Resolve a CONTESTED hypothesis
     Resolve {
         /// Project id, as printed by `debura new`
         project: String,
         /// Hypothesis id, e.g. H1
         hypothesis: String,
     },
-    /// Run the autonomous loop (always via the mock provider for now)
+    /// Run the autonomous loop
     Run {
         /// Project id, as printed by `debura new`
         project: String,
@@ -84,6 +102,12 @@ fn parse_hypothesis_id(s: &str) -> anyhow::Result<debura_knowledge::HypothesisId
 }
 
 fn main() -> Result<()> {
+    // Loads .env if present (walking up from the current directory), so a
+    // provider API key can live in a gitignored file instead of needing
+    // `export` in every shell. Silently does nothing if there is no file --
+    // that's the normal case wherever the key is already a real env var.
+    dotenvy::dotenv().ok();
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -164,12 +188,13 @@ fn main() -> Result<()> {
         Command::Investigate { project, subject } => {
             let root = debura_core::config::projects_dir().join(&project);
             anyhow::ensure!(root.is_dir(), "no such project: {project}");
+            let provider = make_provider(cli.provider)?;
 
             let conn = debura_storage::init_project_db(&root.join("project.sqlite"))?;
             let mut graph = debura_storage::knowledge::load(&conn)?;
 
             let investigation_id =
-                debura_agent::analyze_function(&mut graph, &debura_agent::mock::EchoProvider, &subject)?;
+                debura_agent::analyze_function(&mut graph, provider.as_ref(), &subject)?;
 
             debura_storage::knowledge::save(&conn, &graph)?;
 
@@ -190,13 +215,14 @@ fn main() -> Result<()> {
             let root = debura_core::config::projects_dir().join(&project);
             anyhow::ensure!(root.is_dir(), "no such project: {project}");
             let id = parse_hypothesis_id(&hypothesis)?;
+            let provider = make_provider(cli.provider)?;
 
             let conn = debura_storage::init_project_db(&root.join("project.sqlite"))?;
             let mut graph = debura_storage::knowledge::load(&conn)?;
 
             debura_verifier::challenge_hypothesis(
                 &mut graph,
-                &debura_agent::mock::EchoProvider,
+                provider.as_ref(),
                 id,
                 &debura_verifier::VerificationPolicy::default(),
             )?;
@@ -213,13 +239,14 @@ fn main() -> Result<()> {
             let root = debura_core::config::projects_dir().join(&project);
             anyhow::ensure!(root.is_dir(), "no such project: {project}");
             let id = parse_hypothesis_id(&hypothesis)?;
+            let provider = make_provider(cli.provider)?;
 
             let conn = debura_storage::init_project_db(&root.join("project.sqlite"))?;
             let mut graph = debura_storage::knowledge::load(&conn)?;
 
             debura_verifier::resolve_contradiction(
                 &mut graph,
-                &debura_agent::mock::EchoProvider,
+                provider.as_ref(),
                 id,
                 &debura_verifier::VerificationPolicy::default(),
             )?;
@@ -241,6 +268,7 @@ fn main() -> Result<()> {
         } => {
             let root = debura_core::config::projects_dir().join(&project);
             anyhow::ensure!(root.is_dir(), "no such project: {project}");
+            let provider = make_provider(cli.provider)?;
 
             let conn = debura_storage::init_project_db(&root.join("project.sqlite"))?;
             let mut graph = debura_storage::knowledge::load(&conn)?;
@@ -256,7 +284,7 @@ fn main() -> Result<()> {
 
             let summary = debura_scheduler::run(
                 &mut graph,
-                &debura_agent::mock::EchoProvider,
+                provider.as_ref(),
                 &debura_verifier::VerificationPolicy::default(),
                 &budget,
                 |iteration, task, graph| {

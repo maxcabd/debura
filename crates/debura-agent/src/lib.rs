@@ -15,6 +15,8 @@ mod result;
 mod task;
 
 pub mod mock;
+#[cfg(feature = "openai")]
+pub mod openai;
 
 pub use challenge::{ChallengeHypothesisTask, ChallengeResult};
 pub use harness::{analyze_function, commit_contradiction, commit_hypothesis};
