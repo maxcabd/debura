@@ -34,14 +34,30 @@ pub fn is_reserved_identifier(name: &str) -> bool {
     matches!((chars.next(), chars.next()), (Some('_'), Some(c)) if c.is_ascii_uppercase())
 }
 
-/// Classifies a subject by its class membership (`is_method_of`) or, for
-/// a free function, its own name. Defaults to `Application` when neither
-/// observation is present or neither matches a reserved shape -- an
-/// unnamed structurally-discovered class (`Class_1400080e0`) counts as
-/// Application too, since it's genuinely unverified rather than known to
-/// be library code; ground-truth classification (a separate, manual
-/// process) is still needed to judge its accuracy.
+/// Classifies a subject by its class membership (`is_method_of`), its
+/// own name, or -- the strongest signal, checked first -- whether it's
+/// listed in the binary's own import table at all: an `imports`
+/// observation means the symbol is external to the binary by
+/// construction (whether a dynamically-imported libstdc++/SDL symbol or
+/// a statically-linked one Ghidra still recognized), which no
+/// name-shape heuristic is needed to establish. A real run showed why
+/// this matters beyond the C++-reserved-identifier convention alone:
+/// SDL's own C API (`SDL_Init`, `TTF_OpenFont`) is plain PascalCase, not
+/// underscore-prefixed, so it never matched `is_reserved_identifier` at
+/// all -- diluting a library-dominated function's callee ratio with
+/// calls that were just as clearly not application code, only shaped
+/// differently. Defaults to `Application` when none of these observations
+/// are present or none matches -- an unnamed structurally-discovered
+/// class (`Class_1400080e0`) counts as Application too, since it's
+/// genuinely unverified rather than known to be library code;
+/// ground-truth classification (a separate, manual process) is still
+/// needed to judge its accuracy.
 pub fn classify_subject(graph: &KnowledgeGraph, subject: &str) -> ClaimClass {
+    let imported = graph.observations().any(|o| o.subject == subject && o.predicate == "imports");
+    if imported {
+        return ClaimClass::LibraryOrCompiler;
+    }
+
     let owner = graph
         .observations()
         .find(|o| o.subject == subject && o.predicate == "is_method_of")
@@ -180,6 +196,19 @@ mod tests {
         // immediately followed by an uppercase letter is (or a `__`
         // anywhere); `_lowercase` doesn't match the C++ reservation rule.
         assert!(!is_reserved_identifier("_lowercase"));
+    }
+
+    /// A real run showed SDL's own C API (`SDL_Init`, `TTF_OpenFont`) is
+    /// plain PascalCase, never matching `is_reserved_identifier` -- an
+    /// `imports` observation is a stronger, name-shape-independent
+    /// signal that catches it anyway.
+    #[test]
+    fn an_imported_symbol_is_library_regardless_of_name_shape() {
+        let mut graph = KnowledgeGraph::new();
+        graph.add_observation("0x1", "has_name", "SDL_Init", 0.95, "ghidra:function", None);
+        graph.add_observation("0x1", "imports", "SDL2.dll!SDL_Init", 1.0, "ghidra:imports", None);
+
+        assert_eq!(classify_subject(&graph, "0x1"), ClaimClass::LibraryOrCompiler);
     }
 
     #[test]
