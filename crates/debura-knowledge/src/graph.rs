@@ -303,6 +303,14 @@ impl KnowledgeGraph {
         newly_stale
     }
 
+    /// How many hypotheses DEPEND_ON `id` directly (not transitively).
+    /// A scheduler (M6) uses this as a proxy for "how much would resolving
+    /// this unblock" (S15, S27): a central type has many dependents, so
+    /// settling it is worth more than settling something no one relies on.
+    pub fn dependent_count(&self, id: HypothesisId) -> usize {
+        self.dependents_of.get(&id).map(Vec::len).unwrap_or(0)
+    }
+
     // --- Investigation -------------------------------------------------------
 
     pub fn record_investigation(&mut self, mut investigation: Investigation) -> InvestigationId {
