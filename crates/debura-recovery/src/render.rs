@@ -16,7 +16,42 @@ use crate::symbols::GHIDRA_SYMBOLS_HEADER_NAME;
 fn patch_known_idioms(text: &str) -> String {
     let prefix = "*(undefined ***)this = ";
     let needle = format!("{prefix}&");
-    text.replace(&needle, &format!("{prefix}(undefined **)&"))
+    let text = text.replace(&needle, &format!("{prefix}(undefined **)&"));
+
+    // Ghidra decompiles `std::cout << x` (real signature: `ostream&
+    // operator<<(ostream&, ...)`) as `std::operator<<(&cout, x)` --
+    // references are raw pointers at the ABI level, which the real,
+    // reference-taking overloads don't match at all. C++ also forbids
+    // declaring a pointer-taking `operator<<` overload to catch this (a
+    // non-member operator<< needs at least one class/enum/reference
+    // parameter, which `(ostream *, T *)` never has); `compat.rs`'s
+    // `debura_stream_output`/`debura_stream_endl` are ordinary functions
+    // instead, which carry no such restriction, so the call sites are
+    // renamed to them here rather than declaring an operator that could
+    // never legally exist.
+    let text = text.replace("std::operator<<(", "debura_stream_output(");
+    let text = text.replace("std::endl<char,std::char_traits<char>>(", "debura_stream_endl(");
+
+    // Ghidra always writes these STL types out with their real,
+    // explicit (and in this codebase, always `char`-based) template
+    // arguments -- valid against the *real* std:: templates, but not
+    // against `ghidra_compat.hpp`'s own bare-name aliases (declared as
+    // plain, non-template `using` aliases specifically so a bare
+    // `basic_ostream *pbVar1;` -- Ghidra's *other* common shape for the
+    // same type, with no template arguments at all -- also resolves). A
+    // real compile hit "is not a template" for exactly this: a local
+    // variable declared `basic_stringstream<char,...> local_1a8 [16];`.
+    // Dropping the redundant explicit arguments (they name the exact
+    // instantiation the bare alias already is) satisfies both shapes.
+    let text = text.replace(
+        "basic_stringstream<char,std::char_traits<char>,std::allocator<char>>",
+        "basic_stringstream",
+    );
+    let text = text.replace(
+        "basic_string<char,std::char_traits<char>,std::allocator<char>>",
+        "basic_string",
+    );
+    text.replace("basic_ostream<char,std::char_traits<char>>", "basic_ostream")
 }
 
 fn name_comment(source: &NameSource) -> String {

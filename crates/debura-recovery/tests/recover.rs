@@ -1,8 +1,8 @@
 use chrono::Utc;
 use debura_knowledge::{HypothesisStatus, KnowledgeGraph};
 use debura_recovery::{
-    extract, render_function_declarations, render_ghidra_symbols_header, render_header,
-    render_source, NameSource, GHIDRA_COMPAT_HEADER, GHIDRA_COMPAT_HEADER_NAME,
+    extract, render_function_declarations, render_ghidra_compat_header, render_ghidra_symbols_header,
+    render_header, render_source, NameSource, GHIDRA_COMPAT_HEADER_NAME,
 };
 
 /// Builds a graph shaped like real debura-analysis output for the
@@ -242,6 +242,29 @@ fn libstdcxx_and_crt_standalone_functions_are_not_recovered() {
     assert!(program.functions.is_empty());
 }
 
+/// A real run had two unrelated addresses independently earn the exact
+/// same generic name (`invokeFunction`) from a conservative
+/// mechanical-behavior-style guess -- both landing in `functions.cpp`'s
+/// single shared scope, which C++ doesn't allow (a real "redefinition"
+/// compile error). PROJECT.md M15's disambiguation should catch the
+/// collision and rename both, appending each one's own address.
+#[test]
+fn colliding_function_names_are_disambiguated_by_address() {
+    let mut graph = KnowledgeGraph::new();
+    for (addr, raw) in [("0x10", "FUN_10"), ("0x20", "FUN_20")] {
+        graph.add_observation(addr, "has_name", raw, 0.95, "ghidra:function", None);
+        graph.add_observation(addr, "has_signature", format!("void {raw}(void)"), 0.95, "ghidra:function", None);
+        graph.add_observation(addr, "decompiles_to", format!("void {raw}(void)\n\n{{\n  return;\n}}"), 0.95, "ghidra:decompiler", None);
+        let h = graph.propose_hypothesis(addr, "semantic_role", "invokeFunction", 0.95, None);
+        graph.mark_verified(h, Utc::now()).unwrap();
+        graph.set_status(h, HypothesisStatus::Accepted).unwrap();
+    }
+
+    let program = extract(&graph);
+    let names: Vec<&str> = program.functions.iter().map(|f| f.display_name.as_str()).collect();
+    assert_eq!(names, vec!["invokeFunction_10", "invokeFunction_20"]);
+}
+
 /// A real run hit this: a retry after a *sibling* hypothesis (a
 /// different predicate from the same investigation) gets rejected
 /// re-runs AnalyzeFunction on the whole subject, and a fresh
@@ -472,12 +495,13 @@ fn refptr_symbols_are_declared_as_pointers_not_plain_bytes() {
 /// the entries that were verified to matter.
 #[test]
 fn ghidra_compat_header_declares_the_types_a_real_compile_needed() {
+    let header = render_ghidra_compat_header(&["CONCAT44".to_string()]);
     for needed in [
         "undefined", "undefined4", "undefined8", "uint", "ulonglong", "code", "CONCAT44",
         "__thiscall", "operator_new", "operator_delete", "<windows.h>", "<iostream>", "<cstring>",
     ] {
         assert!(
-            GHIDRA_COMPAT_HEADER.contains(needed),
+            header.contains(needed),
             "compat header is missing {needed:?}, which a real g++ run against recovered Snake output required"
         );
     }
@@ -518,6 +542,37 @@ fn ghidra_data_symbols_are_collected_and_declared() {
         "the vtable-pointer-slot assignment must get an explicit cast so it compiles \
          regardless of the placeholder symbol's declared type: {source}"
     );
+}
+
+/// A real run showed `&LAB_x` isn't a goto target at all -- it's a
+/// MinGW CRT startup idiom taking a label's *address* as a function
+/// pointer value (`(_invalid_parameter_handler)&LAB_140001000`). Handled
+/// the same way as `DAT_`/`PTR_`: an extern placeholder declaration,
+/// which can never collide with a genuine `LAB_x:` goto-label elsewhere
+/// in the same function (C++ keeps labels and ordinary names in
+/// separate namespaces).
+#[test]
+fn lab_symbols_taken_by_address_are_declared_as_placeholders() {
+    let mut graph = KnowledgeGraph::new();
+    graph.add_observation("0x1", "has_name", "FUN_1", 0.95, "ghidra:function", None);
+    graph.add_observation("0x1", "has_signature", "void FUN_1(void)", 0.95, "ghidra:function", None);
+    graph.add_observation(
+        "0x1",
+        "decompiles_to",
+        "void FUN_1(void)\n\n{\n  registerHandler((handler_t)&LAB_140001000);\n  return;\n}",
+        0.95,
+        "ghidra:decompiler",
+        None,
+    );
+    let h = graph.propose_hypothesis("0x1", "semantic_role", "installHandler", 0.95, None);
+    graph.mark_verified(h, Utc::now()).unwrap();
+    graph.set_status(h, HypothesisStatus::Accepted).unwrap();
+
+    let program = extract(&graph);
+    assert_eq!(program.ghidra_data_symbols, vec!["LAB_140001000".to_string()]);
+
+    let header = render_ghidra_symbols_header(&program.ghidra_data_symbols, &program.unresolved_calls, "");
+    assert!(header.contains("extern unsigned char LAB_140001000;"), "header:\n{header}");
 }
 
 /// Itanium ABI returns `this` from `operator=` in the return register,
