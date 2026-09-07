@@ -136,25 +136,44 @@ impl AgentProvider for OpenAiProvider {
     fn investigate(&self, task: &AnalyzeFunctionTask) -> Result<InvestigationResult> {
         const SYSTEM: &str = "You are Debura's AnalyzeFunction reasoning step. You are given \
             deterministic facts already extracted from a compiled binary by Ghidra -- you did \
-            not extract them and must not invent facts beyond what's given. Propose hypotheses \
-            about the semantic role of the given subject only. Exactly one of your hypotheses \
-            must use the predicate \"semantic_role\" (that literal string, not a paraphrase) \
-            with its value set to the best identifier-style name for this subject -- e.g. \
-            \"calculateDirection\", never a sentence. This is the only predicate Debura's C++ \
-            recovery step reads to name anything: a proposed name under any other predicate is \
-            invisible to it and the subject keeps its raw, unverified Ghidra name. Additional \
-            hypotheses under other predicates (behavior, ownership, purpose, etc.) are welcome \
+            not extract them and must not invent facts beyond what's given. \
+            \n\n\
+            Two different kinds of claim matter here, and they are not the same thing. Exactly \
+            one hypothesis must use the predicate \"mechanical_behavior\": what the function's \
+            own body literally does, at the level the decompilation itself supports (e.g. \
+            \"decrementsIntegerField\", \"iterates20x20Grid\", \"comparesTwoStructs\"). Always \
+            propose this one, even when nothing else is clear -- it only needs the function's \
+            own code. \
+            \n\n\
+            Separately, propose a hypothesis under the predicate \"semantic_role\" (that literal \
+            string, not a paraphrase) ONLY when you have evidence beyond the function's own body \
+            -- its callers (the called_by observations), its class membership and what its \
+            sibling methods suggest the class is for, or field semantics -- that supports a \
+            claim about this function's PURPOSE in the program, not just its mechanics. A real \
+            case this matters for: a function that decrements a field is mechanically a \
+            decrement, but if it's a Snake method reached from a collision-handling path and \
+            leads toward a game-over state, that context is what justifies naming its semantic \
+            role something like \"die\" -- the decrement alone does not. If your only evidence is \
+            the function's own decompiled body, do not propose a semantic_role at all this round; \
+            leaving it unproposed (so the subject keeps its raw name for now) is a more honest \
+            outcome than a confident-sounding guess the body alone can't support. When you do \
+            have that broader evidence, semantic_role's value should still be an identifier-style \
+            name, e.g. \"calculateDirection\", never a sentence. semantic_role is the only \
+            predicate Debura's C++ recovery step reads to rename anything -- a proposed name \
+            under any other predicate (including mechanical_behavior) is invisible to it and the \
+            subject keeps its raw, unverified Ghidra name. \
+            \n\n\
+            Additional hypotheses under other predicates (ownership, purpose, etc.) are welcome \
             and should use whatever predicate best describes that claim. Cite existing \
             hypothesis ids in depends_on only if they appear in the provided list of existing \
-            hypotheses. Leave arrays empty rather than guessing when you have nothing \
-            well-founded to add. If an existing hypothesis is marked as contested or rejected \
-            with a stated reason, do not propose the same claim again -- either address why it \
-            failed or propose something genuinely different. If the subject has a \
-            vtable_install_pattern observation, name it \"install<ClassName>Vtable\" (e.g. \
+            hypotheses. If an existing hypothesis is marked as contested or rejected with a \
+            stated reason, do not propose the same claim again -- either address why it failed or \
+            propose something genuinely different. If the subject has a vtable_install_pattern \
+            observation, its semantic_role should be \"install<ClassName>Vtable\" (e.g. \
             \"installWallVtable\") -- identifier-style and class-qualified, without claiming to \
             know constructor vs destructor, which that observation deliberately doesn't \
-            determine. A bare word like \"constructor\" on its own isn't identifier-style \
-            enough for Debura's recovery step, even when the underlying belief is correct.";
+            determine. A bare word like \"constructor\" on its own isn't identifier-style enough \
+            for Debura's recovery step, even when the underlying belief is correct.";
 
         let user = render_analyze_function_task(task);
         let value = self.complete(
@@ -180,20 +199,37 @@ impl AgentProvider for OpenAiProvider {
             nothing about one subject bears on another, and evidence must never be borrowed \
             across them. You are given deterministic facts already extracted from a compiled \
             binary by Ghidra -- you did not extract them and must not invent facts beyond \
-            what's given. Propose hypotheses about the semantic role of each subject only. \
-            Exactly one hypothesis per subject must use the predicate \"semantic_role\" (that \
-            literal string, not a paraphrase) with its value set to the best identifier-style \
-            name for that subject -- e.g. \"calculateDirection\", never a sentence. This is the \
-            only predicate Debura's C++ recovery step reads to name anything: a proposed name \
-            under any other predicate is invisible to it and the subject keeps its raw, \
-            unverified Ghidra name. Additional hypotheses under other predicates (behavior, \
-            ownership, purpose, etc.) are welcome and should use whatever predicate best \
-            describes that claim. Cite existing hypothesis ids in depends_on only if they \
-            appear in that subject's own list of existing hypotheses. Leave arrays empty rather \
-            than guessing when you have nothing well-founded to add for a subject. If an \
-            existing hypothesis is marked as contested or rejected with a stated reason, do not \
-            propose the same claim again -- either address why it failed or propose something \
-            genuinely different. If a subject has a vtable_install_pattern observation, name it \
+            what's given. \
+            \n\n\
+            Two different kinds of claim matter for each subject, and they are not the same \
+            thing. Exactly one hypothesis per subject must use the predicate \
+            \"mechanical_behavior\": what that subject's own body literally does, at the level \
+            the decompilation itself supports (e.g. \"decrementsIntegerField\", \
+            \"iterates20x20Grid\"). Always propose this one for every subject, even when nothing \
+            else is clear -- it only needs that subject's own code. \
+            \n\n\
+            Separately, propose a hypothesis under the predicate \"semantic_role\" (that literal \
+            string, not a paraphrase) for a given subject ONLY when you have evidence beyond its \
+            own body -- its callers (the called_by observations), its class membership and what \
+            its sibling methods suggest the class is for, or field semantics -- that supports a \
+            claim about that subject's PURPOSE in the program, not just its mechanics. If a \
+            subject's only evidence is its own decompiled body, do not propose a semantic_role \
+            for it this round; leaving it unproposed is a more honest outcome than a \
+            confident-sounding guess the body alone can't support. When you do have that broader \
+            evidence, semantic_role's value should still be an identifier-style name, e.g. \
+            \"calculateDirection\", never a sentence. semantic_role is the only predicate \
+            Debura's C++ recovery step reads to rename anything -- a proposed name under any \
+            other predicate (including mechanical_behavior) is invisible to it and the subject \
+            keeps its raw, unverified Ghidra name. \
+            \n\n\
+            Additional hypotheses under other predicates (ownership, purpose, etc.) are welcome \
+            and should use whatever predicate best describes that claim. Cite existing \
+            hypothesis ids in depends_on only if they appear in that subject's own list of \
+            existing hypotheses. Leave arrays empty rather than guessing when you have nothing \
+            well-founded to add for a subject. If an existing hypothesis is marked as contested \
+            or rejected with a stated reason, do not propose the same claim again -- either \
+            address why it failed or propose something genuinely different. If a subject has a \
+            vtable_install_pattern observation, its semantic_role should be \
             \"install<ClassName>Vtable\" (e.g. \"installWallVtable\") -- identifier-style and \
             class-qualified, without claiming to know constructor vs destructor, which that \
             observation deliberately doesn't determine. A bare word like \"constructor\" on its \
@@ -400,7 +436,20 @@ const CHALLENGE_SYSTEM: &str = "You are Debura's ChallengeHypothesis adversarial
     pointer -- a semantic_role name shaped \"install<ClassName>Vtable\" is already an \
     appropriately conservative, honest name for exactly that fact, not a vague placeholder \
     needing more specificity; don't demand it also specify constructor vs destructor or a \
-    fuller behavioral role the evidence doesn't support.";
+    fuller behavioral role the evidence doesn't support. \
+    \n\n\
+    If the hypothesis under review has the predicate \"semantic_role\" (not \
+    \"mechanical_behavior\" -- that one is expected to describe the body's own mechanics and \
+    isn't held to this bar), ask specifically: could this be describing only one internal side \
+    effect or mechanical detail of the function, rather than its role in the application? A real \
+    case this caught: a semantic_role of \"decrementValue\" for a Snake method later shown to be \
+    the death handler -- the decrement is real, but naming the *role* after one incidental \
+    operation, with no supporting evidence beyond the function's own body (no caller, class-role, \
+    or field-semantics context contributing), is exactly the failure this question exists to \
+    catch. If that's what you find -- a semantic_role whose only support is the subject's own \
+    decompiled body, describing what the code does rather than why it exists -- flag it as a \
+    contradiction and recommend it be withdrawn (or re-proposed under mechanical_behavior \
+    instead), even when the description is technically accurate.";
 
 const RESOLVE_SYSTEM: &str = "You are Debura's ResolveContradiction step. A hypothesis has been \
     marked CONTESTED because contradicting evidence was found. Weigh the supporting evidence \
