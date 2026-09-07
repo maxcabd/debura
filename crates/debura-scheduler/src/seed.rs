@@ -252,7 +252,7 @@ fn is_likely_runtime_noise(name: &str) -> bool {
     NOISE_CONTAINS.iter().any(|needle| name.contains(needle))
 }
 
-fn latest_value<'a>(graph: &'a KnowledgeGraph, subject: &str, predicate: &str) -> Option<&'a str> {
+pub(crate) fn latest_value<'a>(graph: &'a KnowledgeGraph, subject: &str, predicate: &str) -> Option<&'a str> {
     graph
         .observations()
         .filter(|o| o.subject == subject && o.predicate == predicate)

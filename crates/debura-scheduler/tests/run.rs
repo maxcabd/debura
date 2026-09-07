@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use chrono::Utc;
 use debura_agent::mock::EchoProvider;
 use debura_agent::{
     AgentProvider, AnalyzeFunctionTask, ChallengeHypothesisTask, ChallengeResult,
@@ -60,6 +61,65 @@ fn coverage_target_stops_before_the_queue_empties() {
     assert!(summary.iterations < 4, "should stop once coverage is reached, not run to completion");
     assert_eq!(summary.total_subjects, 2);
     assert!(summary.resolved_subjects * 2 >= summary.total_subjects, "at least 50% must be resolved");
+}
+
+/// PROJECT.md M10: a subject whose decompiled body exactly matches
+/// (after Ghidra-address normalization) an already-solved subject
+/// should reuse that answer instead of spending another AnalyzeFunction
+/// call on code we've already investigated once.
+#[test]
+fn a_structurally_identical_subject_reuses_the_accepted_answer_without_a_fresh_investigation() {
+    let mut graph = KnowledgeGraph::new();
+
+    graph.add_observation("0x1", "has_name", "resetLevel", 0.95, "ghidra:function", None);
+    graph.add_observation(
+        "0x1",
+        "decompiles_to",
+        "void resetLevel(void) { score = DAT_140009070; return; }",
+        0.95,
+        "ghidra:decompiler",
+        None,
+    );
+    let h = graph.propose_hypothesis("0x1", "semantic_role", "resetLevel", 0.9, None);
+    graph.mark_verified(h, Utc::now()).unwrap();
+    graph.set_status(h, HypothesisStatus::Accepted).unwrap();
+
+    // Same shape, different embedded address -- the case a real re-run
+    // of the same source at another address (or a duplicate/COMDAT-folded
+    // copy) actually looks like.
+    graph.add_observation("0x2", "has_name", "FUN_dead", 0.95, "ghidra:function", None);
+    graph.add_observation(
+        "0x2",
+        "decompiles_to",
+        "void resetLevel(void) { score = DAT_1400091a0; return; }",
+        0.95,
+        "ghidra:decompiler",
+        None,
+    );
+
+    let summary = run(&mut graph, &EchoProvider, &VerificationPolicy::default(), &RunBudget::default(), |_, _, _| {});
+
+    assert_eq!(summary.stopped_because, StopReason::QueueEmpty);
+
+    let analyzed_0x2 = graph
+        .investigations()
+        .filter(|i| i.task == "AnalyzeFunction" && i.target == "0x2")
+        .count();
+    assert_eq!(analyzed_0x2, 0, "a fingerprint match must skip the model call entirely");
+
+    let semantic_role = graph
+        .hypotheses()
+        .find(|h| h.subject == "0x2" && h.predicate == "semantic_role")
+        .expect("the cloned hypothesis should exist");
+    assert_eq!(semantic_role.value, "resetLevel");
+    assert_eq!(semantic_role.status, HypothesisStatus::Accepted);
+
+    assert!(
+        graph
+            .observations()
+            .any(|o| o.subject == "0x2" && o.predicate == "fingerprint_cache_source" && o.value == "0x1"),
+        "the reused answer's provenance must be traceable back to its source subject"
+    );
 }
 
 #[test]

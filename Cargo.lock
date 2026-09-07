@@ -350,6 +350,7 @@ name = "debura-scheduler"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "debura-agent",
  "debura-knowledge",
  "debura-verifier",

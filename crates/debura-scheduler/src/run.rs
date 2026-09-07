@@ -174,10 +174,18 @@ pub fn run(
     budget: &RunBudget,
     mut on_iteration: impl FnMut(u64, &Task, &KnowledgeGraph),
 ) -> RunSummary {
+    // `seeded` (the coverage denominator) is captured before the
+    // fingerprint cache can mutate the graph, so subjects it fast-paths
+    // still count as part of the binary that needed handling.
     let seeded = seeded_subjects(graph);
+    let cache_followups = crate::fingerprint::apply_fingerprint_cache(graph, &seeded);
+
     let mut scheduler = Scheduler::new();
-    for subject in &seeded {
-        scheduler.enqueue(graph, Task::AnalyzeFunction { subject: subject.clone() });
+    for task in seed_initial_tasks(graph) {
+        scheduler.enqueue(graph, task);
+    }
+    for followup in cache_followups {
+        scheduler.enqueue(graph, followup);
     }
 
     let start = Instant::now();
@@ -432,10 +440,18 @@ pub fn run_with_concurrency(
         .build()
         .expect("failed to build thread pool");
 
+    // `seeded` (the coverage denominator) is captured before the
+    // fingerprint cache can mutate the graph, so subjects it fast-paths
+    // still count as part of the binary that needed handling.
     let seeded = seeded_subjects(graph);
+    let cache_followups = crate::fingerprint::apply_fingerprint_cache(graph, &seeded);
+
     let mut scheduler = Scheduler::new();
-    for subject in &seeded {
-        scheduler.enqueue(graph, Task::AnalyzeFunction { subject: subject.clone() });
+    for task in seed_initial_tasks(graph) {
+        scheduler.enqueue(graph, task);
+    }
+    for followup in cache_followups {
+        scheduler.enqueue(graph, followup);
     }
 
     let start = Instant::now();
