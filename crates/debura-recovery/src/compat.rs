@@ -81,9 +81,25 @@ typedef unsigned int uint;
 typedef unsigned long long ulonglong;
 typedef long long longlong;
 
-// Ghidra's type for "this address holds executable code" -- almost
-// always seen only as `code *`, i.e. an opaque function pointer.
-typedef void code;
+// Ghidra's type for "this address holds executable code" -- `code *` is
+// meant to *be* a callable function pointer (a real run had
+// `(**(code **)ptr)(0,2,0);`, calling straight through a double
+// dereference with no further cast), not a `void *`: a real compile
+// showed `typedef void code;` fails exactly that call ("'code*' {aka
+// 'void*'} is not a pointer-to-object type") since you can never call
+// through a `void *`. A variadic function type has no such problem --
+// `code *` becomes a genuine (if signature-erased) function pointer,
+// callable with whatever arguments a given call site actually passes.
+typedef void code(...);
+
+// Ghidra's own marker for an x86 LOCK-prefixed instruction boundary in
+// a compare-and-swap-style atomic sequence it couldn't fully decompile
+// into a real C++ atomic op (seen bracketing MinGW's thread-safe CRT
+// initialization). No-ops here lose the real atomicity, but that's a
+// CRT-internal path, not application logic Debura is trying to recover
+// faithfully.
+static inline void LOCK() {}
+static inline void UNLOCK() {}
 
 // A real compile showed Ghidra's own signature/decompilation text names
 // these STL types bare -- neither `std::`-qualified nor carrying their
