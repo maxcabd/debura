@@ -1,6 +1,9 @@
 use chrono::Utc;
 use debura_knowledge::{HypothesisStatus, KnowledgeGraph};
-use debura_recovery::{extract, render_header, render_source, NameSource};
+use debura_recovery::{
+    extract, render_header, render_source, NameSource, GHIDRA_COMPAT_HEADER,
+    GHIDRA_COMPAT_HEADER_NAME,
+};
 
 /// Builds a graph shaped like real debura-analysis output for the
 /// Entity/Player fixture (crates/debura-testbins/fixtures/entity_player.cpp),
@@ -246,4 +249,83 @@ fn a_non_identifier_accepted_value_falls_back_to_the_raw_name() {
     let function = program.functions.iter().find(|f| f.address == "0x1").unwrap();
     assert_eq!(function.display_name, "FUN_drawtext");
     assert!(matches!(function.name_source, NameSource::Raw));
+}
+
+/// A real run had `Screen` and `Snake` -- real classes the binary
+/// defines, with their own methods -- referenced by name in already-
+/// recovered classes' method signatures (`Food::draw(Screen *)`), but
+/// never declared anywhere in the output: `extract()` only recovered
+/// classes with a detected vtable, and neither of those is polymorphic.
+/// A class with real methods of its own must be recovered even without
+/// one.
+#[test]
+fn a_class_with_methods_but_no_vtable_is_still_recovered() {
+    let mut graph = KnowledgeGraph::new();
+    graph.add_observation("0x1", "has_name", "setPixel", 0.95, "ghidra:function", None);
+    graph.add_observation(
+        "0x1",
+        "decompiles_to",
+        "void __thiscall Screen::setPixel(Screen *this,int x,int y)\n\n{\n  return;\n}",
+        0.95,
+        "ghidra:decompiler",
+        None,
+    );
+    graph.add_observation("0x1", "is_method_of", "Screen", 0.95, "ghidra:function", None);
+
+    let program = extract(&graph);
+    let screen = program.classes.iter().find(|c| c.name == "Screen");
+    assert!(screen.is_some(), "a class with real methods must be recovered even without a vtable");
+
+    let screen = screen.unwrap();
+    assert_eq!(screen.methods.len(), 1);
+    assert!(screen.vtable_address.is_empty());
+
+    let header = render_header(screen);
+    assert!(header.contains("no vtable observed"), "header:\n{header}");
+    assert!(!header.contains("vtable observed at"), "header:\n{header}");
+    assert!(
+        header.contains(&format!("#include \"{GHIDRA_COMPAT_HEADER_NAME}\"")),
+        "every recovered header must pull in Ghidra's placeholder types: {header}"
+    );
+}
+
+/// A real run also had `Food::draw(Screen *)` compile-fail even after
+/// `Screen` itself was recovered: `Screen.hpp` existed on disk, but
+/// nothing in `Food.hpp` pulled it in. A class must `#include` every
+/// other recovered class its own methods/fields mention, not just its
+/// base class.
+#[test]
+fn a_class_includes_every_other_recovered_class_it_references() {
+    let mut graph = KnowledgeGraph::new();
+
+    graph.add_observation("0x1", "has_name", "setPixel", 0.95, "ghidra:function", None);
+    graph.add_observation("0x1", "is_method_of", "Screen", 0.95, "ghidra:function", None);
+
+    graph.add_observation("Food", "has_vtable_at", "0x9c0", 1.0, "ghidra:vtable", None);
+    graph.add_observation("0x2", "has_name", "draw", 0.95, "ghidra:function", None);
+    graph.add_observation("0x2", "has_signature", "undefined draw(Food * this, Screen * param_1)", 0.95, "ghidra:function", None);
+    graph.add_observation("0x2", "decompiles_to", "void __thiscall Food::draw(Food *this,Screen *param_1)\n\n{\n  return;\n}", 0.95, "ghidra:decompiler", None);
+    graph.add_observation("0x2", "is_method_of", "Food", 0.95, "ghidra:function", None);
+
+    let program = extract(&graph);
+    let food = program.classes.iter().find(|c| c.name == "Food").unwrap();
+
+    assert_eq!(food.references, vec!["Screen".to_string()]);
+
+    let header = render_header(food);
+    assert!(header.contains("#include \"Screen.hpp\""), "header:\n{header}");
+}
+
+/// A compact sanity check that the compat header actually declares what
+/// this session's real compile attempt against the Snake fixture showed
+/// was missing -- not exhaustive, just a guard against silently deleting
+/// the entries that were verified to matter.
+#[test]
+fn ghidra_compat_header_declares_the_types_a_real_compile_needed() {
+    for needed in ["undefined", "undefined4", "undefined8", "uint", "ulonglong", "code", "CONCAT44", "__thiscall"] {
+        assert!(
+            GHIDRA_COMPAT_HEADER.contains(needed),
+            "compat header is missing {needed:?}, which a real g++ run against recovered Snake output required"
+        );
+    }
 }
