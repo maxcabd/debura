@@ -179,6 +179,35 @@ pub fn ingest(graph: &mut KnowledgeGraph, analysis: &AnalysisResult, artifact_pa
                 );
             }
         }
+
+        // A real run showed why this needs to be its own observation
+        // rather than left implicit: without it, a structurally-discovered
+        // constructor/destructor's decompilation (a base-class call plus a
+        // pointer store) reads as generic, unremarkable code to a
+        // reasoning model with no other signal -- it has no way to know
+        // that pattern *is* the well-known ABI idiom, so it proposes a
+        // vague semantic_role guess that an equally uninformed adversarial
+        // challenge then rejects for being unsupported. Surfacing the
+        // pattern explicitly (without claiming which of constructor/
+        // destructor it is -- see `installs_vtable_of`'s own doc comment)
+        // gives both sides of that exchange the context the symbol-based
+        // path gets for free from `is_constructor_of`/`is_destructor_of`.
+        if let Some(owner) = &f.installs_vtable_of {
+            add_once(
+                graph,
+                &mut seen,
+                &f.address,
+                "vtable_install_pattern",
+                format!(
+                    "stores {owner}'s own vtable pointer into `this` early in this \
+                     function's body -- the Itanium C++ ABI idiom every constructor and \
+                     destructor performs (which of the two this is isn't determined)"
+                ),
+                HEURISTIC_CONFIDENCE,
+                "ghidra:function",
+                None,
+            );
+        }
     }
 
     for v in &analysis.vtables {

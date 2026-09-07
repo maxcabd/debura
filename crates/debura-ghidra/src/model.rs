@@ -20,6 +20,16 @@ pub struct FunctionFact {
     pub owner_class: Option<String>,
     pub is_constructor: bool,
     pub is_destructor: bool,
+    /// Set when this function stores its owner class's own vtable pointer
+    /// into `this` early in its body -- the Itanium ABI idiom every
+    /// constructor and destructor performs, but which one isn't
+    /// distinguished (M7's structural discovery can find the pattern
+    /// without being able to tell the two apart -- see ExtractFacts.py's
+    /// module-level comment). `None` when the owner class (if any) came
+    /// from Ghidra's own symbol-based demangling instead, where
+    /// `is_constructor`/`is_destructor` already answer this more
+    /// precisely.
+    pub installs_vtable_of: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

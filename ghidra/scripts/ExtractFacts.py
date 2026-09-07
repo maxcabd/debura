@@ -336,7 +336,7 @@ def extract_field_accesses(owner_class, decompilation):
     return fields
 
 
-def extract_functions(decompiler, monitor, structural_owner_of):
+def extract_functions(decompiler, monitor, structural_owner_of, structural_vtable_installers):
     """`structural_owner_of` (address string -> class name) is
     discover_classes_structurally()'s finding of which functions are a
     vtable's constructor/destructor or one of its virtual method slots
@@ -351,7 +351,15 @@ def extract_functions(decompiler, monitor, structural_owner_of):
     materially harder, separate problem (see discover_classes_
     structurally's docstring), so these come through as regular methods
     of the class rather than guessing ctor vs dtor and risking debura-
-    recovery applying the wrong one's special rendering."""
+    recovery applying the wrong one's special rendering. `installs_vtable_of`
+    (set only for `structural_vtable_installers` -- the ctor/dtor
+    addresses specifically, not every structurally-owned method) makes
+    that ABI idiom visible to the reasoning agent anyway, without
+    claiming to know which of the two it is: a real run showed that
+    without it, a constructor/destructor found this way reads as
+    unremarkable code (a call plus a pointer store) with no signal that
+    it's the well-known pattern, and every semantic_role guess for it got
+    rejected by an equally uninformed adversarial challenge."""
     functions = []
     all_fields = []
     fm = currentProgram.getFunctionManager()
@@ -385,6 +393,10 @@ def extract_functions(decompiler, monitor, structural_owner_of):
         if owner_class is not None and decompilation:
             all_fields.extend(extract_field_accesses(owner_class, decompilation))
 
+        installs_vtable_of = owner_class if (
+            structural_owner and owner_class is not None and address in structural_vtable_installers
+        ) else None
+
         functions.append({
             "address": address,
             "name": name,
@@ -397,6 +409,7 @@ def extract_functions(decompiler, monitor, structural_owner_of):
             "owner_class": owner_class,
             "is_constructor": (not structural_owner) and owner_class is not None and name == owner_class,
             "is_destructor": (not structural_owner) and owner_class is not None and name == "~" + owner_class,
+            "installs_vtable_of": installs_vtable_of,
         })
 
     return functions, all_fields
@@ -631,9 +644,11 @@ def run():
     )
 
     structural_owner_of = {}
+    structural_vtable_installers = set()
     for key, class_name in struct_class_names.items():
         for addr in struct_ctor_or_dtor.get(key, ()):
             structural_owner_of[addr_str(addr)] = class_name
+            structural_vtable_installers.add(addr_str(addr))
         for addr in struct_virtual_methods.get(key, ()):
             structural_owner_of[addr_str(addr)] = class_name
 
@@ -641,7 +656,9 @@ def run():
     decompiler.openProgram(currentProgram)
 
     try:
-        functions, fields = extract_functions(decompiler, monitor, structural_owner_of)
+        functions, fields = extract_functions(
+            decompiler, monitor, structural_owner_of, structural_vtable_installers
+        )
         vtables, virtual_methods = extract_vtables(sym_table, mem, addr_factory, fm)
         vtables, virtual_methods = merge_structural_vtables(
             vtables, virtual_methods, struct_class_names, struct_virtual_methods

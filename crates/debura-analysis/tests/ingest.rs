@@ -39,6 +39,7 @@ fn m7_facts_become_observations() {
         owner_class: Some("Player".to_string()),
         is_constructor: true,
         is_destructor: false,
+        installs_vtable_of: None,
     });
     analysis.vtables.push(VtableFact {
         class_name: "Player".to_string(),
@@ -109,6 +110,7 @@ fn ingest_is_idempotent_but_still_captures_real_changes() {
         owner_class: None,
         is_constructor: false,
         is_destructor: false,
+        installs_vtable_of: None,
     });
 
     let mut graph = KnowledgeGraph::new();
@@ -156,6 +158,7 @@ fn plain_methods_get_is_method_of_without_ctor_dtor_tags() {
         owner_class: Some("Entity".to_string()),
         is_constructor: false,
         is_destructor: false,
+        installs_vtable_of: None,
     });
 
     let mut graph = KnowledgeGraph::new();
@@ -166,6 +169,49 @@ fn plain_methods_get_is_method_of_without_ctor_dtor_tags() {
         .find(|o| o.subject == "0x1" && o.predicate == "is_method_of")
         .expect("is_method_of observation");
     assert_eq!(is_method_of.value, "Entity");
+
+    assert!(graph
+        .observations()
+        .all(|o| o.predicate != "is_constructor_of" && o.predicate != "is_destructor_of"));
+}
+
+/// A structurally-discovered constructor/destructor (M7 on a stripped
+/// binary) can't be labeled `is_constructor_of`/`is_destructor_of` --
+/// distinguishing the two needs symbol-based typing this path doesn't
+/// have -- but the reasoning agent still needs *some* signal that this
+/// function's body (typically just a base-class call plus a pointer
+/// store) is the well-known ABI idiom rather than arbitrary code. A real
+/// run showed the cost of not having this: every semantic_role guess for
+/// such a function got rejected by an equally uninformed adversarial
+/// challenge.
+#[test]
+fn structural_vtable_install_produces_a_pattern_observation_not_ctor_dtor() {
+    let mut analysis = empty_result();
+    analysis.functions.push(FunctionFact {
+        address: "0x1".to_string(),
+        name: "FUN_1".to_string(),
+        size: 10,
+        signature: "void FUN_1(undefined8 *param_1)".to_string(),
+        calling_convention: "__fastcall".to_string(),
+        callers: Vec::new(),
+        callees: Vec::new(),
+        decompilation: String::new(),
+        owner_class: Some("Wall".to_string()),
+        is_constructor: false,
+        is_destructor: false,
+        installs_vtable_of: Some("Wall".to_string()),
+    });
+
+    let mut graph = KnowledgeGraph::new();
+    ingest(&mut graph, &analysis, "artifacts/analysis.json");
+
+    let pattern = graph
+        .observations()
+        .find(|o| o.subject == "0x1" && o.predicate == "vtable_install_pattern")
+        .expect("vtable_install_pattern observation");
+    assert!(pattern.value.contains("Wall"));
+    assert!(pattern.value.contains("constructor"));
+    assert!(pattern.value.contains("destructor"));
 
     assert!(graph
         .observations()
@@ -188,6 +234,7 @@ fn free_functions_produce_no_class_facts() {
         owner_class: None,
         is_constructor: false,
         is_destructor: false,
+        installs_vtable_of: None,
     });
 
     let mut graph = KnowledgeGraph::new();
