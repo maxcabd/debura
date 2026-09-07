@@ -468,7 +468,10 @@ fn refptr_symbols_are_declared_as_pointers_not_plain_bytes() {
 /// the entries that were verified to matter.
 #[test]
 fn ghidra_compat_header_declares_the_types_a_real_compile_needed() {
-    for needed in ["undefined", "undefined4", "undefined8", "uint", "ulonglong", "code", "CONCAT44", "__thiscall"] {
+    for needed in [
+        "undefined", "undefined4", "undefined8", "uint", "ulonglong", "code", "CONCAT44",
+        "__thiscall", "operator_new", "operator_delete", "<windows.h>", "<iostream>", "<cstring>",
+    ] {
         assert!(
             GHIDRA_COMPAT_HEADER.contains(needed),
             "compat header is missing {needed:?}, which a real g++ run against recovered Snake output required"
