@@ -41,18 +41,18 @@ pub(crate) fn analyze_headless_binary() -> Result<PathBuf> {
 /// facts (functions, strings, imports, exports, xrefs, decompilation) into
 /// `<project_root>/artifacts/analysis.json` (PROJECT.md S21, M1).
 ///
-/// Each call reimports the binary into a fresh Ghidra project under
-/// `<project_root>/ghidra/project`. Incremental reanalysis (reusing an
-/// already-analyzed project) is a concern for later milestones once
-/// Ghidra feedback (S29-30) needs to re-run analysis after mutations.
+/// The first call imports the binary into a fresh Ghidra project and runs
+/// full auto-analysis. A later call against the same project reuses it
+/// (`-process`, not `-import`) and skips auto-analysis -- it only
+/// re-extracts, so it never destroys mutations M8's `apply` already made.
+/// Re-running `analyze` used to always wipe and reimport, silently
+/// discarding any applied renames; this is what fixes that.
 pub fn analyze(project_root: &Path, binary_path: &Path) -> Result<AnalysisResult> {
     let analyze_headless = analyze_headless_binary()?;
 
     let ghidra_dir = project_root.join("ghidra");
     let ghidra_project_dir = ghidra_dir.join("project");
-    if ghidra_project_dir.is_dir() {
-        fs::remove_dir_all(&ghidra_project_dir)?;
-    }
+    let already_imported = ghidra_project_dir.is_dir();
     fs::create_dir_all(&ghidra_project_dir)?;
 
     let scripts_dir = ghidra_dir.join("scripts");
@@ -66,13 +66,25 @@ pub fn analyze(project_root: &Path, binary_path: &Path) -> Result<AnalysisResult
         fs::remove_file(&output_path)?;
     }
 
-    tracing::info!(binary = %binary_path.display(), "starting headless Ghidra analysis");
+    let mut cmd = Command::new(&analyze_headless);
+    cmd.arg(&ghidra_project_dir).arg(GHIDRA_PROJECT_NAME);
 
-    let status = Command::new(&analyze_headless)
-        .arg(&ghidra_project_dir)
-        .arg(GHIDRA_PROJECT_NAME)
-        .arg("-import")
-        .arg(binary_path)
+    if already_imported {
+        let binary_name = binary_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .context("binary path has no file name")?;
+        tracing::info!(
+            binary = %binary_path.display(),
+            "re-analyzing existing Ghidra project (preserving prior mutations)"
+        );
+        cmd.arg("-process").arg(binary_name).arg("-noanalysis");
+    } else {
+        tracing::info!(binary = %binary_path.display(), "starting headless Ghidra analysis");
+        cmd.arg("-import").arg(binary_path);
+    }
+
+    let status = cmd
         .arg("-scriptPath")
         .arg(&scripts_dir)
         .arg("-postScript")
