@@ -290,6 +290,27 @@ fn find_references(class: &RecoveredClass, class_names: &BTreeSet<String>) -> Ve
     refs.into_iter().collect()
 }
 
+/// Same idea as `find_references`, for the shared `functions.cpp` file:
+/// a real run had a standalone function's rewritten body doing `new
+/// (ptr) Wall(...)` (M15's symbol resolution turning a raw `FUN_ctor`
+/// call into a real constructor call) with nothing in `functions.cpp`
+/// ever including `Wall.hpp` -- the class-reference scan only ever
+/// looked at *class* methods, since standalone functions calling into a
+/// class wasn't a shape that existed before call sites got resolved.
+fn find_function_references(functions: &[RecoveredFunction], class_names: &BTreeSet<String>) -> Vec<String> {
+    let mut refs: BTreeSet<String> = BTreeSet::new();
+    for f in functions {
+        for text in [&f.params, &f.return_type, &f.decompilation] {
+            for token in identifier_tokens(text) {
+                if class_names.contains(token) {
+                    refs.insert(token.to_string());
+                }
+            }
+        }
+    }
+    refs.into_iter().collect()
+}
+
 /// Extracts everything Debura currently has grounds to recover (PROJECT.md
 /// M9): every class with a detected vtable (M7) *or* with at least one
 /// method/constructor/destructor of its own (a real class the binary
@@ -330,9 +351,6 @@ pub fn extract(graph: &KnowledgeGraph) -> RecoveredProgram {
 
     let mut classes: Vec<RecoveredClass> =
         class_names.iter().map(|name| build_class(graph, name)).collect();
-    for class in &mut classes {
-        class.references = find_references(class, &class_names);
-    }
 
     // One entry per *subject*, not per hypothesis: several ACCEPTED
     // semantic_role hypotheses can exist for the same address (see
@@ -388,6 +406,31 @@ pub fn extract(graph: &KnowledgeGraph) -> RecoveredProgram {
     }
     functions.sort_by(|a, b| a.address.cmp(&b.address));
 
+    // PROJECT.md M15: resolve every `FUN_<addr>`/`thunk_FUN_<addr>` call
+    // site against the whole-program symbol table *before* anything else
+    // reads these bodies -- both `find_references` below (so a call
+    // rewritten into `new (this) Section(...)` makes "Section" a token
+    // `find_references` can actually see, the same way it already finds
+    // a class name mentioned in a signature) and the ghidra_data_symbols
+    // scan need the rewritten text, not Ghidra's raw pseudocode.
+    let symbol_table = crate::symtab::build_symbol_table(&classes, &functions);
+    let mut unresolved_calls: BTreeSet<String> = BTreeSet::new();
+    for class in &mut classes {
+        for m in &mut class.methods {
+            m.decompilation =
+                crate::symtab::rewrite_call_sites(&m.decompilation, &symbol_table, &mut unresolved_calls);
+        }
+    }
+    for f in &mut functions {
+        f.decompilation =
+            crate::symtab::rewrite_call_sites(&f.decompilation, &symbol_table, &mut unresolved_calls);
+    }
+
+    for class in &mut classes {
+        class.references = find_references(class, &class_names);
+    }
+    let function_references = find_function_references(&functions, &class_names);
+
     let mut ghidra_data_symbols: BTreeSet<String> = BTreeSet::new();
     for class in &classes {
         for m in &class.methods {
@@ -401,6 +444,8 @@ pub fn extract(graph: &KnowledgeGraph) -> RecoveredProgram {
     RecoveredProgram {
         classes,
         functions,
+        function_references,
         ghidra_data_symbols: ghidra_data_symbols.into_iter().collect(),
+        unresolved_calls: unresolved_calls.into_iter().collect(),
     }
 }

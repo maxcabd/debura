@@ -75,8 +75,17 @@ pub struct RecoveredFunction {
 pub struct RecoveredProgram {
     pub classes: Vec<RecoveredClass>,
     pub functions: Vec<RecoveredFunction>,
+    /// Recovered classes any standalone function's signature or (M15
+    /// symbol-resolved) body mentions -- `functions.cpp`'s own
+    /// `#include` list, the same reasoning as `RecoveredClass::references`.
+    pub function_references: Vec<String>,
     /// Ghidra's own auto-generated data-symbol names (`DAT_...`,
     /// `PTR_...`, `_refptr_...`) referenced somewhere in a recovered
     /// body but never declared anywhere else in the output.
     pub ghidra_data_symbols: Vec<String>,
+    /// Call-site names (`FUN_x`, `thunk_FUN_x`) M15's symbol resolution
+    /// pass found no recovered definition for at all -- left as literal
+    /// calls in the rewritten bodies, needing a permissive fallback
+    /// declaration to at least parse.
+    pub unresolved_calls: Vec<String>,
 }
