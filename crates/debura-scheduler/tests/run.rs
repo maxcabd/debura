@@ -423,3 +423,77 @@ fn parallel_run_respects_max_iterations() {
     assert_eq!(summary.stopped_because, StopReason::MaxIterations);
     assert_eq!(summary.iterations, 3);
 }
+
+/// A provider that records how many subjects it was asked to investigate
+/// in each `investigate_batch` call, so a test can prove clustering
+/// actually happened rather than the default one-at-a-time fallback.
+struct RecordingBatchProvider {
+    batch_sizes: std::sync::Mutex<Vec<usize>>,
+}
+
+impl RecordingBatchProvider {
+    fn new() -> Self {
+        Self { batch_sizes: std::sync::Mutex::new(Vec::new()) }
+    }
+}
+
+impl AgentProvider for RecordingBatchProvider {
+    fn investigate(&self, task: &AnalyzeFunctionTask) -> anyhow::Result<InvestigationResult> {
+        EchoProvider.investigate(task)
+    }
+
+    fn challenge(&self, task: &ChallengeHypothesisTask) -> anyhow::Result<ChallengeResult> {
+        EchoProvider.challenge(task)
+    }
+
+    fn resolve_contradiction(&self, task: &ResolveContradictionTask) -> anyhow::Result<ResolutionResult> {
+        EchoProvider.resolve_contradiction(task)
+    }
+
+    fn investigate_batch(&self, tasks: &[AnalyzeFunctionTask]) -> Vec<anyhow::Result<InvestigationResult>> {
+        self.batch_sizes.lock().unwrap().push(tasks.len());
+        tasks.iter().map(|t| self.investigate(t)).collect()
+    }
+}
+
+/// PROJECT.md M10: several AnalyzeFunction subjects ready in the same
+/// wave must go through one investigate_batch call, not one investigate
+/// call each -- that's the entire point of clustering.
+#[test]
+fn parallel_run_clusters_analyze_function_into_batches() {
+    let mut graph = KnowledgeGraph::new();
+    for i in 1..=6 {
+        graph.add_observation(
+            format!("0x{i}"),
+            "has_name",
+            format!("fn{i}"),
+            0.95,
+            "ghidra:function",
+            None,
+        );
+    }
+    let provider = RecordingBatchProvider::new();
+
+    let summary = run_with_concurrency(
+        &mut graph,
+        &provider,
+        &VerificationPolicy::default(),
+        &RunBudget::default(),
+        8, // >= 6, so all 6 seeded subjects land in the first wave together
+        |_, _, _| {},
+    );
+
+    assert_eq!(summary.stopped_because, StopReason::QueueEmpty);
+    assert_eq!(summary.total_subjects, 6);
+
+    let batch_sizes = provider.batch_sizes.into_inner().unwrap();
+    assert!(
+        batch_sizes.iter().any(|&size| size > 1),
+        "expected at least one clustered call, got batch sizes {batch_sizes:?}"
+    );
+    assert_eq!(
+        batch_sizes.iter().sum::<usize>(),
+        6,
+        "every seeded subject must still be covered exactly once across all batches"
+    );
+}

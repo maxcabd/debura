@@ -161,6 +161,75 @@ impl AgentProvider for OpenAiProvider {
         serde_json::from_value(value).context("mapping OpenAI output to InvestigationResult")
     }
 
+    fn investigate_batch(&self, tasks: &[AnalyzeFunctionTask]) -> Vec<Result<InvestigationResult>> {
+        if tasks.is_empty() {
+            return Vec::new();
+        }
+        if tasks.len() == 1 {
+            return vec![self.investigate(&tasks[0])];
+        }
+
+        const SYSTEM: &str = "You are Debura's AnalyzeFunction reasoning step, batched: you are \
+            given several independent subjects from the same binary in one request, each with \
+            its own deterministic Ghidra facts. Analyze each one entirely on its own terms -- \
+            nothing about one subject bears on another, and evidence must never be borrowed \
+            across them. You are given deterministic facts already extracted from a compiled \
+            binary by Ghidra -- you did not extract them and must not invent facts beyond \
+            what's given. Propose hypotheses about the semantic role of each subject only. \
+            Exactly one hypothesis per subject must use the predicate \"semantic_role\" (that \
+            literal string, not a paraphrase) with its value set to the best identifier-style \
+            name for that subject -- e.g. \"calculateDirection\", never a sentence. This is the \
+            only predicate Debura's C++ recovery step reads to name anything: a proposed name \
+            under any other predicate is invisible to it and the subject keeps its raw, \
+            unverified Ghidra name. Additional hypotheses under other predicates (behavior, \
+            ownership, purpose, etc.) are welcome and should use whatever predicate best \
+            describes that claim. Cite existing hypothesis ids in depends_on only if they \
+            appear in that subject's own list of existing hypotheses. Leave arrays empty rather \
+            than guessing when you have nothing well-founded to add for a subject. If an \
+            existing hypothesis is marked as contested or rejected with a stated reason, do not \
+            propose the same claim again -- either address why it failed or propose something \
+            genuinely different. Return exactly one result per subject listed below, each \
+            carrying that subject's own address back so results can be matched up -- order \
+            doesn't matter, the subject field is authoritative.";
+
+        let user = render_analyze_function_batch(tasks);
+        let value = match self.complete(
+            SYSTEM,
+            &user,
+            "investigation_batch_result",
+            investigation_batch_schema(),
+        ) {
+            Ok(value) => value,
+            Err(error) => {
+                let message = format!("{error:#}");
+                return tasks.iter().map(|_| Err(anyhow::anyhow!(message.clone()))).collect();
+            }
+        };
+
+        let parsed: BatchResponse = match serde_json::from_value(value) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                let message = format!("mapping OpenAI output to a batch of InvestigationResult: {error:#}");
+                return tasks.iter().map(|_| Err(anyhow::anyhow!(message.clone()))).collect();
+            }
+        };
+
+        let mut by_subject: std::collections::HashMap<String, InvestigationResult> = parsed
+            .results
+            .into_iter()
+            .map(|entry| (entry.subject, entry.investigation))
+            .collect();
+
+        tasks
+            .iter()
+            .map(|task| {
+                by_subject
+                    .remove(&task.subject)
+                    .ok_or_else(|| anyhow::anyhow!("model omitted a result for subject {}", task.subject))
+            })
+            .collect()
+    }
+
     fn challenge(&self, task: &ChallengeHypothesisTask) -> Result<ChallengeResult> {
         const SYSTEM: &str = "You are Debura's ChallengeHypothesis adversarial verification \
             step. Your objective is NOT to find more evidence that the hypothesis is right -- \
@@ -219,6 +288,16 @@ struct RawResolution {
     resolution: String,
     confidence: Option<f64>,
     reasoning: String,
+}
+
+fn render_analyze_function_batch(tasks: &[AnalyzeFunctionTask]) -> String {
+    let mut out = format!("{} subjects follow, each independent:\n\n", tasks.len());
+    for task in tasks {
+        out.push_str("=====\n");
+        out.push_str(&render_analyze_function_task(task));
+        out.push('\n');
+    }
+    out
 }
 
 fn render_analyze_function_task(task: &AnalyzeFunctionTask) -> String {
@@ -295,6 +374,42 @@ fn render_resolve_task(task: &ResolveContradictionTask) -> String {
     }
 
     out
+}
+
+/// One `{results: [...]}` entry as OpenAI returns it, paired with the
+/// subject it belongs to so the flat response can be matched back up to
+/// whichever `AnalyzeFunctionTask` asked for it.
+#[derive(Debug, Deserialize)]
+struct BatchEntry {
+    subject: String,
+    investigation: InvestigationResult,
+}
+
+#[derive(Debug, Deserialize)]
+struct BatchResponse {
+    results: Vec<BatchEntry>,
+}
+
+fn investigation_batch_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "results": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "subject": {"type": "string"},
+                        "investigation": investigation_result_schema()
+                    },
+                    "required": ["subject", "investigation"],
+                    "additionalProperties": false
+                }
+            }
+        },
+        "required": ["results"],
+        "additionalProperties": false
+    })
 }
 
 fn investigation_result_schema() -> Value {

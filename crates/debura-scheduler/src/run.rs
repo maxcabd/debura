@@ -317,6 +317,40 @@ enum PendingOutcome {
     },
 }
 
+/// How many AnalyzeFunction subjects go into one investigate_batch call.
+/// Bounded well below a wave's full `concurrency`: an unbounded cluster
+/// would turn one oversized, slow, all-or-nothing-on-parse-failure
+/// request into the very bottleneck concurrency was meant to remove.
+const MAX_CLUSTER_SIZE: usize = 5;
+
+/// The parallel-safe half of a cluster of AnalyzeFunction subjects: builds
+/// each one's context (safe to do concurrently -- PROJECT.md S23), then
+/// makes one `investigate_batch` call covering all of them.
+fn resolve_analyze_cluster(
+    graph: &KnowledgeGraph,
+    provider: &(dyn AgentProvider + Sync),
+    subjects: &[String],
+) -> Vec<(Task, PendingOutcome)> {
+    let built: Vec<AnalyzeFunctionTask> =
+        subjects.iter().map(|s| AnalyzeFunctionTask::build(graph, s)).collect();
+    let results = provider.investigate_batch(&built);
+
+    built
+        .into_iter()
+        .zip(results)
+        .map(|(task, outcome)| {
+            let subject = task.subject.clone();
+            (
+                Task::AnalyzeFunction { subject: subject.clone() },
+                PendingOutcome::AnalyzeFunction {
+                    subject,
+                    outcome: outcome.map(|r| (task, r)),
+                },
+            )
+        })
+        .collect()
+}
+
 fn resolve_one(
     graph: &KnowledgeGraph,
     provider: &(dyn AgentProvider + Sync),
@@ -488,18 +522,44 @@ pub fn run_with_concurrency(
             break StopReason::QueueEmpty;
         }
 
-        let graph_ref: &KnowledgeGraph = graph;
-        let outcomes: Vec<(Task, PendingOutcome)> = pool.install(|| {
-            batch
-                .into_par_iter()
-                .map(|task| {
-                    let outcome = resolve_one(graph_ref, provider, &task);
-                    (task, outcome)
-                })
-                .collect()
-        });
+        // AnalyzeFunction tasks in this wave are clustered into groups of
+        // up to MAX_CLUSTER_SIZE and sent through investigate_batch, one
+        // model call per group instead of one per subject; everything
+        // else still resolves individually. Both run in parallel with
+        // each other via the same thread pool.
+        let mut analyze_subjects = Vec::new();
+        let mut other_tasks = Vec::new();
+        for task in batch {
+            match task {
+                Task::AnalyzeFunction { subject } => analyze_subjects.push(subject),
+                other => other_tasks.push(other),
+            }
+        }
+        let analyze_chunks: Vec<&[String]> = analyze_subjects.chunks(MAX_CLUSTER_SIZE).collect();
 
-        for (task, outcome) in outcomes {
+        let graph_ref: &KnowledgeGraph = graph;
+        let (analyze_outcomes, other_outcomes): (Vec<Vec<(Task, PendingOutcome)>>, Vec<(Task, PendingOutcome)>) =
+            pool.install(|| {
+                rayon::join(
+                    || {
+                        analyze_chunks
+                            .into_par_iter()
+                            .map(|chunk| resolve_analyze_cluster(graph_ref, provider, chunk))
+                            .collect()
+                    },
+                    || {
+                        other_tasks
+                            .into_par_iter()
+                            .map(|task| {
+                                let outcome = resolve_one(graph_ref, provider, &task);
+                                (task, outcome)
+                            })
+                            .collect()
+                    },
+                )
+            });
+
+        for (task, outcome) in analyze_outcomes.into_iter().flatten().chain(other_outcomes) {
             for followup in commit_one(graph, policy, outcome) {
                 scheduler.enqueue(graph, followup);
             }
