@@ -3,6 +3,7 @@ use std::path::Path;
 
 use anyhow::Result;
 
+use crate::compat::{GHIDRA_COMPAT_HEADER, GHIDRA_COMPAT_HEADER_NAME};
 use crate::model::RecoveredProgram;
 use crate::render::{render_functions_source, render_header, render_source};
 
@@ -21,6 +22,8 @@ pub fn write_to_disk(project_root: &Path, program: &RecoveredProgram) -> Result<
     let src_dir = project_root.join("recovered").join("src");
     fs::create_dir_all(&include_dir)?;
     fs::create_dir_all(&src_dir)?;
+
+    fs::write(include_dir.join(GHIDRA_COMPAT_HEADER_NAME), GHIDRA_COMPAT_HEADER)?;
 
     for class in &program.classes {
         fs::write(

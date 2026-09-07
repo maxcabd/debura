@@ -1,3 +1,4 @@
+use crate::compat::GHIDRA_COMPAT_HEADER_NAME;
 use crate::model::{NameSource, RecoveredClass, RecoveredFunction, RecoveredMethod};
 
 fn name_comment(source: &NameSource) -> String {
@@ -40,8 +41,16 @@ pub fn render_header(class: &RecoveredClass) -> String {
     out.push_str("// deterministic Ghidra observations, trusted without a verification pass\n");
     out.push_str("// (PROJECT.md S21). Member names are ACCEPTED hypotheses where noted;\n");
     out.push_str("// otherwise they are Ghidra's own unverified names, not Debura's judgment.\n");
-    out.push_str(&format!("// vtable observed at {}\n", class.vtable_address));
-    out.push_str("\n#pragma once\n\n");
+    if class.vtable_address.is_empty() {
+        out.push_str("// no vtable observed -- not a polymorphic class\n");
+    } else {
+        out.push_str(&format!("// vtable observed at {}\n", class.vtable_address));
+    }
+    out.push_str(&format!("\n#pragma once\n\n#include \"{GHIDRA_COMPAT_HEADER_NAME}\"\n"));
+    for reference in &class.references {
+        out.push_str(&format!("#include \"{reference}.hpp\"\n"));
+    }
+    out.push('\n');
 
     match &class.base {
         Some(base) => {
@@ -116,7 +125,8 @@ pub fn render_functions_source(functions: &[RecoveredFunction]) -> String {
     let mut out = String::new();
     out.push_str("// Recovered by Debura: standalone functions with an ACCEPTED semantic\n");
     out.push_str("// name (PROJECT.md M5). Bodies are Ghidra's decompiled output, unmodified\n");
-    out.push_str("// beyond substituting the recovered name for Ghidra's raw one.\n\n");
+    out.push_str("// beyond substituting the recovered name for Ghidra's raw one.\n");
+    out.push_str(&format!("#include \"{GHIDRA_COMPAT_HEADER_NAME}\"\n\n"));
 
     for f in functions {
         out.push_str(&format!("// {}\n", name_comment(&f.name_source)));

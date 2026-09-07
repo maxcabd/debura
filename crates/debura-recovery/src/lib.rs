@@ -8,11 +8,13 @@
 //! a merely PROPOSED one -- otherwise Ghidra's own raw name is kept and
 //! marked as such. Every recovered name says which of the two it is.
 
+mod compat;
 mod extract;
 mod model;
 mod render;
 mod write;
 
+pub use compat::{GHIDRA_COMPAT_HEADER, GHIDRA_COMPAT_HEADER_NAME};
 pub use extract::extract;
 pub use model::{
     NameSource, RecoveredClass, RecoveredField, RecoveredFunction, RecoveredMethod,
