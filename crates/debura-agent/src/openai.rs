@@ -149,7 +149,12 @@ impl AgentProvider for OpenAiProvider {
             hypotheses. Leave arrays empty rather than guessing when you have nothing \
             well-founded to add. If an existing hypothesis is marked as contested or rejected \
             with a stated reason, do not propose the same claim again -- either address why it \
-            failed or propose something genuinely different.";
+            failed or propose something genuinely different. If the subject has a \
+            vtable_install_pattern observation, name it \"install<ClassName>Vtable\" (e.g. \
+            \"installWallVtable\") -- identifier-style and class-qualified, without claiming to \
+            know constructor vs destructor, which that observation deliberately doesn't \
+            determine. A bare word like \"constructor\" on its own isn't identifier-style \
+            enough for Debura's recovery step, even when the underlying belief is correct.";
 
         let user = render_analyze_function_task(task);
         let value = self.complete(
@@ -188,8 +193,13 @@ impl AgentProvider for OpenAiProvider {
             than guessing when you have nothing well-founded to add for a subject. If an \
             existing hypothesis is marked as contested or rejected with a stated reason, do not \
             propose the same claim again -- either address why it failed or propose something \
-            genuinely different. Return exactly one result per subject listed below, each \
-            carrying that subject's own address back so results can be matched up -- order \
+            genuinely different. If a subject has a vtable_install_pattern observation, name it \
+            \"install<ClassName>Vtable\" (e.g. \"installWallVtable\") -- identifier-style and \
+            class-qualified, without claiming to know constructor vs destructor, which that \
+            observation deliberately doesn't determine. A bare word like \"constructor\" on its \
+            own isn't identifier-style enough for Debura's recovery step, even when the \
+            underlying belief is correct. Return exactly one result per subject listed below, \
+            each carrying that subject's own address back so results can be matched up -- order \
             doesn't matter, the subject field is authoritative.";
 
         let user = render_analyze_function_batch(tasks);
@@ -385,7 +395,12 @@ const CHALLENGE_SYSTEM: &str = "You are Debura's ChallengeHypothesis adversarial
     finding. If your alternative is itself a better name for the subject, its predicate must be \
     the literal string \"semantic_role\" (matching the convention AnalyzeFunction uses) -- \
     Debura's C++ recovery step only reads that exact predicate to name anything. If it's some \
-    other kind of claim, use whatever predicate best fits.";
+    other kind of claim, use whatever predicate best fits. A subject with a \
+    vtable_install_pattern observation is known, structurally, to store its class's own vtable \
+    pointer -- a semantic_role name shaped \"install<ClassName>Vtable\" is already an \
+    appropriately conservative, honest name for exactly that fact, not a vague placeholder \
+    needing more specificity; don't demand it also specify constructor vs destructor or a \
+    fuller behavioral role the evidence doesn't support.";
 
 const RESOLVE_SYSTEM: &str = "You are Debura's ResolveContradiction step. A hypothesis has been \
     marked CONTESTED because contradicting evidence was found. Weigh the supporting evidence \
