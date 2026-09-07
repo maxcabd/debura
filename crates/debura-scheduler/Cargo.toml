@@ -4,3 +4,10 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+debura-agent = { path = "../debura-agent" }
+debura-knowledge = { path = "../debura-knowledge" }
+debura-verifier = { path = "../debura-verifier" }
+tracing.workspace = true
+
+[dev-dependencies]
+anyhow.workspace = true

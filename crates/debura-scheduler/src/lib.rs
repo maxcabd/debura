@@ -1,3 +1,17 @@
-//! Task prioritization and the autonomous loop (PROJECT.md §24, §27).
+//! Task prioritization and the autonomous loop (PROJECT.md S24, S27) -- M6.
 //!
-//! Implementation begins at M6 — Autonomous Scheduler.
+//! `run` is `debura run <project>`'s engine: it seeds work from whatever
+//! the knowledge graph doesn't have hypotheses for yet, executes the
+//! highest-priority task, enqueues whatever follows from it, and repeats
+//! until the queue empties or a budget trips.
+
+mod priority;
+mod queue;
+mod run;
+mod seed;
+mod task;
+
+pub use queue::Scheduler;
+pub use run::{run, RunBudget, RunSummary, StopReason};
+pub use seed::seed_initial_tasks;
+pub use task::Task;
