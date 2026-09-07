@@ -299,6 +299,14 @@ impl KnowledgeGraph {
         self.investigations.get(&id)
     }
 
+    /// Lets a harness fill in an investigation's outcome (which
+    /// hypotheses/evidence it actually produced) after `record_investigation`
+    /// reserved its id -- those aren't known until the harness has finished
+    /// validating and committing the provider's result.
+    pub fn investigation_mut(&mut self, id: InvestigationId) -> Option<&mut Investigation> {
+        self.investigations.get_mut(&id)
+    }
+
     // --- Program model -------------------------------------------------------
 
     pub fn program_model(&self) -> ProgramModel<'_> {
