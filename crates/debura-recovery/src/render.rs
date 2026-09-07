@@ -1,5 +1,23 @@
 use crate::compat::GHIDRA_COMPAT_HEADER_NAME;
 use crate::model::{NameSource, RecoveredClass, RecoveredFunction, RecoveredMethod};
+use crate::symbols::GHIDRA_SYMBOLS_HEADER_NAME;
+
+/// Ghidra's vtable-pointer-slot idiom assigns the *address* of a
+/// synthesized data symbol to a pointer-to-pointer lvalue
+/// (`*(undefined ***)this = &PTR_draw_140009a40;`), but the symbol
+/// itself is only ever declared as a generic placeholder byte (its real
+/// type isn't known -- see `symbols.rs`'s `render_ghidra_symbols_header`),
+/// so `&SYMBOL` doesn't have the exact pointer type the assignment
+/// needs. Inserting the cast the assignment's own left-hand side already
+/// implies makes it compile regardless of what type the symbol is
+/// actually declared as -- verified by compiling this exact
+/// substitution. Real, observed shape from the Snake fixture; other
+/// pointer-depth variants of the same idiom aren't handled yet.
+fn patch_known_idioms(text: &str) -> String {
+    let prefix = "*(undefined ***)this = ";
+    let needle = format!("{prefix}&");
+    text.replace(&needle, &format!("{prefix}(undefined **)&"))
+}
 
 fn name_comment(source: &NameSource) -> String {
     match source {
@@ -27,10 +45,15 @@ fn method_declaration(m: &RecoveredMethod, class_name: &str) -> String {
     }
 }
 
-fn extract_body(decompilation: &str) -> &str {
+/// A real run had methods (e.g. a destructor-variant thunk) whose
+/// `decompiles_to` observation was only ever a bare signature -- Ghidra
+/// never produced a real body for that address. Rendering that text
+/// as-is left a floating signature line with no braces, which doesn't
+/// parse as anything.
+fn extract_body(decompilation: &str) -> String {
     match decompilation.find('{') {
-        Some(idx) => decompilation[idx..].trim_end(),
-        None => decompilation.trim_end(),
+        Some(idx) => decompilation[idx..].trim_end().to_string(),
+        None => "{\n  // Ghidra provided no decompiled body for this address.\n}".to_string(),
     }
 }
 
@@ -46,11 +69,21 @@ pub fn render_header(class: &RecoveredClass) -> String {
     } else {
         out.push_str(&format!("// vtable observed at {}\n", class.vtable_address));
     }
-    out.push_str(&format!("\n#pragma once\n\n#include \"{GHIDRA_COMPAT_HEADER_NAME}\"\n"));
+    out.push_str(&format!("\n#pragma once\n\n#include \"{GHIDRA_COMPAT_HEADER_NAME}\"\n\n"));
+    // Forward-declared, not #include'd: every real reference from this
+    // codebase is by pointer (Ghidra passes objects by pointer/this
+    // throughout its decompiled output), which a forward declaration is
+    // enough for -- and a real run showed two classes referencing each
+    // other (Section <-> Screen <-> Snake) turns a full #include here
+    // into a circular one, where whichever header starts the cycle
+    // sees the other as still-incomplete. render_source() includes the
+    // full header instead, where the class's members are actually used.
     for reference in &class.references {
-        out.push_str(&format!("#include \"{reference}.hpp\"\n"));
+        out.push_str(&format!("class {reference};\n"));
     }
-    out.push('\n');
+    if !class.references.is_empty() {
+        out.push('\n');
+    }
 
     match &class.base {
         Some(base) => {
@@ -88,6 +121,45 @@ pub fn render_header(class: &RecoveredClass) -> String {
     out
 }
 
+/// A real run had every derived-class constructor's decompiled body
+/// open by calling its base's constructor directly on `this`
+/// (`Collideable::Collideable((Collideable *)this,0,0);`) -- valid
+/// Ghidra pseudocode (the base subobject really is initialized there in
+/// the compiled code), but not legal C++: you can't call a constructor
+/// like an ordinary function on an object that already exists, and a
+/// real C++ constructor already default-constructs its base *before*
+/// the body even runs, so the call would be redundant even if it
+/// somehow compiled. This recognizes exactly that leading-statement
+/// shape and splits it into (initializer-list args, remaining body) so
+/// the caller can turn it into a real `: Base(args)`. Returns `None` for
+/// any body that doesn't open with precisely this pattern -- narrower
+/// than a real C parser, but this is the one shape Ghidra actually
+/// produces for it.
+fn extract_base_constructor_call<'a>(body: &'a str, base: &str) -> Option<(&'a str, &'a str)> {
+    let after_brace = body[body.find('{')? + 1..].trim_start();
+    let call_args = after_brace.strip_prefix(&format!("{base}::{base}("))?;
+
+    let mut depth = 1i32;
+    let close = call_args.char_indices().find_map(|(i, c)| match c {
+        '(' => {
+            depth += 1;
+            None
+        }
+        ')' => {
+            depth -= 1;
+            (depth == 0).then_some(i)
+        }
+        _ => None,
+    })?;
+
+    let rest = call_args[close + 1..].trim_start().strip_prefix(';')?;
+    let args = call_args[..close]
+        .strip_prefix(&format!("({base} *)this"))?
+        .trim_start_matches(',')
+        .trim();
+    Some((args, rest))
+}
+
 pub fn render_source(class: &RecoveredClass) -> String {
     let mut out = String::new();
     out.push_str("// Recovered by Debura. Method bodies are Ghidra's decompiled output\n");
@@ -96,7 +168,15 @@ pub fn render_source(class: &RecoveredClass) -> String {
     out.push_str("// arithmetic (`this + N`) rather than named members: Debura hasn't applied\n");
     out.push_str("// recovered field types back into Ghidra yet (that's a natural extension of\n");
     out.push_str("// M8's Ghidra feedback loop, not yet implemented for fields/structs).\n");
-    out.push_str(&format!("#include \"{}.hpp\"\n\n", class.name));
+    out.push_str(&format!("#include \"{GHIDRA_SYMBOLS_HEADER_NAME}\"\n"));
+    out.push_str(&format!("#include \"{}.hpp\"\n", class.name));
+    // The header only forward-declares these (see render_header) -- the
+    // full definition is needed here since method bodies actually call
+    // into them.
+    for reference in &class.references {
+        out.push_str(&format!("#include \"{reference}.hpp\"\n"));
+    }
+    out.push('\n');
 
     for m in &class.methods {
         // Same rule as method_declaration(): a constructor/destructor's
@@ -109,12 +189,24 @@ pub fn render_source(class: &RecoveredClass) -> String {
         } else {
             (format!("{} ", m.return_type), m.display_name.clone())
         };
+        let decompilation = patch_known_idioms(&m.decompilation);
+        let base_init = m.is_constructor.then(|| {
+            class.base.as_ref().and_then(|base| extract_base_constructor_call(&decompilation, base))
+        }).flatten();
+
+        let (initializer_list, body) = match base_init {
+            Some((args, rest)) => (
+                format!(" : {}({args})", class.base.as_ref().unwrap()),
+                format!("{{\n{rest}"),
+            ),
+            None => (String::new(), extract_body(&decompilation)),
+        };
+
         out.push_str(&format!("// {}\n", name_comment(&m.name_source)));
         out.push_str(&format!(
-            "{return_prefix}{}::{name}({})\n{}\n\n",
+            "{return_prefix}{}::{name}({}){initializer_list}\n{body}\n\n",
             class.name,
             m.params,
-            extract_body(&m.decompilation)
         ));
     }
 
@@ -126,7 +218,8 @@ pub fn render_functions_source(functions: &[RecoveredFunction]) -> String {
     out.push_str("// Recovered by Debura: standalone functions with an ACCEPTED semantic\n");
     out.push_str("// name (PROJECT.md M5). Bodies are Ghidra's decompiled output, unmodified\n");
     out.push_str("// beyond substituting the recovered name for Ghidra's raw one.\n");
-    out.push_str(&format!("#include \"{GHIDRA_COMPAT_HEADER_NAME}\"\n\n"));
+    out.push_str(&format!("#include \"{GHIDRA_COMPAT_HEADER_NAME}\"\n"));
+    out.push_str(&format!("#include \"{GHIDRA_SYMBOLS_HEADER_NAME}\"\n\n"));
 
     for f in functions {
         out.push_str(&format!("// {}\n", name_comment(&f.name_source)));
@@ -136,7 +229,7 @@ pub fn render_functions_source(functions: &[RecoveredFunction]) -> String {
             f.return_type,
             f.display_name,
             f.params,
-            extract_body(&f.decompilation)
+            extract_body(&patch_known_idioms(&f.decompilation))
         ));
     }
 
