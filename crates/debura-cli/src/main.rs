@@ -22,8 +22,14 @@ enum Command {
         /// Path to the binary to analyze
         binary: PathBuf,
     },
-    /// Run headless Ghidra and extract deterministic facts
+    /// Run headless Ghidra, extract deterministic facts, and persist them
+    /// as observations
     Analyze {
+        /// Project id, as printed by `debura new`
+        project: String,
+    },
+    /// Report the persisted knowledge graph's current state
+    Status {
         /// Project id, as printed by `debura new`
         project: String,
     },
@@ -67,6 +73,45 @@ fn main() -> Result<()> {
             println!("Imports:   {}", result.imports.len());
             println!("Exports:   {}", result.exports.len());
             println!("Xrefs:     {}", result.xrefs.len());
+
+            let mut graph = debura_knowledge::KnowledgeGraph::new();
+            debura_analysis::ingest(&mut graph, &result, "artifacts/analysis.json");
+
+            let conn = debura_storage::init_project_db(&root.join("project.sqlite"))?;
+            debura_storage::knowledge::save(&conn, &graph)?;
+
+            println!(
+                "\nPersisted {} observations to project.sqlite",
+                graph.observations().count()
+            );
+        }
+        Command::Status { project } => {
+            let root = debura_core::config::projects_dir().join(&project);
+            anyhow::ensure!(root.is_dir(), "no such project: {project}");
+
+            let conn = debura_storage::init_project_db(&root.join("project.sqlite"))?;
+            let graph = debura_storage::knowledge::load(&conn)?;
+
+            println!("Project: {project}\n");
+            println!("Observations: {}", graph.observations().count());
+            println!("Evidence:     {}", graph.all_evidence().count());
+            println!("Hypotheses:   {}", graph.hypotheses().count());
+
+            use debura_knowledge::HypothesisStatus::*;
+            for status in [
+                Proposed,
+                Investigating,
+                Supported,
+                Accepted,
+                Contested,
+                Stale,
+                Rejected,
+            ] {
+                let count = graph.hypotheses().filter(|h| h.status == status).count();
+                if count > 0 {
+                    println!("  {status:?}: {count}");
+                }
+            }
         }
     }
 
