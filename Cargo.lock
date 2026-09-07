@@ -203,6 +203,8 @@ dependencies = [
  "anyhow",
  "clap",
  "debura-core",
+ "debura-ghidra",
+ "serde_json",
  "tracing",
  "tracing-subscriber",
 ]
@@ -226,6 +228,12 @@ dependencies = [
 [[package]]
 name = "debura-ghidra"
 version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "tracing",
+]
 
 [[package]]
 name = "debura-knowledge"
