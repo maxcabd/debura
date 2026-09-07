@@ -54,6 +54,15 @@ enum Command {
         /// Project id, as printed by `debura new`
         project: String,
     },
+    /// Break down persisted investigations by task type (PROJECT.md
+    /// M15): how many were run, how many produced a new hypothesis or
+    /// evidence versus nothing at all, and the resulting productive
+    /// investigation rate -- the metric to watch once a run is fast
+    /// enough that wall-clock time stops being the bottleneck question.
+    Stats {
+        /// Project id, as printed by `debura new`
+        project: String,
+    },
     /// Run a bounded AnalyzeFunction investigation against one subject
     Investigate {
         /// Project id, as printed by `debura new`
@@ -216,6 +225,41 @@ fn main() -> Result<()> {
                     println!("  {status:?}: {count}");
                 }
             }
+        }
+        Command::Stats { project } => {
+            let root = debura_core::config::projects_dir().join(&project);
+            anyhow::ensure!(root.is_dir(), "no such project: {project}");
+
+            let conn = debura_storage::init_project_db(&root.join("project.sqlite"))?;
+            let graph = debura_storage::knowledge::load(&conn)?;
+
+            let report = debura_scheduler::investigation_report(&graph);
+
+            println!("Project: {project}\n");
+            println!(
+                "{:<22} {:>8} {:>10} {:>10} {:>9} {:>9} {:>7}",
+                "Task", "executed", "hyp.new", "hyp.mod", "evidence", "accepted", "no-op"
+            );
+            for stats in &report.by_task {
+                println!(
+                    "{:<22} {:>8} {:>10} {:>10} {:>9} {:>9} {:>7}",
+                    stats.task,
+                    stats.executed,
+                    stats.hypotheses_created,
+                    stats.hypotheses_modified,
+                    stats.evidence_created,
+                    stats.accepted_from_created,
+                    stats.no_op,
+                );
+            }
+            println!();
+            println!("Fingerprint cache hits (no model call at all): {}", report.fingerprint_cache_hits);
+            println!(
+                "Productive investigations: {}/{} ({:.1}%)",
+                report.productive_investigations,
+                report.total_investigations,
+                100.0 * report.productive_rate()
+            );
         }
         Command::Investigate { project, subject } => {
             let root = debura_core::config::projects_dir().join(&project);

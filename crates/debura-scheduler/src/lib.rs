@@ -8,12 +8,14 @@
 mod fingerprint;
 mod priority;
 mod queue;
+mod report;
 mod run;
 mod seed;
 mod task;
 
 pub use fingerprint::fingerprint;
 pub use queue::Scheduler;
+pub use report::{investigation_report, InvestigationReport, TaskTypeStats};
 pub use run::{run, run_with_concurrency, RunBudget, RunSummary, StopReason};
 pub use seed::seed_initial_tasks;
 pub use task::Task;
