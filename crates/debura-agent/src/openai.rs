@@ -156,12 +156,18 @@ impl AgentProvider for OpenAiProvider {
             role something like \"die\" -- the decrement alone does not. If your only evidence is \
             the function's own decompiled body, do not propose a semantic_role at all this round; \
             leaving it unproposed (so the subject keeps its raw name for now) is a more honest \
-            outcome than a confident-sounding guess the body alone can't support. When you do \
-            have that broader evidence, semantic_role's value should still be an identifier-style \
-            name, e.g. \"calculateDirection\", never a sentence. semantic_role is the only \
-            predicate Debura's C++ recovery step reads to rename anything -- a proposed name \
-            under any other predicate (including mechanical_behavior) is invisible to it and the \
-            subject keeps its raw, unverified Ghidra name. \
+            outcome than a confident-sounding guess the body alone can't support. This applies \
+            just as much when your only alternative is a generic placeholder: a value like \
+            \"function\", \"method\", \"handler\", \"process\", or \"logic\" is not a real \
+            semantic_role just because some word was needed to fill the field -- it conveys \
+            nothing that distinguishes this subject from any other, and is exactly as \
+            unsupported as no evidence at all. Omitting semantic_role is always the honest \
+            choice over a placeholder like that. When you do have real evidence, semantic_role's \
+            value should still be an identifier-style name, e.g. \"calculateDirection\", never a \
+            sentence and never a generic placeholder word. semantic_role is the only predicate \
+            Debura's C++ recovery step reads to rename anything -- a proposed name under any \
+            other predicate (including mechanical_behavior) is invisible to it and the subject \
+            keeps its raw, unverified Ghidra name. \
             \n\n\
             Additional hypotheses under other predicates (ownership, purpose, etc.) are welcome \
             and should use whatever predicate best describes that claim. Cite existing \
@@ -170,10 +176,9 @@ impl AgentProvider for OpenAiProvider {
             stated reason, do not propose the same claim again -- either address why it failed or \
             propose something genuinely different. If the subject has a vtable_install_pattern \
             observation, its semantic_role should be \"install<ClassName>Vtable\" (e.g. \
-            \"installWallVtable\") -- identifier-style and class-qualified, without claiming to \
-            know constructor vs destructor, which that observation deliberately doesn't \
-            determine. A bare word like \"constructor\" on its own isn't identifier-style enough \
-            for Debura's recovery step, even when the underlying belief is correct.";
+            \"installWallVtable\") -- identifier-style, class-qualified, and specific in exactly \
+            this sense, without claiming to know constructor vs destructor, which that \
+            observation deliberately doesn't determine.";
 
         let user = render_analyze_function_task(task);
         let value = self.complete(
@@ -215,12 +220,18 @@ impl AgentProvider for OpenAiProvider {
             claim about that subject's PURPOSE in the program, not just its mechanics. If a \
             subject's only evidence is its own decompiled body, do not propose a semantic_role \
             for it this round; leaving it unproposed is a more honest outcome than a \
-            confident-sounding guess the body alone can't support. When you do have that broader \
-            evidence, semantic_role's value should still be an identifier-style name, e.g. \
-            \"calculateDirection\", never a sentence. semantic_role is the only predicate \
-            Debura's C++ recovery step reads to rename anything -- a proposed name under any \
-            other predicate (including mechanical_behavior) is invisible to it and the subject \
-            keeps its raw, unverified Ghidra name. \
+            confident-sounding guess the body alone can't support. This applies just as much when \
+            your only alternative is a generic placeholder: a value like \"function\", \
+            \"method\", \"handler\", \"process\", or \"logic\" is not a real semantic_role just \
+            because some word was needed to fill the field -- it conveys nothing that \
+            distinguishes that subject from any other, and is exactly as unsupported as no \
+            evidence at all. Omitting semantic_role is always the honest choice over a \
+            placeholder like that. When you do have real evidence, semantic_role's value should \
+            still be an identifier-style name, e.g. \"calculateDirection\", never a sentence and \
+            never a generic placeholder word. semantic_role is the only predicate Debura's C++ \
+            recovery step reads to rename anything -- a proposed name under any other predicate \
+            (including mechanical_behavior) is invisible to it and the subject keeps its raw, \
+            unverified Ghidra name. \
             \n\n\
             Additional hypotheses under other predicates (ownership, purpose, etc.) are welcome \
             and should use whatever predicate best describes that claim. Cite existing \
@@ -230,11 +241,10 @@ impl AgentProvider for OpenAiProvider {
             or rejected with a stated reason, do not propose the same claim again -- either \
             address why it failed or propose something genuinely different. If a subject has a \
             vtable_install_pattern observation, its semantic_role should be \
-            \"install<ClassName>Vtable\" (e.g. \"installWallVtable\") -- identifier-style and \
-            class-qualified, without claiming to know constructor vs destructor, which that \
-            observation deliberately doesn't determine. A bare word like \"constructor\" on its \
-            own isn't identifier-style enough for Debura's recovery step, even when the \
-            underlying belief is correct. Return exactly one result per subject listed below, \
+            \"install<ClassName>Vtable\" (e.g. \"installWallVtable\") -- identifier-style, \
+            class-qualified, and specific in exactly this sense, without claiming to know \
+            constructor vs destructor, which that observation deliberately doesn't determine. \
+            Return exactly one result per subject listed below, \
             each carrying that subject's own address back so results can be matched up -- order \
             doesn't matter, the subject field is authoritative.";
 
@@ -449,7 +459,17 @@ const CHALLENGE_SYSTEM: &str = "You are Debura's ChallengeHypothesis adversarial
     catch. If that's what you find -- a semantic_role whose only support is the subject's own \
     decompiled body, describing what the code does rather than why it exists -- flag it as a \
     contradiction and recommend it be withdrawn (or re-proposed under mechanical_behavior \
-    instead), even when the description is technically accurate.";
+    instead), even when the description is technically accurate. \
+    \n\n\
+    Also reject, unconditionally, a semantic_role value that is a generic placeholder word \
+    rather than a real name -- \"function\", \"method\", \"handler\", \"process\", \"logic\", or \
+    anything similarly generic. A real case this caught: \"function\" accepted as a subject's \
+    semantic_role -- technically not *false* (it is, trivially, a function), but conveying \
+    nothing that distinguishes that subject from any other one in the binary, which makes it \
+    exactly as useless as no semantic_role at all while looking like real recovered knowledge. \
+    This check doesn't depend on the vaguer side-effect question above -- a placeholder like this \
+    fails even if there happens to be real supporting evidence behind it, because the *name* \
+    itself carries no information regardless of what justified proposing it.";
 
 const RESOLVE_SYSTEM: &str = "You are Debura's ResolveContradiction step. A hypothesis has been \
     marked CONTESTED because contradicting evidence was found. Weigh the supporting evidence \
