@@ -1,0 +1,16 @@
+[package]
+name = "debura-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+debura-storage = { path = "../debura-storage" }
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+ulid.workspace = true
+chrono.workspace = true
+goblin.workspace = true
+dirs.workspace = true
