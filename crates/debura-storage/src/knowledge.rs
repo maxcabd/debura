@@ -3,21 +3,23 @@
 //! an incremental diff -- simple and correct, and fast enough until a real
 //! scheduler (M6) makes full-graph rewrites a bottleneck.
 //!
-//! Investigations aren't persisted yet: nothing produces them until the
-//! agent harness (M4), and designing their schema before that exists would
-//! be guessing at a shape we don't know yet.
+//! Investigations are persisted with array fields (tool_calls, the various
+//! id lists) as JSON columns rather than junction tables, same pragmatic
+//! choice as hypotheses' evidence lists -- nothing needs to SQL-query into
+//! them yet, only read a whole record back.
 
 use anyhow::{bail, Result};
 use chrono::{DateTime, Utc};
 use debura_knowledge::{
     Dependency, DependencyKind, Evidence, EvidenceId, Hypothesis, HypothesisId, HypothesisStatus,
-    InvestigationId, KnowledgeGraph, Observation, ObservationId,
+    Investigation, InvestigationId, KnowledgeGraph, Observation, ObservationId,
 };
 use rusqlite::{params, Connection};
 
 pub fn save(conn: &Connection, graph: &KnowledgeGraph) -> Result<()> {
     let tx = conn.unchecked_transaction()?;
 
+    tx.execute("DELETE FROM investigations", [])?;
     tx.execute("DELETE FROM dependencies", [])?;
     tx.execute("DELETE FROM hypotheses", [])?;
     tx.execute("DELETE FROM evidence", [])?;
@@ -86,6 +88,30 @@ pub fn save(conn: &Connection, graph: &KnowledgeGraph) -> Result<()> {
             "INSERT INTO dependencies (source_hypothesis, target_hypothesis, kind)
              VALUES (?1, ?2, ?3)",
             params![d.source.0, d.target.0, kind_to_str(d.kind)],
+        )?;
+    }
+
+    for i in graph.investigations() {
+        tx.execute(
+            "INSERT INTO investigations
+                (id, task, target, context_snapshot, tool_calls, observations,
+                 hypotheses_created, hypotheses_modified, evidence_created,
+                 result, followup_tasks, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![
+                i.id.0,
+                i.task,
+                i.target,
+                i.context_snapshot,
+                strings_to_json(&i.tool_calls),
+                obs_ids_to_json(&i.observations),
+                hyp_ids_to_json(&i.hypotheses_created),
+                hyp_ids_to_json(&i.hypotheses_modified),
+                ids_to_json(&i.evidence_created),
+                i.result,
+                strings_to_json(&i.followup_tasks),
+                i.created_at.to_rfc3339(),
+            ],
         )?;
     }
 
@@ -228,6 +254,61 @@ pub fn load(conn: &Connection) -> Result<KnowledgeGraph> {
         });
     }
 
+    let mut stmt = conn.prepare(
+        "SELECT id, task, target, context_snapshot, tool_calls, observations,
+                hypotheses_created, hypotheses_modified, evidence_created,
+                result, followup_tasks, created_at
+         FROM investigations",
+    )?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, String>(7)?,
+                row.get::<_, String>(8)?,
+                row.get::<_, String>(9)?,
+                row.get::<_, String>(10)?,
+                row.get::<_, String>(11)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for (
+        id,
+        task,
+        target,
+        context_snapshot,
+        tool_calls,
+        observations,
+        hypotheses_created,
+        hypotheses_modified,
+        evidence_created,
+        result,
+        followup_tasks,
+        created_at,
+    ) in rows
+    {
+        graph.insert_investigation(Investigation {
+            id: InvestigationId(id as u64),
+            task,
+            target,
+            context_snapshot,
+            tool_calls: strings_from_json(&tool_calls)?,
+            observations: obs_ids_from_json(&observations)?,
+            hypotheses_created: hyp_ids_from_json(&hypotheses_created)?,
+            hypotheses_modified: hyp_ids_from_json(&hypotheses_modified)?,
+            evidence_created: ids_from_json(&evidence_created)?,
+            result,
+            followup_tasks: strings_from_json(&followup_tasks)?,
+            created_at: parse_dt(&created_at)?,
+        });
+    }
+
     Ok(graph)
 }
 
@@ -239,6 +320,34 @@ fn ids_to_json(ids: &[EvidenceId]) -> String {
 fn ids_from_json(json: &str) -> Result<Vec<EvidenceId>> {
     let raw: Vec<u64> = serde_json::from_str(json)?;
     Ok(raw.into_iter().map(EvidenceId).collect())
+}
+
+fn obs_ids_to_json(ids: &[ObservationId]) -> String {
+    let raw: Vec<u64> = ids.iter().map(|id| id.0).collect();
+    serde_json::to_string(&raw).expect("Vec<u64> always serializes")
+}
+
+fn obs_ids_from_json(json: &str) -> Result<Vec<ObservationId>> {
+    let raw: Vec<u64> = serde_json::from_str(json)?;
+    Ok(raw.into_iter().map(ObservationId).collect())
+}
+
+fn hyp_ids_to_json(ids: &[HypothesisId]) -> String {
+    let raw: Vec<u64> = ids.iter().map(|id| id.0).collect();
+    serde_json::to_string(&raw).expect("Vec<u64> always serializes")
+}
+
+fn hyp_ids_from_json(json: &str) -> Result<Vec<HypothesisId>> {
+    let raw: Vec<u64> = serde_json::from_str(json)?;
+    Ok(raw.into_iter().map(HypothesisId).collect())
+}
+
+fn strings_to_json(items: &[String]) -> String {
+    serde_json::to_string(items).expect("Vec<String> always serializes")
+}
+
+fn strings_from_json(json: &str) -> Result<Vec<String>> {
+    Ok(serde_json::from_str(json)?)
 }
 
 fn parse_dt(s: &str) -> Result<DateTime<Utc>> {

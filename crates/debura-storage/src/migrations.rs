@@ -61,6 +61,25 @@ const MIGRATIONS: &[(&str, &str)] = &[
         );
         "#,
     ),
+    (
+        "0003_investigations",
+        r#"
+        CREATE TABLE investigations (
+            id                   INTEGER PRIMARY KEY,
+            task                 TEXT NOT NULL,
+            target               TEXT NOT NULL,
+            context_snapshot     TEXT NOT NULL,
+            tool_calls           TEXT NOT NULL,
+            observations         TEXT NOT NULL,
+            hypotheses_created   TEXT NOT NULL,
+            hypotheses_modified  TEXT NOT NULL,
+            evidence_created     TEXT NOT NULL,
+            result               TEXT NOT NULL,
+            followup_tasks       TEXT NOT NULL,
+            created_at           TEXT NOT NULL
+        );
+        "#,
+    ),
 ];
 
 pub fn run(conn: &Connection) -> Result<()> {
