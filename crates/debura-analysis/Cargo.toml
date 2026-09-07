@@ -4,3 +4,5 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+debura-ghidra = { path = "../debura-ghidra" }
+debura-knowledge = { path = "../debura-knowledge" }
