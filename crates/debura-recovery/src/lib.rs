@@ -16,7 +16,7 @@ mod symbols;
 mod symtab;
 mod write;
 
-pub use compat::{GHIDRA_COMPAT_HEADER, GHIDRA_COMPAT_HEADER_NAME};
+pub use compat::{render_ghidra_compat_header, GHIDRA_COMPAT_HEADER_NAME};
 pub use extract::extract;
 pub use model::{
     NameSource, RecoveredClass, RecoveredField, RecoveredFunction, RecoveredMethod,

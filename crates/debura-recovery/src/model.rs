@@ -83,6 +83,10 @@ pub struct RecoveredProgram {
     /// `PTR_...`, `_refptr_...`) referenced somewhere in a recovered
     /// body but never declared anywhere else in the output.
     pub ghidra_data_symbols: Vec<String>,
+    /// Ghidra's own `CONCATxy`/`SUBxy`/`ZEXTxy`/`SEXTxy` intrinsic names
+    /// referenced somewhere in a recovered body -- exactly the set
+    /// `render_ghidra_compat_header` needs to generate definitions for.
+    pub ghidra_intrinsics: Vec<String>,
     /// Call-site names (`FUN_x`, `thunk_FUN_x`) M15's symbol resolution
     /// pass found no recovered definition for at all -- left as literal
     /// calls in the rewritten bodies, needing a permissive fallback

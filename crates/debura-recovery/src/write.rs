@@ -3,7 +3,7 @@ use std::path::Path;
 
 use anyhow::Result;
 
-use crate::compat::{GHIDRA_COMPAT_HEADER, GHIDRA_COMPAT_HEADER_NAME};
+use crate::compat::{render_ghidra_compat_header, GHIDRA_COMPAT_HEADER_NAME};
 use crate::model::RecoveredProgram;
 use crate::render::{render_functions_source, render_header, render_source};
 use crate::symbols::{render_function_declarations, render_ghidra_symbols_header, GHIDRA_SYMBOLS_HEADER_NAME};
@@ -24,7 +24,10 @@ pub fn write_to_disk(project_root: &Path, program: &RecoveredProgram) -> Result<
     fs::create_dir_all(&include_dir)?;
     fs::create_dir_all(&src_dir)?;
 
-    fs::write(include_dir.join(GHIDRA_COMPAT_HEADER_NAME), GHIDRA_COMPAT_HEADER)?;
+    fs::write(
+        include_dir.join(GHIDRA_COMPAT_HEADER_NAME),
+        render_ghidra_compat_header(&program.ghidra_intrinsics),
+    )?;
     let function_declarations: Vec<(String, String, String)> = program
         .functions
         .iter()
