@@ -171,9 +171,23 @@ def next_symbol_boundary(sym_table, addr):
     end of the symbol table. Used to bound reads into a vtable/typeinfo
     record so they never run into whatever unrelated data happens to
     follow it in the section (there is no explicit length field for
-    either)."""
-    it = sym_table.getSymbolIterator(addr.add(1), True)
-    return it.next().getAddress() if it.hasNext() else None
+    either). On a stripped binary there are far fewer real symbols, so
+    walking forward can run the iterator off the end of the program's
+    real address space and into Ghidra's synthetic EXTERNAL space
+    instead of just exhausting cleanly -- a real run hit exactly this
+    ("Invalid memory address: EXTERNAL:...", an IllegalArgumentException
+    thrown from inside getSymbolIterator itself, not from iterating).
+    Treated the same as "no next symbol": there's nothing meaningful to
+    bound against either way. A bare `except`, not `except Exception`:
+    this specific exception crosses a Java reflection boundary
+    (getSymbolIterator is invoked via NativeMethodAccessorImpl.invoke in
+    the real stack trace) and a real run showed Jython does not
+    consistently surface that as a catchable `Exception` instance."""
+    try:
+        it = sym_table.getSymbolIterator(addr.add(1), True)
+        return it.next().getAddress() if it.hasNext() else None
+    except:
+        return None
 
 
 def resolve_pointer(mem, addr_factory, value):
@@ -203,7 +217,13 @@ def extract_type_info(sym_table, mem, addr_factory):
         if available < 0x18:
             continue  # __class_type_info: no base
 
-        base_ptr_value = mem.getLong(addr.add(0x10))
+        # Same risk as extract_vtables(): `available` falls back to a
+        # fixed guess when there's no next symbol to bound against,
+        # which a stripped binary can make wrong.
+        try:
+            base_ptr_value = mem.getLong(addr.add(0x10))
+        except:
+            continue
         base_addr = resolve_pointer(mem, addr_factory, base_ptr_value)
         if base_addr is None:
             continue
@@ -247,7 +267,17 @@ def extract_vtables(sym_table, mem, addr_factory, fm):
         slot = 0
         offset = 0x10  # skip offset-to-top and the RTTI pointer
         while offset < available and slot < max_slots:
-            value = mem.getLong(addr.add(offset))
+            # `available` is a real bound when a next symbol was found,
+            # but falls back to a fixed guess (max_slots * 8) when there
+            # wasn't one -- true on a stripped binary near the end of a
+            # section, where that guess can walk past real memory into
+            # Ghidra's synthetic EXTERNAL space. A real run crashed
+            # extraction outright here; unreadable memory means there's
+            # no more real vtable data, the same as hitting a boundary.
+            try:
+                value = mem.getLong(addr.add(offset))
+            except:
+                break
             if value == 0:
                 break
             target = resolve_pointer(mem, addr_factory, value)
