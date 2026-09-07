@@ -6,6 +6,9 @@
 //! Behind the `openai` feature so crates that only need the mock provider
 //! (most of the test suite) don't pay for `reqwest` in their build.
 
+use std::thread;
+use std::time::Duration;
+
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -18,6 +21,14 @@ use crate::AgentProvider;
 
 const API_URL: &str = "https://api.openai.com/v1/chat/completions";
 const DEFAULT_MODEL: &str = "gpt-4o-mini";
+
+/// PROJECT.md M10: at real concurrency, 429 (rate limit) responses aren't
+/// exceptional -- they're expected, and OpenAI's guidance is to back off
+/// and retry, not fail immediately. 5xx are treated the same way (also
+/// transient). Any other status is a real error and isn't retried.
+const MAX_RETRIES: u32 = 6;
+const INITIAL_BACKOFF: Duration = Duration::from_millis(500);
+const MAX_BACKOFF: Duration = Duration::from_secs(30);
 
 pub struct OpenAiProvider {
     api_key: String,
@@ -62,27 +73,63 @@ impl OpenAiProvider {
             }
         });
 
-        let response = self
-            .client
-            .post(API_URL)
-            .bearer_auth(&self.api_key)
-            .json(&body)
-            .send()
-            .context("OpenAI request failed")?;
+        let mut attempt = 0u32;
+        loop {
+            let response = self
+                .client
+                .post(API_URL)
+                .bearer_auth(&self.api_key)
+                .json(&body)
+                .send()
+                .context("OpenAI request failed")?;
 
-        let status = response.status();
-        let text = response.text().context("reading OpenAI response body")?;
-        if !status.is_success() {
-            bail!("OpenAI API error ({status}): {text}");
+            let status = response.status();
+            let retryable = status.as_u16() == 429 || status.is_server_error();
+
+            if retryable && attempt < MAX_RETRIES {
+                let wait = retry_after(&response).unwrap_or_else(|| backoff_for(attempt));
+                tracing::warn!(
+                    %status,
+                    attempt,
+                    wait_ms = wait.as_millis() as u64,
+                    "OpenAI request throttled, retrying"
+                );
+                thread::sleep(wait);
+                attempt += 1;
+                continue;
+            }
+
+            let text = response.text().context("reading OpenAI response body")?;
+            if !status.is_success() {
+                bail!("OpenAI API error ({status}) after {attempt} retries: {text}");
+            }
+
+            let parsed: Value =
+                serde_json::from_str(&text).context("parsing OpenAI response envelope")?;
+            let content = parsed["choices"][0]["message"]["content"]
+                .as_str()
+                .context("OpenAI response missing message content")?;
+
+            return serde_json::from_str(content).context("parsing structured output JSON");
         }
-
-        let parsed: Value = serde_json::from_str(&text).context("parsing OpenAI response envelope")?;
-        let content = parsed["choices"][0]["message"]["content"]
-            .as_str()
-            .context("OpenAI response missing message content")?;
-
-        serde_json::from_str(content).context("parsing structured output JSON")
     }
+}
+
+/// Prefers the server's own `Retry-After` header over guessing.
+fn retry_after(response: &reqwest::blocking::Response) -> Option<Duration> {
+    response
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .parse::<u64>()
+        .ok()
+        .map(Duration::from_secs)
+}
+
+fn backoff_for(attempt: u32) -> Duration {
+    let millis = INITIAL_BACKOFF.as_millis() as u64 * 2u64.saturating_pow(attempt);
+    Duration::from_millis(millis).min(MAX_BACKOFF)
 }
 
 impl AgentProvider for OpenAiProvider {
