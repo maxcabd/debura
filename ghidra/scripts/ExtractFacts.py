@@ -18,6 +18,7 @@
 import json
 import re
 
+from ghidra.app.cmd.function import CreateFunctionCmd
 from ghidra.app.decompiler import DecompInterface
 from ghidra.util.task import ConsoleTaskMonitor
 
@@ -41,6 +42,273 @@ def owner_class_of(signature):
     return match.group(1) if match else None
 
 
+# --- Structural vtable/RTTI discovery (PROJECT.md M7, stripped-binary case) ---
+#
+# Everything above (and the original extract_vtables/extract_type_info below)
+# depends on Ghidra's own demangler having already labeled "vtable"/
+# "typeinfo" symbols and typed `this` parameters -- which it only does from
+# the ORIGINAL binary's own symbol table. A real run confirmed this: on a
+# properly stripped binary, that whole path recovers zero of the binary's
+# real classes (only libstdc++'s own RTTI base types, which Ghidra
+# recognizes via a built-in library-signature database, not the stripped
+# binary's own symbols).
+#
+# The RTTI/vtable *data* itself is untouched by stripping -- it's real
+# program data needed at runtime for dynamic_cast/typeid/exception
+# matching, not debug info -- so it can still be found structurally:
+#
+#  1. Every constructor (and destructor) writes its own class's vptr
+#     value into offset 0 of `this` early on (`this->vptr = vfunc0`, the
+#     Itanium ABI's own convention -- `this->vptr` points directly at
+#     the first virtual function slot, not at the 2-slot offset-to-top/
+#     RTTI header that precedes it in memory, despite Ghidra's own
+#     "vtable" symbol conventionally being placed at that header instead;
+#     see is_plausible_vtable_start's docstring, which got this backwards
+#     on the first attempt). Confirmed on the real stripped Snake binary:
+#     `Wall`'s constructor decompiles to `*param_1 = &PTR_LAB_140009a20;`
+#     -- found via a plain cross-reference from the function's own early
+#     instructions, no symbol involved.
+#  2. A candidate address is confirmed as vfunc0 (not some other data
+#     reference) by checking for a real function pointer AT that exact
+#     address -- the one part of a vtable's shape unlikely to appear by
+#     coincidence.
+#  3. The RTTI pointer one slot before vfunc0 leads to a typeinfo
+#     record, whose own name field (the slot right after its own vtable
+#     pointer) points at the class's raw mangled type name (e.g.
+#     "9SnakeGame4Food") -- also real program data, so a real class name
+#     is recoverable with no symbol at any step, not just a synthetic
+#     placeholder.
+#
+# Deliberately scoped narrower than a real class recoverer: this finds
+# vtables, their owning constructor/destructor addresses (not
+# distinguished from each other -- a materially harder problem, deferred)
+# and their virtual method slots. It does not attempt to find a class's
+# *non-virtual* methods (PROJECT.md M7's `is_method_of` for those still
+# needs the this-param typing above) or inheritance edges.
+
+POINTER_SIZE = 8  # x64 only, matching the rest of this script's assumptions
+# Generous on purpose: unoptimized (-O0) GCC prologues -- stack canary
+# setup, spilling every parameter to its own stack slot -- can easily run
+# 15-20+ instructions before a small constructor reaches its first real
+# statement. This scan is pure instruction/reference iteration (no
+# decompiler call), so a larger limit is cheap.
+EARLY_INSTRUCTION_LIMIT = 48
+MAX_VTABLE_SLOTS = 64
+
+
+def ensure_function_at(target, mem, fm):
+    """A vtable slot's target can be real code Ghidra's own auto-analysis
+    already disassembled -- it just never registered a Function boundary
+    there, since nothing else called it directly enough to trigger that
+    (only ever reached indirectly, through the vtable). Confirmed on the
+    real stripped Snake binary: `Wall::draw`'s own address had a real
+    disassembled `PUSH RBP` prologue sitting there, but
+    `getFunctionAt`/`getFunctionContaining` both returned None until this
+    was added. `CreateFunctionCmd` is the same command Ghidra's own
+    scripts use for exactly this -- it computes the function's body via
+    flow analysis from the entry point, the same as if a human had
+    pressed "create function" in the GUI."""
+    existing = fm.getFunctionAt(target)
+    if existing is not None:
+        return existing
+    block = mem.getBlock(target)
+    if block is None or not block.isExecute():
+        return None
+    try:
+        CreateFunctionCmd(target).applyTo(currentProgram)
+    except:
+        return None
+    return fm.getFunctionAt(target)
+
+
+def is_plausible_vtable_start(vfunc0_addr, mem, addr_factory, fm):
+    """A real function pointer *at this exact address* is the structural
+    signature confirming it's genuinely what a constructor's vtable-
+    pointer-slot store targets. Per the Itanium ABI, `this->vptr` points
+    directly at the first virtual function slot (vfunc0) -- NOT at the
+    2-slot offset-to-top/RTTI header before it, despite that header
+    coming first in memory and being where Ghidra's own "vtable" symbol
+    (see extract_vtables() below) is conventionally placed. Confirmed
+    against the real stripped Wall constructor: its `this[0] = &X` store
+    targets an X where `mem.getLong(X)` itself -- not `X + 0x10` -- is a
+    real function pointer; checking `+ 0x10` here (as a first version of
+    this did) missed every real class that has fewer than 2 virtual
+    methods, which is most of them.
+
+    That function-pointer check alone still misses a real case: a class
+    that overrides nothing of its own can have its vtable's function
+    slots come out as genuine null bytes rather than a function pointer
+    or even a `__cxa_pure_virtual` thunk. Confirmed against the real
+    stripped Snake binary cross-checked byte-for-byte with the
+    unstripped build's own linker symbols: `Collideable`'s vtable --
+    `_ZTVN9SnakeGame11CollideableE`, at exactly the address this
+    function's caller computes as its true vtable start -- has all-zero
+    bytes at both vfunc0 and vfunc0+8 in *both* binaries, so it's not a
+    stripping artifact. Falling back to the RTTI chain (one slot before
+    vfunc0) as an independent confirming signal recovers this case: a
+    well-formed, demanglable Itanium typeinfo name one slot back is not
+    something a coincidental data/function-pointer array would also
+    have, so it's a comparably strong signal even when vfunc0 itself is
+    unusable."""
+    try:
+        value = mem.getLong(vfunc0_addr)
+    except:
+        value = None
+    if value is not None:
+        target = resolve_pointer(mem, addr_factory, value)
+        if target is not None and ensure_function_at(target, mem, fm) is not None:
+            return True
+    return class_name_from_vtable(vfunc0_addr, mem, addr_factory) is not None
+
+
+def find_early_vtable_store(func, listing, ref_manager, mem, addr_factory, fm, monitor):
+    """The vfunc0 address (see is_plausible_vtable_start's docstring)
+    this function's own early instructions reference -- the Itanium ABI
+    idiom every constructor/destructor performs to (re-)initialize its
+    own vtable-pointer slot. Limited to the first several instructions:
+    a vtable store is always one of the first things a constructor does,
+    and restricting the search avoids picking up an unrelated later
+    reference (e.g. to a member's own vtable during that member's
+    construction) instead of this function's own."""
+    instructions = listing.getInstructions(func.getBody(), True)
+    checked = 0
+    while instructions.hasNext() and checked < EARLY_INSTRUCTION_LIMIT:
+        monitor.checkCancelled()
+        instruction = instructions.next()
+        checked += 1
+        for ref in ref_manager.getReferencesFrom(instruction.getAddress()):
+            if not ref.isMemoryReference():
+                continue
+            target = ref.getToAddress()
+            if is_plausible_vtable_start(target, mem, addr_factory, fm):
+                return target
+    return None
+
+
+def read_cstring(mem, addr, max_len=256):
+    try:
+        out = []
+        for i in range(max_len):
+            b = mem.getByte(addr.add(i))
+            if b == 0:
+                break
+            out.append(chr(b & 0xff))
+        return "".join(out)
+    except:
+        return None
+
+
+NAME_COMPONENT_PATTERN = re.compile(r"^(\d+)")
+
+
+def demangle_itanium_type_name(raw):
+    """The Itanium ABI's typeinfo `name` field is the class's own <name>
+    mangling component -- not a full mangled symbol, just length-prefixed
+    identifiers, optionally wrapped in N...E for a qualified (namespaced)
+    name, e.g. "9SnakeGame4Food" -> "SnakeGame::Food". Only handles that
+    plain nested-name shape; template names mangle very differently and
+    fall back to None here, same as any other unparseable case -- narrower
+    than a real demangler, but this is the shape a user's own class
+    produces."""
+    if not raw:
+        return None
+    body = raw[1:-1] if raw.startswith("N") and raw.endswith("E") else raw
+    parts = []
+    rest = body
+    while rest:
+        match = NAME_COMPONENT_PATTERN.match(rest)
+        if not match:
+            return None
+        length = int(match.group(1))
+        rest = rest[match.end():]
+        if length <= 0 or length > len(rest):
+            return None
+        parts.append(rest[:length])
+        rest = rest[length:]
+    return "::".join(parts) if parts else None
+
+
+def class_name_from_vtable(vfunc0_addr, mem, addr_factory):
+    """`vfunc0_addr` is what `this->vptr` itself points at (see
+    is_plausible_vtable_start), so the RTTI pointer -- one slot *before*
+    vfunc0 in memory -- is read at `vfunc0_addr - POINTER_SIZE`, and the
+    typeinfo record's own name field is the slot right after its own
+    vtable pointer. Entirely structural, no symbol needed at any step."""
+    try:
+        rtti_ptr_value = mem.getLong(vfunc0_addr.subtract(POINTER_SIZE))
+    except:
+        return None
+    rtti_addr = resolve_pointer(mem, addr_factory, rtti_ptr_value)
+    if rtti_addr is None:
+        return None
+    try:
+        name_ptr_value = mem.getLong(rtti_addr.add(POINTER_SIZE))
+    except:
+        return None
+    name_addr = resolve_pointer(mem, addr_factory, name_ptr_value)
+    if name_addr is None:
+        return None
+    return demangle_itanium_type_name(read_cstring(mem, name_addr))
+
+
+def discover_classes_structurally(fm, listing, ref_manager, sym_table, mem, addr_factory, monitor):
+    """Returns (class_names, ctor_or_dtor_addrs, virtual_methods), all
+    keyed by the *true* vtable start (as an int offset) -- 2 slots
+    before vfunc0 (offset-to-top, then RTTI), matching has_vtable_at's
+    existing convention from the symbol-based path below, even though
+    what's actually found via cross-references is vfunc0's own address.
+    class_names maps to a real recovered name where the RTTI name string
+    parsed, else a synthetic "Class_<hex address>"; ctor_or_dtor maps to
+    the set of function entry-point Addresses that store that vtable
+    early on (constructors and destructors both -- not distinguished,
+    see the module-level comment); virtual_methods maps to the ordered
+    list of function entry-point Addresses found in that vtable's own
+    slots."""
+    ctors_by_vfunc0 = {}
+    for func in fm.getFunctions(True):
+        monitor.checkCancelled()
+        if func.isExternal():
+            continue
+        vfunc0_addr = find_early_vtable_store(func, listing, ref_manager, mem, addr_factory, fm, monitor)
+        if vfunc0_addr is None:
+            continue
+        ctors_by_vfunc0.setdefault(vfunc0_addr.getOffset(), set()).add(func.getEntryPoint())
+
+    class_names = {}
+    ctor_or_dtor = {}
+    virtual_methods = {}
+    for vfunc0_key, ctor_addrs in ctors_by_vfunc0.items():
+        vfunc0_addr = addr_factory.getDefaultAddressSpace().getAddress(vfunc0_key)
+        true_key = vfunc0_addr.subtract(2 * POINTER_SIZE).getOffset()
+
+        real_name = class_name_from_vtable(vfunc0_addr, mem, addr_factory)
+        class_names[true_key] = real_name if real_name else "Class_%x" % true_key
+        ctor_or_dtor[true_key] = ctor_addrs
+
+        boundary = next_symbol_boundary(sym_table, vfunc0_addr)
+        available = boundary.subtract(vfunc0_addr) if boundary is not None else MAX_VTABLE_SLOTS * POINTER_SIZE
+
+        methods = []
+        offset = 0
+        slot = 0
+        while offset < available and slot < MAX_VTABLE_SLOTS:
+            try:
+                value = mem.getLong(vfunc0_addr.add(offset))
+            except:
+                break
+            if value == 0:
+                break
+            target = resolve_pointer(mem, addr_factory, value)
+            func_at = ensure_function_at(target, mem, fm) if target is not None else None
+            if func_at is not None:
+                methods.append(func_at.getEntryPoint())
+            slot += 1
+            offset += POINTER_SIZE
+        virtual_methods[true_key] = methods
+
+    return class_names, ctor_or_dtor, virtual_methods
+
+
 def extract_field_accesses(owner_class, decompilation):
     fields = []
     for match in FIELD_ACCESS_PATTERN.finditer(decompilation):
@@ -58,7 +326,22 @@ def extract_field_accesses(owner_class, decompilation):
     return fields
 
 
-def extract_functions(decompiler, monitor):
+def extract_functions(decompiler, monitor, structural_owner_of):
+    """`structural_owner_of` (address string -> class name) is
+    discover_classes_structurally()'s finding of which functions are a
+    vtable's constructor/destructor or one of its virtual method slots
+    -- consulted only when `owner_class_of(signature)` (Ghidra's own
+    this-param typing, which needs a symbol somewhere upstream) found
+    nothing, so a stripped binary still gets an owner class where the
+    structural pass found one, without disturbing the symbol-based
+    result where it's already available.
+
+    Constructor/destructor status is intentionally NOT set from
+    `structural_owner_of` -- distinguishing the two structurally is a
+    materially harder, separate problem (see discover_classes_
+    structurally's docstring), so these come through as regular methods
+    of the class rather than guessing ctor vs dtor and risking debura-
+    recovery applying the wrong one's special rendering."""
     functions = []
     all_fields = []
     fm = currentProgram.getFunctionManager()
@@ -82,14 +365,18 @@ def extract_functions(decompiler, monitor):
                 decompilation = decompiled.getC()
 
         signature = func.getSignature().getPrototypeString()
+        address = addr_str(func.getEntryPoint())
         owner_class = owner_class_of(signature)
+        structural_owner = owner_class is None
+        if structural_owner:
+            owner_class = structural_owner_of.get(address)
         name = func.getName()
 
         if owner_class is not None and decompilation:
             all_fields.extend(extract_field_accesses(owner_class, decompilation))
 
         functions.append({
-            "address": addr_str(func.getEntryPoint()),
+            "address": address,
             "name": name,
             "size": int(func.getBody().getNumAddresses()),
             "signature": signature,
@@ -98,8 +385,8 @@ def extract_functions(decompiler, monitor):
             "callees": sorted(callees),
             "decompilation": decompilation,
             "owner_class": owner_class,
-            "is_constructor": owner_class is not None and name == owner_class,
-            "is_destructor": owner_class is not None and name == "~" + owner_class,
+            "is_constructor": (not structural_owner) and owner_class is not None and name == owner_class,
+            "is_destructor": (not structural_owner) and owner_class is not None and name == "~" + owner_class,
         })
 
     return functions, all_fields
@@ -294,6 +581,27 @@ def extract_vtables(sym_table, mem, addr_factory, fm):
     return vtables, virtual_methods
 
 
+def merge_structural_vtables(vtables, virtual_methods, struct_class_names, struct_virtual_methods):
+    """Adds a structurally-discovered vtable/class only if nothing at
+    that address was already found via symbols -- the symbol-based
+    result (already tested, and able to demangle template names this
+    module's simplified decoder can't) wins wherever both find the same
+    address."""
+    existing_addrs = set(v["address"] for v in vtables)
+    for key, class_name in struct_class_names.items():
+        address = "0x%x" % key
+        if address in existing_addrs:
+            continue
+        vtables.append({"class_name": class_name, "address": address})
+        for slot, func_addr in enumerate(struct_virtual_methods.get(key, [])):
+            virtual_methods.append({
+                "class_name": class_name,
+                "slot": slot,
+                "function_address": addr_str(func_addr),
+            })
+    return vtables, virtual_methods
+
+
 def run():
     args = getScriptArgs()
     if len(args) < 1:
@@ -305,13 +613,29 @@ def run():
     mem = currentProgram.getMemory()
     addr_factory = currentProgram.getAddressFactory()
     fm = currentProgram.getFunctionManager()
+    listing = currentProgram.getListing()
+    ref_manager = currentProgram.getReferenceManager()
+
+    struct_class_names, struct_ctor_or_dtor, struct_virtual_methods = discover_classes_structurally(
+        fm, listing, ref_manager, sym_table, mem, addr_factory, monitor
+    )
+
+    structural_owner_of = {}
+    for key, class_name in struct_class_names.items():
+        for addr in struct_ctor_or_dtor.get(key, ()):
+            structural_owner_of[addr_str(addr)] = class_name
+        for addr in struct_virtual_methods.get(key, ()):
+            structural_owner_of[addr_str(addr)] = class_name
 
     decompiler = DecompInterface()
     decompiler.openProgram(currentProgram)
 
     try:
-        functions, fields = extract_functions(decompiler, monitor)
+        functions, fields = extract_functions(decompiler, monitor, structural_owner_of)
         vtables, virtual_methods = extract_vtables(sym_table, mem, addr_factory, fm)
+        vtables, virtual_methods = merge_structural_vtables(
+            vtables, virtual_methods, struct_class_names, struct_virtual_methods
+        )
 
         result = {
             "program": currentProgram.getName(),
