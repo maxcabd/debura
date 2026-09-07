@@ -1,0 +1,9 @@
+[package]
+name = "debura-storage"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+rusqlite.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
