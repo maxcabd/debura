@@ -1,6 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use debura_knowledge::{Hypothesis, HypothesisStatus, KnowledgeGraph, Observation};
+use debura_knowledge::{
+    classify_subject, is_reserved_identifier, ClaimClass, Hypothesis, HypothesisStatus,
+    KnowledgeGraph, Observation,
+};
 
 use crate::model::{NameSource, RecoveredClass, RecoveredField, RecoveredFunction, RecoveredMethod, RecoveredProgram};
 
@@ -297,14 +300,27 @@ fn find_references(class: &RecoveredClass, class_names: &BTreeSet<String>) -> Ve
 /// every standalone function that has actually earned an ACCEPTED
 /// semantic name (M5) -- nothing else counts as "recovered".
 pub fn extract(graph: &KnowledgeGraph) -> RecoveredProgram {
+    // PROJECT.md M15: a real run found libstdc++/CRT-internal classes
+    // (`_Guard`, `_Vector_impl`, `__class_type_info`) getting the exact
+    // same recovery treatment as real application classes -- rendered
+    // into their own .hpp/.cpp files that then fail to compile (they
+    // call into MinGW runtime internals like HeapAlloc/EnterCriticalSection
+    // that a normal g++ build already supplies for free, so "recovering"
+    // them as if they were missing application code was never right to
+    // begin with). `is_reserved_identifier` is the same C++-standard-
+    // reserved-name convention `classify_subject` uses for the stats
+    // split; applied here, it keeps them out of the generated output
+    // entirely rather than just flagging them in a metric.
     let mut class_names: BTreeSet<String> = BTreeSet::new();
     let mut class_method_addresses: BTreeSet<String> = BTreeSet::new();
     for o in graph.observations() {
         match o.predicate.as_str() {
-            "has_vtable_at" => {
+            "has_vtable_at" if !is_reserved_identifier(&o.subject) => {
                 class_names.insert(o.subject.clone());
             }
-            "is_method_of" | "is_constructor_of" | "is_destructor_of" => {
+            "is_method_of" | "is_constructor_of" | "is_destructor_of"
+                if !is_reserved_identifier(&o.value) =>
+            {
                 class_method_addresses.insert(o.subject.clone());
                 class_names.insert(o.value.clone());
             }
@@ -335,6 +351,13 @@ pub fn extract(graph: &KnowledgeGraph) -> RecoveredProgram {
     for subject in subjects {
         if class_method_addresses.contains(&subject) {
             continue; // already represented as a class method
+        }
+        if classify_subject(graph, &subject) == ClaimClass::LibraryOrCompiler {
+            // Same reasoning as the class-name filter above: a standalone
+            // function Ghidra's own name identifies as CRT/library
+            // machinery (`__p___argc`, `_cexit`, `operator_new`) doesn't
+            // need recovering -- a real g++ build already supplies it.
+            continue;
         }
         let Some(raw_name) = latest(graph, &subject, "has_name").map(|o| o.value.clone()) else {
             continue; // not a function subject at all

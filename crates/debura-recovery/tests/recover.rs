@@ -203,6 +203,45 @@ fn functions_without_an_accepted_hypothesis_are_not_recovered() {
     assert!(program.classes.is_empty());
 }
 
+/// A real run had `_Guard`, `_Vector_impl`, and `__class_type_info` --
+/// real classes Ghidra's own demangler recognized, but libstdc++
+/// internals, not application code -- getting the exact same recovery
+/// treatment as `Wall`/`Food`/`Snake`, rendered into their own .hpp/.cpp
+/// files that then failed to compile (they call MinGW runtime internals
+/// like HeapAlloc/EnterCriticalSection that a normal g++ build already
+/// supplies). PROJECT.md M15's reserved-identifier convention keeps them
+/// out of recovered output entirely.
+#[test]
+fn libstdcxx_internal_classes_are_not_recovered() {
+    let mut graph = KnowledgeGraph::new();
+    graph.add_observation("0x1", "has_vtable_at", "0x100", 1.0, "ghidra:vtable", None);
+    graph.add_observation("0x2", "is_method_of", "_Vector_impl", 0.95, "ghidra:function", None);
+    graph.add_observation("0x3", "is_constructor_of", "_Guard", 0.95, "ghidra:function", None);
+    // A real application class, for contrast -- must still be recovered.
+    graph.add_observation("0x4", "is_method_of", "Wall", 0.95, "ghidra:function", None);
+
+    let program = extract(&graph);
+    let class_names: Vec<&str> = program.classes.iter().map(|c| c.name.as_str()).collect();
+    assert!(!class_names.contains(&"_Vector_impl"));
+    assert!(!class_names.contains(&"_Guard"));
+    assert!(class_names.contains(&"Wall"));
+}
+
+/// Same reasoning, for a standalone function: a real run recovered
+/// `__p___argc`/`_cexit`-shaped CRT startup internals as if they were
+/// missing application code.
+#[test]
+fn libstdcxx_and_crt_standalone_functions_are_not_recovered() {
+    let mut graph = KnowledgeGraph::new();
+    graph.add_observation("0x99", "has_name", "__p___argc", 0.95, "ghidra:function", None);
+    let h = graph.propose_hypothesis("0x99", "semantic_role", "getArgCount", 0.95, None);
+    graph.mark_verified(h, Utc::now()).unwrap();
+    graph.set_status(h, HypothesisStatus::Accepted).unwrap();
+
+    let program = extract(&graph);
+    assert!(program.functions.is_empty());
+}
+
 /// A real run hit this: a retry after a *sibling* hypothesis (a
 /// different predicate from the same investigation) gets rejected
 /// re-runs AnalyzeFunction on the whole subject, and a fresh
