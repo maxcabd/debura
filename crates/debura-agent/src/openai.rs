@@ -231,59 +231,191 @@ impl AgentProvider for OpenAiProvider {
     }
 
     fn challenge(&self, task: &ChallengeHypothesisTask) -> Result<ChallengeResult> {
-        const SYSTEM: &str = "You are Debura's ChallengeHypothesis adversarial verification \
-            step. Your objective is NOT to find more evidence that the hypothesis is right -- \
-            it is to actively try to prove it wrong. Look for: contradicting evidence, a more \
-            general or more plausible alternative explanation, or reasons to doubt the current \
-            confidence. If a genuine, careful attempt finds nothing wrong, say so honestly \
-            rather than manufacturing a finding. If your alternative is itself a better name \
-            for the subject, its predicate must be the literal string \"semantic_role\" \
-            (matching the convention AnalyzeFunction uses) -- Debura's C++ recovery step only \
-            reads that exact predicate to name anything. If it's some other kind of claim, use \
-            whatever predicate best fits.";
-
-        let user = render_challenge_task(task);
-        let value = self.complete(SYSTEM, &user, "challenge_result", challenge_result_schema())?;
+        let value = self.complete(
+            CHALLENGE_SYSTEM,
+            &render_challenge_task(task),
+            "challenge_result",
+            challenge_result_schema(),
+        )?;
         serde_json::from_value(value).context("mapping OpenAI output to ChallengeResult")
     }
 
-    fn resolve_contradiction(&self, task: &ResolveContradictionTask) -> Result<ResolutionResult> {
-        const SYSTEM: &str = "You are Debura's ResolveContradiction step. A hypothesis has been \
-            marked CONTESTED because contradicting evidence was found. Weigh the supporting \
-            evidence against the contradicting evidence and decide whether the contradiction \
-            actually holds up, or can be explained away.";
+    fn challenge_batch(&self, tasks: &[ChallengeHypothesisTask]) -> Vec<Result<ChallengeResult>> {
+        if tasks.is_empty() {
+            return Vec::new();
+        }
+        if tasks.len() == 1 {
+            return vec![self.challenge(&tasks[0])];
+        }
 
-        let user = render_resolve_task(task);
-        let value = self.complete(
+        const SYSTEM: &str = "You are Debura's ChallengeHypothesis adversarial verification \
+            step, batched: you are given several independent hypotheses in one request, each \
+            with its own evidence and observations. Judge each one entirely on its own terms -- \
+            a contradiction, alternative explanation, or doubt found for one hypothesis must \
+            never be reused or referenced against another; treat each as if it were the only \
+            one in the request. Your objective for each is NOT to find more evidence that the \
+            hypothesis is right -- it is to actively try to prove it wrong. Look for: \
+            contradicting evidence, a more general or more plausible alternative explanation, \
+            or reasons to doubt the current confidence. If a genuine, careful attempt finds \
+            nothing wrong with a given hypothesis, say so honestly for that one rather than \
+            manufacturing a finding. If your alternative for a hypothesis is itself a better \
+            name for its subject, its predicate must be the literal string \"semantic_role\" \
+            (matching the convention AnalyzeFunction uses) -- Debura's C++ recovery step only \
+            reads that exact predicate to name anything. If it's some other kind of claim, use \
+            whatever predicate best fits. Return exactly one result per hypothesis listed \
+            below, each carrying that hypothesis's own id back so results can be matched up -- \
+            order doesn't matter, the hypothesis field is authoritative.";
+
+        let user = render_challenge_batch(tasks);
+        let value = match self.complete(
             SYSTEM,
             &user,
+            "challenge_batch_result",
+            challenge_batch_schema(),
+        ) {
+            Ok(value) => value,
+            Err(error) => {
+                let message = format!("{error:#}");
+                return tasks.iter().map(|_| Err(anyhow::anyhow!(message.clone()))).collect();
+            }
+        };
+
+        let parsed: ChallengeBatchResponse = match serde_json::from_value(value) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                let message = format!("mapping OpenAI output to a batch of ChallengeResult: {error:#}");
+                return tasks.iter().map(|_| Err(anyhow::anyhow!(message.clone()))).collect();
+            }
+        };
+
+        let mut by_hypothesis: std::collections::HashMap<u64, ChallengeResult> = parsed
+            .results
+            .into_iter()
+            .map(|entry| (entry.hypothesis, entry.result))
+            .collect();
+
+        tasks
+            .iter()
+            .map(|task| {
+                let id = task.hypothesis.id.0;
+                by_hypothesis
+                    .remove(&id)
+                    .ok_or_else(|| anyhow::anyhow!("model omitted a result for hypothesis H{id}"))
+            })
+            .collect()
+    }
+
+    fn resolve_contradiction(&self, task: &ResolveContradictionTask) -> Result<ResolutionResult> {
+        let value = self.complete(
+            RESOLVE_SYSTEM,
+            &render_resolve_task(task),
             "resolution_result",
             resolution_result_schema(),
         )?;
-
         let raw: RawResolution =
             serde_json::from_value(value).context("mapping OpenAI output to ResolutionResult")?;
+        parse_resolution(raw, task.hypothesis.confidence)
+    }
 
-        let resolution = match raw.resolution.as_str() {
-            "survives" => Resolution::Survives {
-                confidence: raw.confidence.unwrap_or(task.hypothesis.confidence),
-            },
-            "rejected" => Resolution::Rejected,
-            other => bail!("unexpected resolution verdict from model: {other}"),
+    fn resolve_batch(&self, tasks: &[ResolveContradictionTask]) -> Vec<Result<ResolutionResult>> {
+        if tasks.is_empty() {
+            return Vec::new();
+        }
+        if tasks.len() == 1 {
+            return vec![self.resolve_contradiction(&tasks[0])];
+        }
+
+        const SYSTEM: &str = "You are Debura's ResolveContradiction step, batched: you are \
+            given several independent CONTESTED hypotheses in one request, each with its own \
+            supporting and contradicting evidence. Judge each one entirely on its own terms -- \
+            reasoning about one hypothesis's evidence must never be reused or referenced when \
+            judging another; treat each as if it were the only one in the request. For each, \
+            weigh its supporting evidence against its contradicting evidence and decide whether \
+            the contradiction actually holds up, or can be explained away. Return exactly one \
+            result per hypothesis listed below, each carrying that hypothesis's own id back so \
+            results can be matched up -- order doesn't matter, the hypothesis field is \
+            authoritative.";
+
+        let user = render_resolve_batch(tasks);
+        let value = match self.complete(
+            SYSTEM,
+            &user,
+            "resolution_batch_result",
+            resolution_batch_schema(),
+        ) {
+            Ok(value) => value,
+            Err(error) => {
+                let message = format!("{error:#}");
+                return tasks.iter().map(|_| Err(anyhow::anyhow!(message.clone()))).collect();
+            }
         };
 
-        Ok(ResolutionResult {
-            resolution,
-            reasoning: raw.reasoning,
-        })
+        let parsed: ResolutionBatchResponse = match serde_json::from_value(value) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                let message = format!("mapping OpenAI output to a batch of ResolutionResult: {error:#}");
+                return tasks.iter().map(|_| Err(anyhow::anyhow!(message.clone()))).collect();
+            }
+        };
+
+        let mut by_hypothesis: std::collections::HashMap<u64, RawResolution> = parsed
+            .results
+            .into_iter()
+            .map(|entry| (entry.hypothesis, entry.result))
+            .collect();
+
+        tasks
+            .iter()
+            .map(|task| {
+                let id = task.hypothesis.id.0;
+                let raw = by_hypothesis
+                    .remove(&id)
+                    .ok_or_else(|| anyhow::anyhow!("model omitted a result for hypothesis H{id}"))?;
+                parse_resolution(raw, task.hypothesis.confidence)
+            })
+            .collect()
     }
+}
+
+const CHALLENGE_SYSTEM: &str = "You are Debura's ChallengeHypothesis adversarial verification \
+    step. Your objective is NOT to find more evidence that the hypothesis is right -- it is to \
+    actively try to prove it wrong. Look for: contradicting evidence, a more general or more \
+    plausible alternative explanation, or reasons to doubt the current confidence. If a \
+    genuine, careful attempt finds nothing wrong, say so honestly rather than manufacturing a \
+    finding. If your alternative is itself a better name for the subject, its predicate must be \
+    the literal string \"semantic_role\" (matching the convention AnalyzeFunction uses) -- \
+    Debura's C++ recovery step only reads that exact predicate to name anything. If it's some \
+    other kind of claim, use whatever predicate best fits.";
+
+const RESOLVE_SYSTEM: &str = "You are Debura's ResolveContradiction step. A hypothesis has been \
+    marked CONTESTED because contradicting evidence was found. Weigh the supporting evidence \
+    against the contradicting evidence and decide whether the contradiction actually holds up, \
+    or can be explained away.";
+
+/// Shared by the single and batched ResolveContradiction paths: maps the
+/// wire-shape `RawResolution` onto the real `Resolution` enum (a payload
+/// on one variant doesn't map onto a clean JSON Schema the way a plain
+/// struct does, so this is asked for separately and converted here).
+fn parse_resolution(raw: RawResolution, fallback_confidence: f64) -> Result<ResolutionResult> {
+    let resolution = match raw.resolution.as_str() {
+        "survives" => Resolution::Survives {
+            confidence: raw.confidence.unwrap_or(fallback_confidence),
+        },
+        "rejected" => Resolution::Rejected,
+        other => bail!("unexpected resolution verdict from model: {other}"),
+    };
+
+    Ok(ResolutionResult {
+        resolution,
+        reasoning: raw.reasoning,
+    })
 }
 
 /// `Resolution` is a Rust enum with a payload on one variant, which doesn't
 /// map onto a clean JSON Schema the way a plain struct does -- this is the
 /// wire shape we actually ask the model for, mapped onto `Resolution`
 /// afterward.
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 struct RawResolution {
     resolution: String,
     confidence: Option<f64>,
@@ -328,6 +460,16 @@ fn render_analyze_function_task(task: &AnalyzeFunctionTask) -> String {
     out
 }
 
+fn render_challenge_batch(tasks: &[ChallengeHypothesisTask]) -> String {
+    let mut out = format!("{} hypotheses follow, each independent:\n\n", tasks.len());
+    for task in tasks {
+        out.push_str("=====\n");
+        out.push_str(&render_challenge_task(task));
+        out.push('\n');
+    }
+    out
+}
+
 fn render_challenge_task(task: &ChallengeHypothesisTask) -> String {
     let h = &task.hypothesis;
     let mut out = format!(
@@ -349,6 +491,16 @@ fn render_challenge_task(task: &ChallengeHypothesisTask) -> String {
         ));
     }
 
+    out
+}
+
+fn render_resolve_batch(tasks: &[ResolveContradictionTask]) -> String {
+    let mut out = format!("{} contested hypotheses follow, each independent:\n\n", tasks.len());
+    for task in tasks {
+        out.push_str("=====\n");
+        out.push_str(&render_resolve_task(task));
+        out.push('\n');
+    }
     out
 }
 
@@ -505,6 +657,42 @@ fn challenge_result_schema() -> Value {
     })
 }
 
+/// One `{results: [...]}` entry as OpenAI returns it, paired with the
+/// hypothesis id it belongs to so the flat response can be matched back
+/// up to whichever `ChallengeHypothesisTask` asked for it.
+#[derive(Debug, Deserialize)]
+struct ChallengeBatchEntry {
+    hypothesis: u64,
+    #[serde(flatten)]
+    result: ChallengeResult,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChallengeBatchResponse {
+    results: Vec<ChallengeBatchEntry>,
+}
+
+fn challenge_batch_schema() -> Value {
+    let mut entry_schema = challenge_result_schema();
+    entry_schema["properties"]["hypothesis"] = json!({"type": "integer"});
+    entry_schema["required"]
+        .as_array_mut()
+        .expect("challenge_result_schema always has a required array")
+        .push(json!("hypothesis"));
+
+    json!({
+        "type": "object",
+        "properties": {
+            "results": {
+                "type": "array",
+                "items": entry_schema
+            }
+        },
+        "required": ["results"],
+        "additionalProperties": false
+    })
+}
+
 fn resolution_result_schema() -> Value {
     json!({
         "type": "object",
@@ -514,6 +702,42 @@ fn resolution_result_schema() -> Value {
             "reasoning": {"type": "string"}
         },
         "required": ["resolution", "confidence", "reasoning"],
+        "additionalProperties": false
+    })
+}
+
+/// One `{results: [...]}` entry as OpenAI returns it, paired with the
+/// hypothesis id it belongs to so the flat response can be matched back
+/// up to whichever `ResolveContradictionTask` asked for it.
+#[derive(Debug, Deserialize)]
+struct ResolutionBatchEntry {
+    hypothesis: u64,
+    #[serde(flatten)]
+    result: RawResolution,
+}
+
+#[derive(Debug, Deserialize)]
+struct ResolutionBatchResponse {
+    results: Vec<ResolutionBatchEntry>,
+}
+
+fn resolution_batch_schema() -> Value {
+    let mut entry_schema = resolution_result_schema();
+    entry_schema["properties"]["hypothesis"] = json!({"type": "integer"});
+    entry_schema["required"]
+        .as_array_mut()
+        .expect("resolution_result_schema always has a required array")
+        .push(json!("hypothesis"));
+
+    json!({
+        "type": "object",
+        "properties": {
+            "results": {
+                "type": "array",
+                "items": entry_schema
+            }
+        },
+        "required": ["results"],
         "additionalProperties": false
     })
 }

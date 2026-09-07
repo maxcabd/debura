@@ -351,31 +351,93 @@ fn resolve_analyze_cluster(
         .collect()
 }
 
-fn resolve_one(
+/// The parallel-safe half of a cluster of ChallengeHypothesis tasks:
+/// builds each hypothesis's context, then makes one `challenge_batch`
+/// call covering all of them. A hypothesis whose task fails to build
+/// (already gone, say) reports that failure on its own without losing
+/// the rest of the cluster.
+fn resolve_challenge_cluster(
     graph: &KnowledgeGraph,
     provider: &(dyn AgentProvider + Sync),
-    task: &Task,
-) -> PendingOutcome {
-    match task {
-        Task::AnalyzeFunction { subject } => {
-            let (built, result) = debura_agent::investigate(graph, provider, subject);
-            PendingOutcome::AnalyzeFunction {
-                subject: subject.clone(),
-                outcome: result.map(|r| (built, r)),
-            }
+    hypotheses: &[HypothesisId],
+) -> Vec<(Task, PendingOutcome)> {
+    let mut built = Vec::new();
+    let mut build_failures = Vec::new();
+    for &hypothesis in hypotheses {
+        match debura_verifier::build_challenge_task(graph, hypothesis) {
+            Ok(task) => built.push(task),
+            Err(error) => build_failures.push((hypothesis, error)),
         }
-        Task::ChallengeHypothesis { hypothesis } => PendingOutcome::ChallengeHypothesis {
-            hypothesis: *hypothesis,
-            outcome: debura_verifier::challenge(graph, provider, *hypothesis),
-        },
-        Task::ResolveContradiction { hypothesis } => PendingOutcome::ResolveContradiction {
-            hypothesis: *hypothesis,
-            outcome: debura_verifier::resolve(graph, provider, *hypothesis),
-        },
     }
+
+    let results = provider.challenge_batch(&built);
+
+    let mut outcomes: Vec<(Task, PendingOutcome)> = built
+        .into_iter()
+        .zip(results)
+        .map(|(task, outcome)| {
+            let hypothesis = task.hypothesis.id;
+            (
+                Task::ChallengeHypothesis { hypothesis },
+                PendingOutcome::ChallengeHypothesis {
+                    hypothesis,
+                    outcome: outcome.map(|r| (task, r)),
+                },
+            )
+        })
+        .collect();
+
+    for (hypothesis, error) in build_failures {
+        outcomes.push((
+            Task::ChallengeHypothesis { hypothesis },
+            PendingOutcome::ChallengeHypothesis { hypothesis, outcome: Err(error) },
+        ));
+    }
+    outcomes
 }
 
-/// The mutating half: commits whatever `resolve_one` produced. Always
+/// Same shape as `resolve_challenge_cluster`, for ResolveContradiction.
+fn resolve_resolution_cluster(
+    graph: &KnowledgeGraph,
+    provider: &(dyn AgentProvider + Sync),
+    hypotheses: &[HypothesisId],
+) -> Vec<(Task, PendingOutcome)> {
+    let mut built = Vec::new();
+    let mut build_failures = Vec::new();
+    for &hypothesis in hypotheses {
+        match debura_verifier::build_resolve_task(graph, hypothesis) {
+            Ok(task) => built.push(task),
+            Err(error) => build_failures.push((hypothesis, error)),
+        }
+    }
+
+    let results = provider.resolve_batch(&built);
+
+    let mut outcomes: Vec<(Task, PendingOutcome)> = built
+        .into_iter()
+        .zip(results)
+        .map(|(task, outcome)| {
+            let hypothesis = task.hypothesis.id;
+            (
+                Task::ResolveContradiction { hypothesis },
+                PendingOutcome::ResolveContradiction {
+                    hypothesis,
+                    outcome: outcome.map(|r| (task, r)),
+                },
+            )
+        })
+        .collect();
+
+    for (hypothesis, error) in build_failures {
+        outcomes.push((
+            Task::ResolveContradiction { hypothesis },
+            PendingOutcome::ResolveContradiction { hypothesis, outcome: Err(error) },
+        ));
+    }
+    outcomes
+}
+
+/// The mutating half: commits whatever a cluster resolver produced. Always
 /// called on the main thread, one outcome at a time -- this is the only
 /// part of a wave that touches `&mut KnowledgeGraph`.
 fn commit_one(graph: &mut KnowledgeGraph, policy: &VerificationPolicy, outcome: PendingOutcome) -> Vec<Task> {
@@ -522,44 +584,67 @@ pub fn run_with_concurrency(
             break StopReason::QueueEmpty;
         }
 
-        // AnalyzeFunction tasks in this wave are clustered into groups of
-        // up to MAX_CLUSTER_SIZE and sent through investigate_batch, one
-        // model call per group instead of one per subject; everything
-        // else still resolves individually. Both run in parallel with
-        // each other via the same thread pool.
+        // Every task type in this wave is clustered into groups of up to
+        // MAX_CLUSTER_SIZE and sent through its provider's batch method,
+        // one model call per group instead of one per subject/hypothesis
+        // -- a real run showed why this matters for all three, not just
+        // AnalyzeFunction: ChallengeHypothesis and ResolveContradiction
+        // together made up 72% of that run's request volume, each paying
+        // a full system-prompt-and-schema request on its own. The three
+        // groups run in parallel with each other via the same thread pool.
         let mut analyze_subjects = Vec::new();
-        let mut other_tasks = Vec::new();
+        let mut challenge_hypotheses = Vec::new();
+        let mut resolve_hypotheses = Vec::new();
         for task in batch {
             match task {
                 Task::AnalyzeFunction { subject } => analyze_subjects.push(subject),
-                other => other_tasks.push(other),
+                Task::ChallengeHypothesis { hypothesis } => challenge_hypotheses.push(hypothesis),
+                Task::ResolveContradiction { hypothesis } => resolve_hypotheses.push(hypothesis),
             }
         }
         let analyze_chunks: Vec<&[String]> = analyze_subjects.chunks(MAX_CLUSTER_SIZE).collect();
+        let challenge_chunks: Vec<&[HypothesisId]> =
+            challenge_hypotheses.chunks(MAX_CLUSTER_SIZE).collect();
+        let resolve_chunks: Vec<&[HypothesisId]> =
+            resolve_hypotheses.chunks(MAX_CLUSTER_SIZE).collect();
 
         let graph_ref: &KnowledgeGraph = graph;
-        let (analyze_outcomes, other_outcomes): (Vec<Vec<(Task, PendingOutcome)>>, Vec<(Task, PendingOutcome)>) =
-            pool.install(|| {
-                rayon::join(
-                    || {
-                        analyze_chunks
-                            .into_par_iter()
-                            .map(|chunk| resolve_analyze_cluster(graph_ref, provider, chunk))
-                            .collect()
-                    },
-                    || {
-                        other_tasks
-                            .into_par_iter()
-                            .map(|task| {
-                                let outcome = resolve_one(graph_ref, provider, &task);
-                                (task, outcome)
-                            })
-                            .collect()
-                    },
-                )
-            });
+        let (analyze_outcomes, (challenge_outcomes, resolve_outcomes)): (
+            Vec<Vec<(Task, PendingOutcome)>>,
+            (Vec<Vec<(Task, PendingOutcome)>>, Vec<Vec<(Task, PendingOutcome)>>),
+        ) = pool.install(|| {
+            rayon::join(
+                || {
+                    analyze_chunks
+                        .into_par_iter()
+                        .map(|chunk| resolve_analyze_cluster(graph_ref, provider, chunk))
+                        .collect()
+                },
+                || {
+                    rayon::join(
+                        || {
+                            challenge_chunks
+                                .into_par_iter()
+                                .map(|chunk| resolve_challenge_cluster(graph_ref, provider, chunk))
+                                .collect()
+                        },
+                        || {
+                            resolve_chunks
+                                .into_par_iter()
+                                .map(|chunk| resolve_resolution_cluster(graph_ref, provider, chunk))
+                                .collect()
+                        },
+                    )
+                },
+            )
+        });
 
-        for (task, outcome) in analyze_outcomes.into_iter().flatten().chain(other_outcomes) {
+        let all_outcomes = analyze_outcomes
+            .into_iter()
+            .flatten()
+            .chain(challenge_outcomes.into_iter().flatten())
+            .chain(resolve_outcomes.into_iter().flatten());
+        for (task, outcome) in all_outcomes {
             for followup in commit_one(graph, policy, outcome) {
                 scheduler.enqueue(graph, followup);
             }

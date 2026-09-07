@@ -21,14 +21,24 @@ pub fn challenge(
     provider: &dyn AgentProvider,
     hypothesis: HypothesisId,
 ) -> Result<(ChallengeHypothesisTask, ChallengeResult)> {
+    let task = build_challenge_task(graph, hypothesis)?;
+    let result = provider.challenge(&task)?;
+    Ok((task, result))
+}
+
+/// The task-building half of `challenge`, split out so a caller that wants
+/// to batch several hypotheses into one `challenge_batch` call (PROJECT.md
+/// M10) can build each task without calling the provider yet -- mirroring
+/// how `AnalyzeFunctionTask::build` is used directly for the same purpose.
+pub fn build_challenge_task(
+    graph: &KnowledgeGraph,
+    hypothesis: HypothesisId,
+) -> Result<ChallengeHypothesisTask> {
     let target = graph
         .hypothesis(hypothesis)
         .with_context(|| format!("unknown hypothesis: {hypothesis}"))?
         .clone();
-
-    let task = ChallengeHypothesisTask::build(graph, &target);
-    let result = provider.challenge(&task)?;
-    Ok((task, result))
+    Ok(ChallengeHypothesisTask::build(graph, &target))
 }
 
 /// The mutating half of `challenge_hypothesis` -- call with exclusive
@@ -122,6 +132,18 @@ pub fn resolve(
     provider: &dyn AgentProvider,
     hypothesis: HypothesisId,
 ) -> Result<(ResolveContradictionTask, ResolutionResult)> {
+    let task = build_resolve_task(graph, hypothesis)?;
+    let result = provider.resolve_contradiction(&task)?;
+    Ok((task, result))
+}
+
+/// The task-building half of `resolve`, split out so a caller that wants
+/// to batch several CONTESTED hypotheses into one `resolve_batch` call
+/// (PROJECT.md M10) can build each task without calling the provider yet.
+pub fn build_resolve_task(
+    graph: &KnowledgeGraph,
+    hypothesis: HypothesisId,
+) -> Result<ResolveContradictionTask> {
     let target = graph
         .hypothesis(hypothesis)
         .with_context(|| format!("unknown hypothesis: {hypothesis}"))?
@@ -134,9 +156,7 @@ pub fn resolve(
         );
     }
 
-    let task = ResolveContradictionTask::build(graph, &target);
-    let result = provider.resolve_contradiction(&task)?;
-    Ok((task, result))
+    Ok(ResolveContradictionTask::build(graph, &target))
 }
 
 /// The mutating half of `resolve_contradiction` -- call with exclusive

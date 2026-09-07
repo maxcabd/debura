@@ -424,16 +424,22 @@ fn parallel_run_respects_max_iterations() {
     assert_eq!(summary.iterations, 3);
 }
 
-/// A provider that records how many subjects it was asked to investigate
-/// in each `investigate_batch` call, so a test can prove clustering
-/// actually happened rather than the default one-at-a-time fallback.
+/// A provider that records how many subjects/hypotheses it was asked to
+/// handle in each batch call, so a test can prove clustering actually
+/// happened rather than the default one-at-a-time fallback.
 struct RecordingBatchProvider {
     batch_sizes: std::sync::Mutex<Vec<usize>>,
+    challenge_batch_sizes: std::sync::Mutex<Vec<usize>>,
+    resolve_batch_sizes: std::sync::Mutex<Vec<usize>>,
 }
 
 impl RecordingBatchProvider {
     fn new() -> Self {
-        Self { batch_sizes: std::sync::Mutex::new(Vec::new()) }
+        Self {
+            batch_sizes: std::sync::Mutex::new(Vec::new()),
+            challenge_batch_sizes: std::sync::Mutex::new(Vec::new()),
+            resolve_batch_sizes: std::sync::Mutex::new(Vec::new()),
+        }
     }
 }
 
@@ -442,8 +448,17 @@ impl AgentProvider for RecordingBatchProvider {
         EchoProvider.investigate(task)
     }
 
-    fn challenge(&self, task: &ChallengeHypothesisTask) -> anyhow::Result<ChallengeResult> {
-        EchoProvider.challenge(task)
+    // Unlike EchoProvider, always reports a contradiction -- so a test
+    // built on this provider can also exercise ResolveContradiction
+    // clustering, which only ever gets queued as a real follow-up of a
+    // challenge that actually found something (PROJECT.md: seed_initial_tasks
+    // never seeds ResolveContradiction for a pre-existing CONTESTED
+    // hypothesis on its own).
+    fn challenge(&self, _task: &ChallengeHypothesisTask) -> anyhow::Result<ChallengeResult> {
+        Ok(ChallengeResult {
+            contradiction: Some("RecordingBatchProvider always contradicts, for testing".to_string()),
+            ..Default::default()
+        })
     }
 
     fn resolve_contradiction(&self, task: &ResolveContradictionTask) -> anyhow::Result<ResolutionResult> {
@@ -453,6 +468,16 @@ impl AgentProvider for RecordingBatchProvider {
     fn investigate_batch(&self, tasks: &[AnalyzeFunctionTask]) -> Vec<anyhow::Result<InvestigationResult>> {
         self.batch_sizes.lock().unwrap().push(tasks.len());
         tasks.iter().map(|t| self.investigate(t)).collect()
+    }
+
+    fn challenge_batch(&self, tasks: &[ChallengeHypothesisTask]) -> Vec<anyhow::Result<ChallengeResult>> {
+        self.challenge_batch_sizes.lock().unwrap().push(tasks.len());
+        tasks.iter().map(|t| self.challenge(t)).collect()
+    }
+
+    fn resolve_batch(&self, tasks: &[ResolveContradictionTask]) -> Vec<anyhow::Result<ResolutionResult>> {
+        self.resolve_batch_sizes.lock().unwrap().push(tasks.len());
+        tasks.iter().map(|t| self.resolve_contradiction(t)).collect()
     }
 }
 
@@ -495,5 +520,63 @@ fn parallel_run_clusters_analyze_function_into_batches() {
         batch_sizes.iter().sum::<usize>(),
         6,
         "every seeded subject must still be covered exactly once across all batches"
+    );
+}
+
+/// PROJECT.md M10: a real run showed ChallengeHypothesis and
+/// ResolveContradiction together made up 72% of that run's request
+/// volume, each going through the provider one hypothesis at a time --
+/// the same clustering AnalyzeFunction already gets must apply to both.
+/// This drives one seeded graph all the way through AnalyzeFunction (6
+/// hypotheses proposed) -> ChallengeHypothesis (RecordingBatchProvider
+/// always contradicts, so all 6 become CONTESTED) -> ResolveContradiction,
+/// checking both stages actually clustered rather than falling back to
+/// one call per hypothesis.
+#[test]
+fn parallel_run_clusters_challenge_and_resolve_into_batches() {
+    let mut graph = KnowledgeGraph::new();
+    for i in 1..=6 {
+        graph.add_observation(
+            format!("0x{i}"),
+            "has_name",
+            format!("fn{i}"),
+            0.95,
+            "ghidra:function",
+            None,
+        );
+    }
+    let provider = RecordingBatchProvider::new();
+
+    let summary = run_with_concurrency(
+        &mut graph,
+        &provider,
+        &VerificationPolicy::default(),
+        &RunBudget::default(),
+        8, // >= 6, so each stage's 6 tasks land in one wave together
+        |_, _, _| {},
+    );
+
+    assert_eq!(summary.stopped_because, StopReason::QueueEmpty);
+
+    let challenge_sizes = provider.challenge_batch_sizes.into_inner().unwrap();
+    assert!(
+        challenge_sizes.iter().any(|&size| size > 1),
+        "expected at least one clustered challenge call, got sizes {challenge_sizes:?}"
+    );
+    assert_eq!(
+        challenge_sizes.iter().sum::<usize>(),
+        6,
+        "every hypothesis must still be challenged exactly once across all batches"
+    );
+
+    let resolve_sizes = provider.resolve_batch_sizes.into_inner().unwrap();
+    assert!(
+        resolve_sizes.iter().any(|&size| size > 1),
+        "expected at least one clustered resolve call, got sizes {resolve_sizes:?}"
+    );
+    assert_eq!(
+        resolve_sizes.iter().sum::<usize>(),
+        6,
+        "every contested hypothesis must still be resolved exactly once across all batches"
     );
 }

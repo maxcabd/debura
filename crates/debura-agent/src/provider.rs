@@ -19,15 +19,19 @@ pub trait AgentProvider {
     fn challenge(&self, task: &ChallengeHypothesisTask) -> Result<ChallengeResult>;
     fn resolve_contradiction(&self, task: &ResolveContradictionTask) -> Result<ResolutionResult>;
 
-    /// PROJECT.md M10: AnalyzeFunction is the one task type whose context
-    /// is genuinely independent per-subject *and* small enough that
-    /// several fit in one model call -- unlike ChallengeHypothesis/
-    /// ResolveContradiction, which reason adversarially about one
-    /// hypothesis at a time and risk conflating unrelated reasoning if
-    /// batched. Returns one `Result` per entry of `tasks`, same order,
-    /// same length -- a real provider that sends one network request for
-    /// the whole batch can still fail individual subjects independently
-    /// (the model omitted one, say) without losing the rest.
+    /// PROJECT.md M10: every task type here reasons about strictly
+    /// per-subject/per-hypothesis context (S23) and so is safe to batch
+    /// in principle -- the real risk with ChallengeHypothesis/
+    /// ResolveContradiction specifically is adversarial reasoning about
+    /// one hypothesis bleeding into another's (a contradiction found for
+    /// hypothesis A getting inappropriately reused against B). A real
+    /// provider's batched prompt must say so explicitly, the same way
+    /// `investigate_batch`'s already does for AnalyzeFunction, rather
+    /// than assuming the model infers it. Returns one `Result` per entry
+    /// of `tasks`, same order, same length -- a real provider that sends
+    /// one network request for the whole batch can still fail individual
+    /// subjects independently (the model omitted one, say) without
+    /// losing the rest.
     ///
     /// Default implementation calls `investigate` once per task, so
     /// every existing provider (including test doubles) keeps working
@@ -36,5 +40,23 @@ pub trait AgentProvider {
     /// this.
     fn investigate_batch(&self, tasks: &[AnalyzeFunctionTask]) -> Vec<Result<InvestigationResult>> {
         tasks.iter().map(|task| self.investigate(task)).collect()
+    }
+
+    /// See `investigate_batch`'s doc comment -- same batching rationale
+    /// and the same per-hypothesis isolation requirement, applied to
+    /// ChallengeHypothesis. A real run showed why this matters even
+    /// though AnalyzeFunction was clustered first: ChallengeHypothesis
+    /// and ResolveContradiction together made up 72% of that run's
+    /// request volume (1296 of 1794 iterations), each paying a full
+    /// system-prompt-and-schema request on its own -- the single
+    /// largest source of avoidable per-request overhead in the whole
+    /// loop.
+    fn challenge_batch(&self, tasks: &[ChallengeHypothesisTask]) -> Vec<Result<ChallengeResult>> {
+        tasks.iter().map(|task| self.challenge(task)).collect()
+    }
+
+    /// See `challenge_batch`'s doc comment; applied to ResolveContradiction.
+    fn resolve_batch(&self, tasks: &[ResolveContradictionTask]) -> Vec<Result<ResolutionResult>> {
+        tasks.iter().map(|task| self.resolve_contradiction(task)).collect()
     }
 }

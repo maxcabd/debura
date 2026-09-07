@@ -14,6 +14,6 @@ mod verify;
 pub use policy::VerificationPolicy;
 pub use reevaluate::reevaluate_hypothesis;
 pub use verify::{
-    challenge, challenge_hypothesis, commit_challenge, commit_resolution, resolve,
-    resolve_contradiction,
+    build_challenge_task, build_resolve_task, challenge, challenge_hypothesis, commit_challenge,
+    commit_resolution, resolve, resolve_contradiction,
 };
