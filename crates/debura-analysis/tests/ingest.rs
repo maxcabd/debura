@@ -218,6 +218,45 @@ fn structural_vtable_install_produces_a_pattern_observation_not_ctor_dtor() {
         .all(|o| o.predicate != "is_constructor_of" && o.predicate != "is_destructor_of"));
 }
 
+/// A real run showed `callers` was already extracted from Ghidra but
+/// never turned into an observation -- so AnalyzeFunctionTask's
+/// per-subject context (every observation for that subject) could see
+/// what a function calls but never who calls it, even though the raw
+/// data was sitting right there in `FunctionFact`.
+#[test]
+fn callers_become_called_by_observations() {
+    let mut analysis = empty_result();
+    analysis.functions.push(FunctionFact {
+        address: "0x2".to_string(),
+        name: "die".to_string(),
+        size: 10,
+        signature: "void die(Snake *this)".to_string(),
+        calling_convention: "__thiscall".to_string(),
+        callers: vec!["0x1".to_string()],
+        callees: vec!["0x3".to_string()],
+        decompilation: String::new(),
+        owner_class: Some("Snake".to_string()),
+        is_constructor: false,
+        is_destructor: false,
+        installs_vtable_of: None,
+    });
+
+    let mut graph = KnowledgeGraph::new();
+    ingest(&mut graph, &analysis, "artifacts/analysis.json");
+
+    let called_by = graph
+        .observations()
+        .find(|o| o.subject == "0x2" && o.predicate == "called_by")
+        .expect("called_by observation");
+    assert_eq!(called_by.value, "0x1");
+
+    let calls = graph
+        .observations()
+        .find(|o| o.subject == "0x2" && o.predicate == "calls")
+        .expect("calls observation");
+    assert_eq!(calls.value, "0x3");
+}
+
 /// A non-method function (no `this`) should produce none of the M7 facts.
 #[test]
 fn free_functions_produce_no_class_facts() {

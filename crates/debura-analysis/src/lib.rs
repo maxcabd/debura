@@ -143,6 +143,30 @@ pub fn ingest(graph: &mut KnowledgeGraph, analysis: &AnalysisResult, artifact_pa
             );
         }
 
+        // `f.callers` was already extracted (Ghidra gives it for free
+        // alongside `f.callees`) but never turned into an observation --
+        // meaning AnalyzeFunctionTask's per-subject context (which pulls
+        // every observation for the subject) had no way to tell the model
+        // who calls a function, only what it calls. A real run showed why
+        // that matters: a function's role in the program is often visible
+        // only from its call site (e.g. something called right after a
+        // collision check, or only from the render loop), not from its
+        // own body -- without `called_by`, that evidence structurally
+        // couldn't reach the model at all, no matter how the prompt asked
+        // for it.
+        for caller in &f.callers {
+            add_once(
+                graph,
+                &mut seen,
+                &f.address,
+                "called_by",
+                caller,
+                HEURISTIC_CONFIDENCE,
+                "ghidra:call_graph",
+                None,
+            );
+        }
+
         if let Some(owner) = &f.owner_class {
             add_once(
                 graph,
