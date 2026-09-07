@@ -149,6 +149,46 @@ fn multiple_destructor_variants_collapse_to_one_declaration() {
     assert_eq!(entity.methods[0].address, "0x10", "lowest address chosen deterministically");
 }
 
+/// A real run had a model propose a `semantic_role` for a constructor's
+/// own address (nothing stops it from doing so) that didn't match the
+/// class name -- rendering that value as the constructor's name produced
+/// a declaration C++ doesn't recognize as a constructor at all (GCC
+/// parses `initializeFood();` inside `class Food` as an ordinary method
+/// with an implicit `int` return type, not `Food::Food()`). A
+/// constructor's name is fixed by the language; renames must not apply.
+#[test]
+fn a_renamed_constructor_still_renders_with_the_class_name() {
+    let mut graph = KnowledgeGraph::new();
+    graph.add_observation("Food", "has_vtable_at", "0x9c0", 1.0, "ghidra:vtable", None);
+
+    graph.add_observation("0x1", "has_name", "Food", 0.95, "ghidra:function", None);
+    graph.add_observation("0x1", "has_signature", "void Food(Food * this)", 0.95, "ghidra:function", None);
+    graph.add_observation(
+        "0x1",
+        "decompiles_to",
+        "void __thiscall Food::Food(Food *this)\n\n{\n  return;\n}",
+        0.95,
+        "ghidra:decompiler",
+        None,
+    );
+    graph.add_observation("0x1", "is_constructor_of", "Food", 0.95, "ghidra:function", None);
+
+    let h = graph.propose_hypothesis("0x1", "semantic_role", "initializeFood", 0.9, None);
+    graph.mark_verified(h, Utc::now()).unwrap();
+    graph.set_status(h, HypothesisStatus::Accepted).unwrap();
+
+    let program = extract(&graph);
+    let food = program.classes.iter().find(|c| c.name == "Food").unwrap();
+
+    let header = render_header(food);
+    let source = render_source(food);
+
+    assert!(header.contains("Food(void);") || header.contains("Food();"), "header:\n{header}");
+    assert!(!header.contains("initializeFood"), "header:\n{header}");
+    assert!(source.contains("Food::Food("), "source:\n{source}");
+    assert!(!source.contains("initializeFood"), "source:\n{source}");
+}
+
 #[test]
 fn functions_without_an_accepted_hypothesis_are_not_recovered() {
     let mut graph = KnowledgeGraph::new();
