@@ -26,6 +26,15 @@
 //! read, and recovering the same facts would need structural heuristics
 //! (vtable-shaped pointer arrays, RTTI-shaped data) instead of label
 //! lookups -- a materially harder, unimplemented problem.
+//!
+//! `ingest` is idempotent per (subject, predicate, value): calling it
+//! again with facts the graph already has adds nothing. This matters now
+//! that `debura analyze` loads and merges into an existing graph instead
+//! of replacing it (a genuinely changed fact, e.g. a name after an M8
+//! rename, still lands as a new observation -- only exact repeats are
+//! skipped).
+
+use std::collections::HashSet;
 
 use debura_ghidra::AnalysisResult;
 use debura_knowledge::KnowledgeGraph;
@@ -38,20 +47,42 @@ const HEADER_CONFIDENCE: f64 = 1.0;
 /// offset can disagree on type (signedness, in particular).
 const FIELD_CANDIDATE_CONFIDENCE: f64 = 0.85;
 
-/// Adds one Observation per deterministic fact in `analysis` to `graph`.
-/// `artifact_path` is recorded alongside decompilation observations so the
-/// full source (with surrounding context) can still be found later.
+type SeenKey = (String, String, String);
+
+fn add_once(
+    graph: &mut KnowledgeGraph,
+    seen: &mut HashSet<SeenKey>,
+    subject: impl Into<String>,
+    predicate: impl Into<String>,
+    value: impl Into<String>,
+    confidence: f64,
+    source: &str,
+    artifact: Option<String>,
+) {
+    let subject = subject.into();
+    let predicate = predicate.into();
+    let value = value.into();
+
+    if seen.insert((subject.clone(), predicate.clone(), value.clone())) {
+        graph.add_observation(subject, predicate, value, confidence, source, artifact);
+    }
+}
+
+/// Adds one Observation per deterministic fact in `analysis` to `graph`
+/// that it doesn't already have. `artifact_path` is recorded alongside
+/// decompilation observations so the full source (with surrounding
+/// context) can still be found later.
 pub fn ingest(graph: &mut KnowledgeGraph, analysis: &AnalysisResult, artifact_path: &str) {
+    let mut seen: HashSet<SeenKey> = graph
+        .observations()
+        .map(|o| (o.subject.clone(), o.predicate.clone(), o.value.clone()))
+        .collect();
+
     for f in &analysis.functions {
-        graph.add_observation(
-            &f.address,
-            "has_name",
-            &f.name,
-            HEURISTIC_CONFIDENCE,
-            "ghidra:function",
-            None,
-        );
-        graph.add_observation(
+        add_once(graph, &mut seen, &f.address, "has_name", &f.name, HEURISTIC_CONFIDENCE, "ghidra:function", None);
+        add_once(
+            graph,
+            &mut seen,
             &f.address,
             "has_signature",
             &f.signature,
@@ -59,7 +90,9 @@ pub fn ingest(graph: &mut KnowledgeGraph, analysis: &AnalysisResult, artifact_pa
             "ghidra:function",
             None,
         );
-        graph.add_observation(
+        add_once(
+            graph,
+            &mut seen,
             &f.address,
             "calling_convention",
             &f.calling_convention,
@@ -67,7 +100,9 @@ pub fn ingest(graph: &mut KnowledgeGraph, analysis: &AnalysisResult, artifact_pa
             "ghidra:function",
             None,
         );
-        graph.add_observation(
+        add_once(
+            graph,
+            &mut seen,
             &f.address,
             "size_bytes",
             f.size.to_string(),
@@ -77,7 +112,9 @@ pub fn ingest(graph: &mut KnowledgeGraph, analysis: &AnalysisResult, artifact_pa
         );
 
         if !f.decompilation.is_empty() {
-            graph.add_observation(
+            add_once(
+                graph,
+                &mut seen,
                 &f.address,
                 "decompiles_to",
                 &f.decompilation,
@@ -88,7 +125,9 @@ pub fn ingest(graph: &mut KnowledgeGraph, analysis: &AnalysisResult, artifact_pa
         }
 
         for callee in &f.callees {
-            graph.add_observation(
+            add_once(
+                graph,
+                &mut seen,
                 &f.address,
                 "calls",
                 callee,
@@ -99,8 +138,20 @@ pub fn ingest(graph: &mut KnowledgeGraph, analysis: &AnalysisResult, artifact_pa
         }
 
         if let Some(owner) = &f.owner_class {
+            add_once(
+                graph,
+                &mut seen,
+                &f.address,
+                "is_method_of",
+                owner,
+                HEURISTIC_CONFIDENCE,
+                "ghidra:function",
+                None,
+            );
             if f.is_constructor {
-                graph.add_observation(
+                add_once(
+                    graph,
+                    &mut seen,
                     &f.address,
                     "is_constructor_of",
                     owner,
@@ -110,7 +161,9 @@ pub fn ingest(graph: &mut KnowledgeGraph, analysis: &AnalysisResult, artifact_pa
                 );
             }
             if f.is_destructor {
-                graph.add_observation(
+                add_once(
+                    graph,
+                    &mut seen,
                     &f.address,
                     "is_destructor_of",
                     owner,
@@ -123,7 +176,9 @@ pub fn ingest(graph: &mut KnowledgeGraph, analysis: &AnalysisResult, artifact_pa
     }
 
     for v in &analysis.vtables {
-        graph.add_observation(
+        add_once(
+            graph,
+            &mut seen,
             &v.class_name,
             "has_vtable_at",
             &v.address,
@@ -134,7 +189,9 @@ pub fn ingest(graph: &mut KnowledgeGraph, analysis: &AnalysisResult, artifact_pa
     }
 
     for m in &analysis.virtual_methods {
-        graph.add_observation(
+        add_once(
+            graph,
+            &mut seen,
             &m.class_name,
             "has_virtual_method",
             format!("slot {}: {}", m.slot, m.function_address),
@@ -145,7 +202,9 @@ pub fn ingest(graph: &mut KnowledgeGraph, analysis: &AnalysisResult, artifact_pa
     }
 
     for i in &analysis.inheritance {
-        graph.add_observation(
+        add_once(
+            graph,
+            &mut seen,
             &i.derived,
             "inherits_from",
             &i.base,
@@ -156,7 +215,9 @@ pub fn ingest(graph: &mut KnowledgeGraph, analysis: &AnalysisResult, artifact_pa
     }
 
     for f in &analysis.fields {
-        graph.add_observation(
+        add_once(
+            graph,
+            &mut seen,
             &f.class_name,
             "has_field_candidate",
             format!("{}:{}", f.offset, f.field_type),
@@ -167,7 +228,9 @@ pub fn ingest(graph: &mut KnowledgeGraph, analysis: &AnalysisResult, artifact_pa
     }
 
     for s in &analysis.strings {
-        graph.add_observation(
+        add_once(
+            graph,
+            &mut seen,
             &s.address,
             "contains_string",
             &s.value,
@@ -178,7 +241,9 @@ pub fn ingest(graph: &mut KnowledgeGraph, analysis: &AnalysisResult, artifact_pa
     }
 
     for i in &analysis.imports {
-        graph.add_observation(
+        add_once(
+            graph,
+            &mut seen,
             &i.address,
             "imports",
             format!("{}!{}", i.namespace, i.name),
@@ -189,7 +254,9 @@ pub fn ingest(graph: &mut KnowledgeGraph, analysis: &AnalysisResult, artifact_pa
     }
 
     for e in &analysis.exports {
-        graph.add_observation(
+        add_once(
+            graph,
+            &mut seen,
             &e.address,
             "exports",
             &e.name,

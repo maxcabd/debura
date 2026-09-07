@@ -90,6 +90,88 @@ fn m7_facts_become_observations() {
     assert_eq!(virtual_method.value, "slot 0: 0x200");
 }
 
+/// PROJECT.md: re-running `debura analyze` now loads and merges into the
+/// existing graph rather than replacing it, so `ingest` must not
+/// re-duplicate facts it already recorded -- while still capturing a fact
+/// that genuinely changed (e.g. a name after an M8 rename).
+#[test]
+fn ingest_is_idempotent_but_still_captures_real_changes() {
+    let mut analysis = empty_result();
+    analysis.functions.push(FunctionFact {
+        address: "0x1".to_string(),
+        name: "takeDamage".to_string(),
+        size: 10,
+        signature: "void takeDamage(Player *this)".to_string(),
+        calling_convention: "__thiscall".to_string(),
+        callers: Vec::new(),
+        callees: Vec::new(),
+        decompilation: String::new(),
+        owner_class: None,
+        is_constructor: false,
+        is_destructor: false,
+    });
+
+    let mut graph = KnowledgeGraph::new();
+    ingest(&mut graph, &analysis, "artifacts/analysis.json");
+    let count_after_first = graph.observations().count();
+
+    ingest(&mut graph, &analysis, "artifacts/analysis.json");
+    assert_eq!(
+        graph.observations().count(),
+        count_after_first,
+        "re-ingesting identical facts must not duplicate them"
+    );
+
+    analysis.functions[0].name = "ApplyDamage".to_string();
+    ingest(&mut graph, &analysis, "artifacts/analysis.json");
+    assert_eq!(
+        graph.observations().count(),
+        count_after_first + 1,
+        "a genuinely changed fact must still be recorded"
+    );
+
+    let names: Vec<_> = graph
+        .observations()
+        .filter(|o| o.subject == "0x1" && o.predicate == "has_name")
+        .map(|o| o.value.as_str())
+        .collect();
+    assert!(names.contains(&"takeDamage"), "old name stays as history, S4");
+    assert!(names.contains(&"ApplyDamage"));
+}
+
+/// PROJECT.md M9 needs to know which class a plain (non-ctor/dtor) method
+/// belongs to in order to group it under that class's recovered header.
+#[test]
+fn plain_methods_get_is_method_of_without_ctor_dtor_tags() {
+    let mut analysis = empty_result();
+    analysis.functions.push(FunctionFact {
+        address: "0x1".to_string(),
+        name: "describe".to_string(),
+        size: 10,
+        signature: "void describe(Entity *this)".to_string(),
+        calling_convention: "__thiscall".to_string(),
+        callers: Vec::new(),
+        callees: Vec::new(),
+        decompilation: String::new(),
+        owner_class: Some("Entity".to_string()),
+        is_constructor: false,
+        is_destructor: false,
+    });
+
+    let mut graph = KnowledgeGraph::new();
+    ingest(&mut graph, &analysis, "artifacts/analysis.json");
+
+    let is_method_of = graph
+        .observations()
+        .find(|o| o.subject == "0x1" && o.predicate == "is_method_of")
+        .expect("is_method_of observation");
+    assert_eq!(is_method_of.value, "Entity");
+
+    assert!(graph
+        .observations()
+        .all(|o| o.predicate != "is_constructor_of" && o.predicate != "is_destructor_of"));
+}
+
 /// A non-method function (no `this`) should produce none of the M7 facts.
 #[test]
 fn free_functions_produce_no_class_facts() {
