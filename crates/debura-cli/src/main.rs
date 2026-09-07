@@ -42,6 +42,26 @@ enum Command {
         /// Subject address to investigate, e.g. 0x1400016e4
         subject: String,
     },
+    /// Adversarially challenge one hypothesis (always via the mock
+    /// provider for now)
+    Challenge {
+        /// Project id, as printed by `debura new`
+        project: String,
+        /// Hypothesis id, e.g. H1 (as printed by `debura investigate`)
+        hypothesis: String,
+    },
+    /// Resolve a CONTESTED hypothesis (always via the mock provider for now)
+    Resolve {
+        /// Project id, as printed by `debura new`
+        project: String,
+        /// Hypothesis id, e.g. H1
+        hypothesis: String,
+    },
+}
+
+fn parse_hypothesis_id(s: &str) -> anyhow::Result<debura_knowledge::HypothesisId> {
+    let digits = s.strip_prefix(['H', 'h']).unwrap_or(s);
+    Ok(debura_knowledge::HypothesisId(digits.parse()?))
 }
 
 fn main() -> Result<()> {
@@ -146,6 +166,52 @@ fn main() -> Result<()> {
             for task in &investigation.followup_tasks {
                 println!("\nFollow-up: {task}");
             }
+        }
+        Command::Challenge { project, hypothesis } => {
+            let root = debura_core::config::projects_dir().join(&project);
+            anyhow::ensure!(root.is_dir(), "no such project: {project}");
+            let id = parse_hypothesis_id(&hypothesis)?;
+
+            let conn = debura_storage::init_project_db(&root.join("project.sqlite"))?;
+            let mut graph = debura_storage::knowledge::load(&conn)?;
+
+            debura_verifier::challenge_hypothesis(
+                &mut graph,
+                &debura_agent::mock::EchoProvider,
+                id,
+                &debura_verifier::VerificationPolicy::default(),
+            )?;
+
+            debura_storage::knowledge::save(&conn, &graph)?;
+
+            let h = graph.hypothesis(id).context("hypothesis vanished during challenge")?;
+            println!(
+                "{id}: {} {} = {} (confidence {:.2}, {:?})",
+                h.subject, h.predicate, h.value, h.confidence, h.status
+            );
+        }
+        Command::Resolve { project, hypothesis } => {
+            let root = debura_core::config::projects_dir().join(&project);
+            anyhow::ensure!(root.is_dir(), "no such project: {project}");
+            let id = parse_hypothesis_id(&hypothesis)?;
+
+            let conn = debura_storage::init_project_db(&root.join("project.sqlite"))?;
+            let mut graph = debura_storage::knowledge::load(&conn)?;
+
+            debura_verifier::resolve_contradiction(
+                &mut graph,
+                &debura_agent::mock::EchoProvider,
+                id,
+                &debura_verifier::VerificationPolicy::default(),
+            )?;
+
+            debura_storage::knowledge::save(&conn, &graph)?;
+
+            let h = graph.hypothesis(id).context("hypothesis vanished during resolution")?;
+            println!(
+                "{id}: {} {} = {} (confidence {:.2}, {:?})",
+                h.subject, h.predicate, h.value, h.confidence, h.status
+            );
         }
     }
 

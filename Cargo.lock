@@ -219,6 +219,7 @@ dependencies = [
  "debura-ghidra",
  "debura-knowledge",
  "debura-storage",
+ "debura-verifier",
  "serde_json",
  "tracing",
  "tracing-subscriber",
@@ -287,6 +288,12 @@ version = "0.1.0"
 [[package]]
 name = "debura-verifier"
 version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "debura-agent",
+ "debura-knowledge",
+]
 
 [[package]]
 name = "dirs"
