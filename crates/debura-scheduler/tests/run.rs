@@ -250,6 +250,76 @@ fn parallel_run_still_bounds_retries_after_rejection() {
     }
 }
 
+/// A single AnalyzeFunction call that proposes several competing
+/// hypotheses on the same subject at once, all of which get contradicted
+/// and rejected together. Real run against the Snake fixture hit this:
+/// with multiple live hypotheses sharing a subject, several rejections
+/// can land in the same commit batch, each reading the same
+/// not-yet-incremented persisted attempt count and each deciding to
+/// retry -- one subject reached 10 AnalyzeFunction attempts against a
+/// cap of 3 before the scheduler deduplicated identical waiting tasks.
+struct NeverConvergesWithCompetingHypotheses;
+
+impl AgentProvider for NeverConvergesWithCompetingHypotheses {
+    fn investigate(&self, _task: &AnalyzeFunctionTask) -> anyhow::Result<InvestigationResult> {
+        Ok(InvestigationResult {
+            hypotheses: (0..3)
+                .map(|i| ProposedHypothesis {
+                    predicate: "is_a".to_string(),
+                    value: format!("GameEntity{i}"),
+                    confidence: 0.9,
+                    depends_on: Vec::new(),
+                })
+                .collect(),
+            ..Default::default()
+        })
+    }
+
+    fn challenge(&self, _task: &ChallengeHypothesisTask) -> anyhow::Result<ChallengeResult> {
+        Ok(ChallengeResult {
+            contradiction: Some("fabricated claim, no such evidence".to_string()),
+            reasoning: "test".to_string(),
+            ..Default::default()
+        })
+    }
+
+    fn resolve_contradiction(
+        &self,
+        _task: &ResolveContradictionTask,
+    ) -> anyhow::Result<ResolutionResult> {
+        Ok(ResolutionResult {
+            resolution: Resolution::Rejected,
+            reasoning: "test".to_string(),
+        })
+    }
+}
+
+#[test]
+fn parallel_run_bounds_retries_even_when_multiple_hypotheses_share_a_subject() {
+    let mut graph = KnowledgeGraph::new();
+    graph.add_observation("0x1", "has_name", "mystery", 0.95, "ghidra:function", None);
+
+    let summary = run_with_concurrency(
+        &mut graph,
+        &NeverConvergesWithCompetingHypotheses,
+        &VerificationPolicy::default(),
+        &RunBudget::default(),
+        4,
+        |_, _, _| {},
+    );
+
+    assert_eq!(summary.stopped_because, StopReason::QueueEmpty);
+
+    let attempts = graph
+        .investigations()
+        .filter(|i| i.task == "AnalyzeFunction" && i.target == "0x1")
+        .count();
+    assert_eq!(
+        attempts, 3,
+        "must stay bounded even when several hypotheses on the same subject are rejected together"
+    );
+}
+
 #[test]
 fn parallel_run_respects_max_iterations() {
     let mut graph = seeded_graph();

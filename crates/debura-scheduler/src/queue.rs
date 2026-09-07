@@ -1,5 +1,5 @@
 use std::cmp::Ordering;
-use std::collections::BinaryHeap;
+use std::collections::{BinaryHeap, HashSet};
 
 use debura_knowledge::KnowledgeGraph;
 
@@ -39,6 +39,15 @@ impl Ord for Scored {
 #[derive(Default)]
 pub struct Scheduler {
     queue: BinaryHeap<Scored>,
+    /// Tasks currently sitting in `queue`, so a second identical task
+    /// can't be queued alongside one that's already waiting. Without
+    /// this, retry-after-rejection could double up: two hypotheses on
+    /// the same subject rejected within the same commit batch both read
+    /// the same not-yet-incremented persisted attempt count and both
+    /// enqueue a retry, defeating the bounded-retry cap (PROJECT.md M10
+    /// -- observed compounding a subject past 3 AnalyzeFunction attempts
+    /// up to 10 in a real run before this was added).
+    queued: HashSet<Task>,
 }
 
 impl Scheduler {
@@ -47,12 +56,17 @@ impl Scheduler {
     }
 
     pub fn enqueue(&mut self, graph: &KnowledgeGraph, task: Task) {
+        if !self.queued.insert(task.clone()) {
+            return;
+        }
         let priority = priority(graph, &task);
         self.queue.push(Scored { priority, task });
     }
 
     pub fn pop(&mut self) -> Option<Task> {
-        self.queue.pop().map(|s| s.task)
+        let task = self.queue.pop().map(|s| s.task)?;
+        self.queued.remove(&task);
+        Some(task)
     }
 
     pub fn is_empty(&self) -> bool {
