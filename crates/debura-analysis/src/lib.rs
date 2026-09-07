@@ -18,14 +18,20 @@
 //! volume.
 //!
 //! M7 adds vtables, inheritance, constructors/destructors and candidate
-//! fields -- all read from Itanium C++ ABI symbols (`vtable for X`,
-//! `typeinfo for X`, demangled method names) that Ghidra's own demangler
-//! already produces. That's the caveat worth being explicit about: this
-//! entire category depends on those mangled symbols still being present.
-//! On a genuinely stripped release binary there are no such symbols to
-//! read, and recovering the same facts would need structural heuristics
-//! (vtable-shaped pointer arrays, RTTI-shaped data) instead of label
-//! lookups -- a materially harder, unimplemented problem.
+//! fields. Two independent paths feed this: Ghidra's own Itanium C++ ABI
+//! symbols (`vtable for X`, `typeinfo for X`, demangled method names)
+//! where they're present, and -- for a genuinely stripped binary, where
+//! there are no such symbols to read -- `ExtractFacts.py`'s own
+//! structural discovery, which finds the same vtable/RTTI data by
+//! cross-referencing constructors' own `this->vptr` stores and reading
+//! the Itanium ABI's typeinfo name strings directly, no symbol involved.
+//! Confirmed against a real stripped build: recovers every real class
+//! with its correct name, including one whose vtable's virtual-method
+//! slots are themselves genuinely null. It's still narrower than the
+//! symbol-based path -- it doesn't distinguish constructors from
+//! destructors, or find inheritance edges or non-virtual methods -- so a
+//! stripped binary's `owner_class`/`is_method_of` facts can be less
+//! complete even when the class name itself came through correctly.
 //!
 //! `ingest` is idempotent per (subject, predicate, value): calling it
 //! again with facts the graph already has adds nothing. This matters now
