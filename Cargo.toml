@@ -1,0 +1,33 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/debura-cli",
+    "crates/debura-core",
+    "crates/debura-agent",
+    "crates/debura-ghidra",
+    "crates/debura-analysis",
+    "crates/debura-knowledge",
+    "crates/debura-storage",
+    "crates/debura-scheduler",
+    "crates/debura-verifier",
+    "crates/debura-recovery",
+    "crates/debura-testbins",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+
+[workspace.dependencies]
+anyhow = "1"
+thiserror = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive"] }
+ulid = { version = "1", features = ["serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+rusqlite = { version = "0.31", features = ["bundled"] }
+goblin = "0.8"
+dirs = "5"
