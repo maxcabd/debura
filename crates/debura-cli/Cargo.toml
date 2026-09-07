@@ -1,0 +1,15 @@
+[package]
+name = "debura-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "debura"
+path = "src/main.rs"
+
+[dependencies]
+debura-core = { path = "../debura-core" }
+clap.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
