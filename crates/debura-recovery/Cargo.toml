@@ -4,3 +4,8 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+debura-knowledge = { path = "../debura-knowledge" }
+anyhow.workspace = true
+
+[dev-dependencies]
+chrono.workspace = true
