@@ -325,6 +325,14 @@ impl KnowledgeGraph {
         self.investigations.get(&id)
     }
 
+    /// All recorded investigations. A scheduler (M6) uses this to count how
+    /// many times a subject has already been investigated, e.g. to bound a
+    /// retry loop -- derived from persisted history rather than transient
+    /// counters, so it survives a restart mid-run.
+    pub fn investigations(&self) -> impl Iterator<Item = &Investigation> {
+        self.investigations.values()
+    }
+
     /// Lets a harness fill in an investigation's outcome (which
     /// hypotheses/evidence it actually produced) after `record_investigation`
     /// reserved its id -- those aren't known until the harness has finished
@@ -383,6 +391,11 @@ impl KnowledgeGraph {
     pub fn insert_hypothesis(&mut self, hypothesis: Hypothesis) {
         self.next_hypothesis_id = self.next_hypothesis_id.max(hypothesis.id.0);
         self.hypotheses.insert(hypothesis.id, hypothesis);
+    }
+
+    pub fn insert_investigation(&mut self, investigation: Investigation) {
+        self.next_investigation_id = self.next_investigation_id.max(investigation.id.0);
+        self.investigations.insert(investigation.id, investigation);
     }
 
     /// Restores a dependency edge, rebuilding the `dependents_of` index and
