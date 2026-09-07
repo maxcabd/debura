@@ -9,11 +9,18 @@ fn name_comment(source: &NameSource) -> String {
     }
 }
 
-fn method_declaration(m: &RecoveredMethod) -> String {
+/// A constructor or destructor's name is fixed by the language to the
+/// class's own name (`ClassName`/`~ClassName`) -- never `m.display_name`,
+/// even when a `semantic_role` hypothesis renamed it to something else
+/// (e.g. "initializeFood"). Rendering the renamed value there produces a
+/// declaration C++ doesn't recognize as a constructor at all (GCC parses
+/// it as an ordinary method with an implicit `int` return type instead),
+/// which is exactly what a real compile of this output hit.
+fn method_declaration(m: &RecoveredMethod, class_name: &str) -> String {
     if m.is_constructor {
-        format!("{}({});", m.display_name, m.params)
+        format!("{class_name}({});", m.params)
     } else if m.is_destructor {
-        format!("~{}();", m.display_name.trim_start_matches('~'))
+        format!("~{class_name}();")
     } else {
         format!("{} {}({});", m.return_type, m.display_name, m.params)
     }
@@ -37,7 +44,10 @@ pub fn render_header(class: &RecoveredClass) -> String {
     out.push_str("\n#pragma once\n\n");
 
     match &class.base {
-        Some(base) => out.push_str(&format!("class {} : public {} {{\n", class.name, base)),
+        Some(base) => {
+            out.push_str(&format!("#include \"{base}.hpp\"\n\n"));
+            out.push_str(&format!("class {} : public {} {{\n", class.name, base));
+        }
         None => out.push_str(&format!("class {} {{\n", class.name)),
     }
 
@@ -45,7 +55,7 @@ pub fn render_header(class: &RecoveredClass) -> String {
         out.push_str("public:\n");
         for m in &class.methods {
             out.push_str(&format!("    // {}\n", name_comment(&m.name_source)));
-            out.push_str(&format!("    {}\n\n", method_declaration(m)));
+            out.push_str(&format!("    {}\n\n", method_declaration(m, &class.name)));
         }
     }
 
@@ -80,17 +90,20 @@ pub fn render_source(class: &RecoveredClass) -> String {
     out.push_str(&format!("#include \"{}.hpp\"\n\n", class.name));
 
     for m in &class.methods {
-        let name = if m.is_destructor {
-            format!("~{}", m.display_name.trim_start_matches('~'))
+        // Same rule as method_declaration(): a constructor/destructor's
+        // name and the absence of a return type are fixed by the
+        // language, not by any semantic_role rename.
+        let (return_prefix, name) = if m.is_constructor {
+            (String::new(), class.name.clone())
+        } else if m.is_destructor {
+            (String::new(), format!("~{}", class.name))
         } else {
-            m.display_name.clone()
+            (format!("{} ", m.return_type), m.display_name.clone())
         };
         out.push_str(&format!("// {}\n", name_comment(&m.name_source)));
         out.push_str(&format!(
-            "{} {}::{}({})\n{}\n\n",
-            m.return_type,
+            "{return_prefix}{}::{name}({})\n{}\n\n",
             class.name,
-            name,
             m.params,
             extract_body(&m.decompilation)
         ));
