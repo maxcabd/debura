@@ -92,7 +92,10 @@ impl AgentProvider for OpenAiProvider {
             not extract them and must not invent facts beyond what's given. Propose hypotheses \
             about the semantic role of the given subject only. Cite existing hypothesis ids in \
             depends_on only if they appear in the provided list of existing hypotheses. Leave \
-            arrays empty rather than guessing when you have nothing well-founded to add.";
+            arrays empty rather than guessing when you have nothing well-founded to add. If an \
+            existing hypothesis is marked as contested or rejected with a stated reason, do not \
+            propose the same claim again -- either address why it failed or propose something \
+            genuinely different.";
 
         let user = render_analyze_function_task(task);
         let value = self.complete(
@@ -178,6 +181,11 @@ fn render_analyze_function_task(task: &AnalyzeFunctionTask) -> String {
             "- {}: {} = {} (confidence {:.2}, status {:?})\n",
             h.id, h.predicate, h.value, h.confidence, h.status
         ));
+        if let Some(reasons) = task.rejection_reasons.get(&h.id) {
+            for reason in reasons {
+                out.push_str(&format!("    this was contested/rejected because: {reason}\n"));
+            }
+        }
     }
 
     out

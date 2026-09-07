@@ -1,8 +1,8 @@
 use debura_agent::{
-    analyze_function, mock::EchoProvider, AgentProvider, AnalyzeFunctionTask,
-    ChallengeHypothesisTask, ChallengeResult, ConfidenceUpdate, InvestigationResult,
-    ProposedContradiction, ProposedHypothesis, ProposedObservation, Resolution, ResolutionResult,
-    ResolveContradictionTask,
+    analyze_function, commit_contradiction, mock::EchoProvider, AgentProvider,
+    AnalyzeFunctionTask, ChallengeHypothesisTask, ChallengeResult, ConfidenceUpdate,
+    InvestigationResult, ProposedContradiction, ProposedHypothesis, ProposedObservation,
+    Resolution, ResolutionResult, ResolveContradictionTask,
 };
 use debura_knowledge::{HypothesisId, HypothesisStatus, KnowledgeGraph};
 
@@ -47,6 +47,24 @@ fn task_context_is_scoped_to_its_own_subject() {
     assert_eq!(task.observations.len(), 1);
     assert_eq!(task.observations[0].value, "compute");
     assert_eq!(task.existing_hypotheses.len(), 1);
+}
+
+/// Feeds a bounded retry: a re-investigation of a subject whose prior
+/// hypothesis was contested/rejected should see *why*, not just *that* it
+/// failed, so it doesn't just repeat the same mistake.
+#[test]
+fn rejection_reasons_are_surfaced_for_contested_or_rejected_hypotheses() {
+    let mut graph = KnowledgeGraph::new();
+    let h = graph.propose_hypothesis("Player", "is_a", "GameEntity", 0.9, None);
+    commit_contradiction(&mut graph, h, "no GameEntity exists in the evidence", "test");
+
+    let task = AnalyzeFunctionTask::build(&graph, "Player");
+
+    let reasons = task
+        .rejection_reasons
+        .get(&h)
+        .expect("reasons present for a contested hypothesis");
+    assert_eq!(reasons, &vec!["no GameEntity exists in the evidence".to_string()]);
 }
 
 #[test]
