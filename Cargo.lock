@@ -218,6 +218,7 @@ dependencies = [
  "debura-core",
  "debura-ghidra",
  "debura-knowledge",
+ "debura-scheduler",
  "debura-storage",
  "debura-verifier",
  "serde_json",
@@ -267,6 +268,13 @@ version = "0.1.0"
 [[package]]
 name = "debura-scheduler"
 version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "debura-agent",
+ "debura-knowledge",
+ "debura-verifier",
+ "tracing",
+]
 
 [[package]]
 name = "debura-storage"

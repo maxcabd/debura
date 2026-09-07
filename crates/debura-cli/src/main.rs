@@ -57,6 +57,25 @@ enum Command {
         /// Hypothesis id, e.g. H1
         hypothesis: String,
     },
+    /// Run the autonomous loop (always via the mock provider for now)
+    Run {
+        /// Project id, as printed by `debura new`
+        project: String,
+        /// Stop after this many tasks
+        #[arg(long)]
+        max_iterations: Option<u64>,
+        /// Stop after this many seconds
+        #[arg(long)]
+        time_budget: Option<u64>,
+        /// Stop after this many tokens spent (not yet enforced -- no
+        /// provider reports usage yet)
+        #[arg(long)]
+        token_budget: Option<u64>,
+        /// Stop after this much spent, in dollars (not yet enforced -- no
+        /// provider reports usage yet)
+        #[arg(long)]
+        cost_budget: Option<f64>,
+    },
 }
 
 fn parse_hypothesis_id(s: &str) -> anyhow::Result<debura_knowledge::HypothesisId> {
@@ -212,6 +231,45 @@ fn main() -> Result<()> {
                 "{id}: {} {} = {} (confidence {:.2}, {:?})",
                 h.subject, h.predicate, h.value, h.confidence, h.status
             );
+        }
+        Command::Run {
+            project,
+            max_iterations,
+            time_budget,
+            token_budget,
+            cost_budget,
+        } => {
+            let root = debura_core::config::projects_dir().join(&project);
+            anyhow::ensure!(root.is_dir(), "no such project: {project}");
+
+            let conn = debura_storage::init_project_db(&root.join("project.sqlite"))?;
+            let mut graph = debura_storage::knowledge::load(&conn)?;
+
+            let budget = debura_scheduler::RunBudget {
+                max_iterations,
+                time_budget: time_budget.map(std::time::Duration::from_secs),
+                token_budget,
+                cost_budget,
+            };
+
+            println!("Project: {project}\n");
+
+            let summary = debura_scheduler::run(
+                &mut graph,
+                &debura_agent::mock::EchoProvider,
+                &debura_verifier::VerificationPolicy::default(),
+                &budget,
+                |iteration, task, graph| {
+                    println!("[{iteration}] {task:?}");
+                    if let Err(error) = debura_storage::knowledge::save(&conn, graph) {
+                        tracing::warn!(%error, "failed to checkpoint after iteration");
+                    }
+                },
+            );
+
+            println!("\nIterations: {}", summary.iterations);
+            println!("Stopped:    {:?}", summary.stopped_because);
+            println!("Hypotheses: {}", graph.hypotheses().count());
         }
     }
 

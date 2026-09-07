@@ -15,6 +15,7 @@ debura-knowledge = { path = "../debura-knowledge" }
 debura-storage = { path = "../debura-storage" }
 debura-agent = { path = "../debura-agent" }
 debura-verifier = { path = "../debura-verifier" }
+debura-scheduler = { path = "../debura-scheduler" }
 clap.workspace = true
 anyhow.workspace = true
 serde_json.workspace = true
