@@ -230,6 +230,27 @@ fn classify_provenance_bounded(
         }
     }
 
+    // PROJECT.md M18: a real frontier run found this gap concretely --
+    // `Screen`/`Snake` have no vtable, so M7's structural detection never
+    // gives their methods an `is_method_of` anchor at all, and most of
+    // their own callees really are SDL/CRT imports (dominance would call
+    // them library-dominated). But a thin library-forwarding thunk
+    // touches at most one field of its own receiver, if any; genuine
+    // lifecycle/orchestration code -- `Screen::init` writing its
+    // window/renderer/texture/font pointers into five distinct fields,
+    // `Screen::close` reading four distinct fields to tear each down --
+    // touches several. This has to run before the dominance check below,
+    // not after: `Screen::init`'s own callees are almost entirely SDL/TTF
+    // imports (real library calls), so dominance alone would misclassify
+    // it as library, not just leave it Unknown.
+    if let Some(body) = latest_decompilation(graph, subject) {
+        if let Some(param) = first_param_name(&body) {
+            if distinct_param_slots_accessed(&body, &param) >= MIN_OWN_STATE_SLOTS {
+                return Provenance::Application;
+            }
+        }
+    }
+
     if depth == 0 {
         return Provenance::Unknown;
     }
@@ -260,6 +281,98 @@ fn classify_provenance_bounded(
     }
 
     Provenance::Unknown
+}
+
+/// How many distinct fields of its own receiver a function must touch
+/// before that counts as "owns persistent state" rather than
+/// coincidentally touching the same one twice. 2 is deliberately low --
+/// this only needs to separate a thin forwarding thunk (touches at most
+/// one field, if any) from genuine lifecycle code, not measure how
+/// elaborate the lifecycle code is.
+const MIN_OWN_STATE_SLOTS: usize = 2;
+
+/// The most recent `decompiles_to` fact for `subject`, matching the
+/// "highest id wins" convention used everywhere else a subject can carry
+/// more than one observation for the same predicate.
+fn latest_decompilation(graph: &KnowledgeGraph, subject: &str) -> Option<String> {
+    graph
+        .observations()
+        .filter(|o| o.subject == subject && o.predicate == "decompiles_to")
+        .max_by_key(|o| o.id.0)
+        .map(|o| o.value.clone())
+}
+
+/// The name of a decompiled function's own first parameter -- Ghidra's
+/// own C-shaped signature always has one, `param_1` in every case this
+/// was built against. A best-effort read of the header text before the
+/// body's own `{`, not a real C parser (matches the same trade-off
+/// `debura-recovery`'s own signature parsing already makes for the same
+/// kind of text).
+fn first_param_name(decompilation: &str) -> Option<String> {
+    let header_end = decompilation.find('{')?;
+    let header = &decompilation[..header_end];
+    let open = header.find('(')?;
+    let close = header.rfind(')')?;
+    if close <= open {
+        return None;
+    }
+    let first = header[open + 1..close].split(',').next()?.trim();
+    if first.is_empty() || first == "void" {
+        return None;
+    }
+    first
+        .rsplit(|c: char| c == ' ' || c == '*')
+        .find(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// Distinct "slots" of `param_name` accessed anywhere in `body` --
+/// `param_1[N]` (array-style, N is the slot), `*param_1` (bare
+/// dereference, its own slot), or `(param_1 + N)`/`((cast)param_1 + N)`
+/// (pointer-arithmetic-style, N is the slot). Counts distinct slots, not
+/// accesses: a real lifecycle/orchestration method typically touches
+/// several different fields of its own receiver; a thin library-
+/// forwarding thunk typically touches at most one (often passing the
+/// receiver through unexamined, or reading exactly one field to hand to
+/// a single library call).
+fn distinct_param_slots_accessed(body: &str, param_name: &str) -> usize {
+    let mut slots: HashSet<String> = HashSet::new();
+
+    let bracket_needle = format!("{param_name}[");
+    let mut rest = body;
+    while let Some(pos) = rest.find(bracket_needle.as_str()) {
+        let after = &rest[pos + bracket_needle.len()..];
+        if let Some(close) = after.find(']') {
+            slots.insert(after[..close].trim().to_string());
+        }
+        rest = &after[..];
+    }
+
+    let plus_needle = format!("{param_name} + ");
+    let mut rest = body;
+    while let Some(pos) = rest.find(plus_needle.as_str()) {
+        let after = &rest[pos + plus_needle.len()..];
+        let end = after
+            .find(|c: char| !(c.is_ascii_hexdigit() || c == 'x'))
+            .unwrap_or(after.len());
+        if end > 0 {
+            slots.insert(format!("+{}", &after[..end]));
+        }
+        rest = after;
+    }
+
+    let star_needle = format!("*{param_name}");
+    let mut rest = body;
+    while let Some(pos) = rest.find(star_needle.as_str()) {
+        let after = &rest[pos + star_needle.len()..];
+        let continues_word = after.chars().next().is_some_and(|c| c.is_ascii_alphanumeric() || c == '_');
+        if !continues_word && !after.starts_with('[') {
+            slots.insert("*".to_string());
+        }
+        rest = after;
+    }
+
+    slots.len()
 }
 
 /// How much of `subject`'s own behavior, by call composition, is really
@@ -488,6 +601,93 @@ mod tests {
             classify_provenance(&graph, "0x1400045a8"),
             Provenance::LibraryOrRuntime
         );
+    }
+
+    /// PROJECT.md M18: the real case this signal was built for. Real body
+    /// (Screen::init, address stripped to `FUN_1400019ae`): writes to 5
+    /// distinct fields of its own receiver, but its callees are almost
+    /// entirely SDL/TTF imports -- dominance alone would call it library.
+    #[test]
+    fn a_lifecycle_method_dominated_by_library_calls_is_still_application() {
+        let mut graph = KnowledgeGraph::new();
+        graph.add_observation("0x1", "has_name", "FUN_1", 0.95, "ghidra:function", None);
+        graph.add_observation(
+            "0x1",
+            "decompiles_to",
+            "undefined8 FUN_1(longlong *param_1)\n\n{\n  \
+             iVar1 = SDL_Init(0x20);\n  \
+             TTF_Init();\n  \
+             lVar3 = TTF_OpenFont(\"Roboto-Regular.ttf\",0x14);\n  \
+             param_1[5] = lVar3;\n  \
+             lVar3 = SDL_CreateWindow(\"Snake Game\",0x1fff0000,0x1fff0000,800,600,4);\n  \
+             *param_1 = lVar3;\n  \
+             lVar3 = SDL_CreateRenderer(*param_1,0xffffffff,4);\n  \
+             param_1[1] = lVar3;\n  \
+             lVar3 = SDL_CreateTexture(param_1[1],0x16462004,0,800,600);\n  \
+             param_1[2] = lVar3;\n  \
+             pvVar4 = operator_new__(0x1d4c00);\n  \
+             param_1[6] = (longlong)pvVar4;\n  \
+             return 1;\n}",
+            0.95,
+            "ghidra:decompiler",
+            None,
+        );
+        for callee in ["0x10", "0x11", "0x12", "0x13", "0x14"] {
+            graph.add_observation("0x1", "calls", callee, 0.95, "ghidra:call_graph", None);
+            graph.add_observation(callee, "imports", format!("SDL2.DLL!Thing{callee}"), 1.0, "ghidra:imports", None);
+        }
+
+        assert_eq!(classify_provenance(&graph, "0x1"), Provenance::Application);
+    }
+
+    /// The other real half of the same case (Screen::clear, stripped to
+    /// `FUN_1400018ca`): touches exactly one field of its own receiver,
+    /// passing it straight to a single library call -- below the "owns
+    /// state" bar, so this signal correctly declines to fire, leaving the
+    /// existing dominance check's own (unrelated, already-correct)
+    /// verdict alone: a single call straight into an imported symbol is
+    /// exactly what dominance already calls library.
+    #[test]
+    fn a_single_field_forwarding_call_does_not_meet_the_own_state_bar() {
+        let mut graph = KnowledgeGraph::new();
+        graph.add_observation("0x1", "has_name", "FUN_1", 0.95, "ghidra:function", None);
+        graph.add_observation(
+            "0x1",
+            "decompiles_to",
+            "void FUN_1(longlong param_1)\n\n{\n  memset(*(void **)(param_1 + 0x30),0,0x1d4c00);\n  return;\n}",
+            0.95,
+            "ghidra:decompiler",
+            None,
+        );
+        graph.add_observation("0x1", "calls", "0x2", 0.95, "ghidra:call_graph", None);
+        graph.add_observation("0x2", "imports", "MSVCRT.DLL!memset", 1.0, "ghidra:imports", None);
+
+        assert_eq!(classify_provenance(&graph, "0x1"), Provenance::LibraryOrRuntime);
+    }
+
+    #[test]
+    fn first_param_name_reads_the_decompiled_headers_own_first_parameter() {
+        assert_eq!(
+            first_param_name("void FUN_1(longlong *param_1, int param_2)\n\n{\n  return;\n}"),
+            Some("param_1".to_string())
+        );
+        assert_eq!(first_param_name("void FUN_1(void)\n\n{\n  return;\n}"), None);
+    }
+
+    #[test]
+    fn distinct_param_slots_accessed_counts_each_shape_once() {
+        let body = "param_1[5] = x; *param_1 = y; *(int *)(param_1 + 0xc) = z; param_1[5] = w;";
+        // slot 5 (bracket, seen twice -> once), slot "*" (bare deref),
+        // slot +0xc (pointer arithmetic) -- 3 distinct, not 4.
+        assert_eq!(distinct_param_slots_accessed(body, "param_1"), 3);
+    }
+
+    #[test]
+    fn distinct_param_slots_accessed_ignores_a_bare_cast_pass_through() {
+        // Passing the whole receiver to another call, no field access at
+        // all -- must not be mistaken for a slot access.
+        let body = "FUN_2((longlong)param_1);";
+        assert_eq!(distinct_param_slots_accessed(body, "param_1"), 0);
     }
 
     /// A pure single-callee, small-bodied function is treated as a thunk
