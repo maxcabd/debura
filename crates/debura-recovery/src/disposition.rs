@@ -2,6 +2,7 @@ use std::collections::BTreeSet;
 
 use debura_knowledge::{classify_provenance, is_degenerate_decompilation, latest_decompilation, KnowledgeGraph, Provenance};
 
+use crate::crt_boundary::crt_startup_only_addresses;
 use crate::extract::extract;
 use crate::frontier::{reachable_from, UnresolvedSymbol};
 
@@ -60,6 +61,26 @@ pub enum RecoveryDisposition {
     /// this program's own perspective, or a path this specific build
     /// never exercises. Recovery necessity doesn't even apply.
     Unreachable,
+    /// Part of the binary's own copy of the compiler's runtime startup
+    /// machinery itself (PROJECT.md M18.3: `entry`, `__tmainCRTStartup`,
+    /// argv duplication, pseudo-relocation, exception-filter setup, ...
+    /// -- everything reachable from `entry` outside the real
+    /// main-equivalent function's own subtree, see `crt_boundary`), as
+    /// opposed to the application's own code. A real recovery run found
+    /// these were being recovered as ordinary application source right
+    /// alongside real game code -- both unnecessary (a normal `g++`
+    /// build already links a real, working CRT startup automatically)
+    /// and actively harmful (the recovered copy is genuinely dead code,
+    /// never actually called by the real linked binary, that references
+    /// CRT-internal storage locations application code was never meant
+    /// to redefine -- the direct root cause of an otherwise-mysterious
+    /// cluster of unresolved `.CRT`-section data symbols). Checked
+    /// *before* every other disposition -- a function can be reachable,
+    /// have a real body, and even (like `entry` itself) carry
+    /// `Provenance::LibraryOrRuntime` the same way a genuine
+    /// `RequiredRuntimeBody` case does, but its membership in the CRT
+    /// boundary always takes precedence.
+    RuntimeArtifact,
     /// Reachable, but either `Provenance::Unknown` with no usable
     /// decompiled body to reconstruct from, or otherwise not yet
     /// decidable. Nothing to recover from yet -- revisit once more
@@ -159,12 +180,13 @@ pub fn classify_recovery_disposition(
 ) -> Vec<DispositionEntry> {
     let reachable = reachable_from(graph, entry);
     let recovered = recovered_program_addresses(graph);
+    let crt_only = crt_startup_only_addresses(graph, entry);
 
     unresolved
         .iter()
         .filter_map(|u| match u {
             UnresolvedSymbol::Function { address, literal_name } => {
-                Some(diagnose_one(graph, address, literal_name, &reachable, &recovered))
+                Some(diagnose_one(graph, address, literal_name, &reachable, &recovered, &crt_only))
             }
             UnresolvedSymbol::Data { .. } => None,
         })
@@ -177,6 +199,7 @@ fn diagnose_one(
     literal_name: &str,
     reachable: &BTreeSet<String>,
     recovered: &BTreeSet<String>,
+    crt_only: &BTreeSet<String>,
 ) -> DispositionEntry {
     let is_reachable = reachable.contains(address);
     let provenance = classify_provenance(graph, address);
@@ -200,6 +223,8 @@ fn diagnose_one(
 
     let disposition = if !is_reachable {
         RecoveryDisposition::Unreachable
+    } else if crt_only.contains(address) {
+        RecoveryDisposition::RuntimeArtifact
     } else {
         match provenance {
             Provenance::Application => RecoveryDisposition::RequiredApplication,

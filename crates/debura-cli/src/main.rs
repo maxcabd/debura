@@ -667,6 +667,7 @@ fn main() -> Result<()> {
                     debura_recovery::RecoveryDisposition::ExternalLibrary => "ExternalLibrary",
                     debura_recovery::RecoveryDisposition::CompilerRuntime => "CompilerRuntime",
                     debura_recovery::RecoveryDisposition::Unreachable => "Unreachable",
+                    debura_recovery::RecoveryDisposition::RuntimeArtifact => "RuntimeArtifact",
                     debura_recovery::RecoveryDisposition::Deferred => "Deferred",
                 };
                 println!(
@@ -693,6 +694,7 @@ fn main() -> Result<()> {
             println!("  ExternalLibrary:     {}", count(debura_recovery::RecoveryDisposition::ExternalLibrary));
             println!("  CompilerRuntime:     {}", count(debura_recovery::RecoveryDisposition::CompilerRuntime));
             println!("  Unreachable:         {}", count(debura_recovery::RecoveryDisposition::Unreachable));
+            println!("  RuntimeArtifact:     {}", count(debura_recovery::RecoveryDisposition::RuntimeArtifact));
             println!("  Deferred:            {}", count(debura_recovery::RecoveryDisposition::Deferred));
         }
         Command::Reconsider { project } => {

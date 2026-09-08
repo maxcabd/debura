@@ -722,8 +722,24 @@ fn extract_impl(graph: &KnowledgeGraph, required_runtime_bodies: &BTreeSet<Strin
         .map(|o| o.subject.clone());
     let reachable = entry.as_deref().map(|e| crate::frontier::reachable_from(graph, e));
     let is_reachable = |subject: &str| reachable.as_ref().is_some_and(|r| r.contains(subject));
+    // PROJECT.md M18.3: a real recovery run found the binary's own copy
+    // of the compiler's CRT startup machinery (`entry` itself, and
+    // `__tmainCRTStartup`, both `Provenance::Unknown` -- no name-shape
+    // anchor, no clear dominance signal) getting swept in by the
+    // `RequiredUnknown` path below exactly like any other reachable,
+    // unnamed-but-bodied function -- both unnecessary (a real `g++`
+    // build already links a working CRT startup automatically) and
+    // actively harmful (the recovered copy is genuinely dead code that
+    // references CRT-internal storage application code was never meant
+    // to redefine, the direct root cause of an otherwise-mysterious
+    // cluster of unresolved `.CRT`-section data symbols). Checked before
+    // *any* inclusion path below -- `entry`'s own membership in the CRT
+    // boundary must win regardless of which provenance/disposition rule
+    // would otherwise have swept it in.
+    let crt_only = entry.as_deref().map(|e| crate::crt_boundary::crt_startup_only_addresses(graph, e)).unwrap_or_default();
     let recoverable_by_disposition_alone = |subject: &str, provenance: Provenance, has_real_body: bool| -> bool {
-        has_real_body
+        !crt_only.contains(subject)
+            && has_real_body
             && ((is_reachable(subject) && provenance == Provenance::Unknown)
                 || (provenance == Provenance::LibraryOrRuntime && required_runtime_bodies.contains(subject)))
     };
