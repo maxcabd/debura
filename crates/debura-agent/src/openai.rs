@@ -187,40 +187,21 @@ impl AgentProvider for OpenAiProvider {
             everything else. Prefer it unless this subject's own body, callers, or fields \
             actively contradict it. \
             \n\n\
-            Two more evidence sections work together and neither depends on any neighbor having \
-            an ACCEPTED name -- that dependency is exactly what made an earlier version of this \
-            context miss real signal, when the neighbor that would have supplied it (a screen- \
-            clear or screen-update function) never itself got accepted. \
-            \n\n\
-            \"API names reachable from this subject's own callee tree\" lists real, \
-            already-resolved names found by walking this subject's OWN calls -- Ghidra resolves \
-            calls into imported/library functions to their real names even in a fully stripped \
-            binary, so a subject that itself calls, say, an SDL render/texture function carries \
-            that evidence directly, with no hypothesis or acceptance needed at all. Treat this as \
-            strong, direct evidence of purpose. \
-            \n\n\
-            \"Call-sequence context\" lists EVERY nearby call in each direction (not just the \
-            first one with an accepted name), each with whatever raw evidence exists for it: an \
-            accepted label if one exists, a raw (possibly never-accepted) mechanical_behavior \
-            value, and/or its own reachable API names. Reason about this the way a person reading \
-            the same decompilation would: look at the ensemble of these raw facts across the \
-            whole cluster to infer what shared purpose (a rendering step, an input/update tick, a \
-            collision check, initialization, cleanup) the cluster represents, THEN use that \
-            inferred purpose -- combined with this subject's own mechanical_behavior -- to propose \
-            a semantic_role at that level, not a restatement of this subject's own loop or \
-            arithmetic. Worked example from a real case: a subject that itself only \
-            \"iteratesOverSections\" sits between a neighbor whose reachable API names include \
-            something memset-shaped (a buffer clear) and a neighbor whose reachable API names \
-            include SDL render/texture calls -- that ensemble supports inferring a shared \
-            rendering-phase purpose for the whole cluster, and thus a semantic_role like \"draw\" \
-            for this subject, even though nothing in the cluster ever earned its own accepted \
-            name and this subject's own body never mentions a single SDL call. Weigh distance: \
-            closer calls carry more weight, and a cluster with mixed, unrelated-looking neighbors \
-            should make you more cautious, not less. The reverse also holds just as firmly: don't \
-            manufacture a phase-level role when the ensemble is genuinely uninformative or \
-            unrelated -- empty or generic evidence here is not itself evidence of anything, and \
-            omitting semantic_role is still the honest choice when the ensemble doesn't actually \
-            support one.";
+            Two more sections give you additional raw facts, on the same footing as any other \
+            observation -- neither is itself a conclusion, and neither should be treated as more \
+            persuasive than the evidence bar already described above requires. \"API names \
+            reachable from this subject's own callee tree\" lists real, already-resolved names \
+            found by walking this subject's own calls (Ghidra resolves calls into imported/library \
+            functions to their real names even in a fully stripped binary). \"Call-sequence \
+            context\" lists nearby calls in the same caller, each with whatever raw evidence \
+            exists for it -- an accepted label if one exists, or an unaccepted mechanical_behavior \
+            value, or its own reachable API names. Use these exactly like any other observation: \
+            real evidence beyond the subject's own body can support a semantic_role, but sparse, \
+            generic, or loosely-related facts in these sections don't lower the bar -- they're \
+            still held to the same standard as everything else here (no restating mechanism, no \
+            placeholder, no guess dressed up as a conclusion). When these sections don't clearly \
+            support a specific claim, that's not itself evidence of anything, and omitting \
+            semantic_role remains the honest choice.";
 
         let user = render_analyze_function_task(task);
         let value = self.complete(
@@ -294,40 +275,22 @@ impl AgentProvider for OpenAiProvider {
             against everything else. Prefer it unless that subject's own body, callers, or \
             fields actively contradict it. \
             \n\n\
-            Two more evidence sections work together for each subject and neither depends on any \
-            neighbor having an ACCEPTED name -- that dependency is exactly what made an earlier \
-            version of this context miss real signal, when the neighbor that would have supplied \
-            it (a screen-clear or screen-update function) never itself got accepted. \
-            \n\n\
+            Two more sections give you additional raw facts for each subject, on the same footing \
+            as any other observation -- neither is itself a conclusion, and neither should be \
+            treated as more persuasive than the evidence bar already described above requires. \
             \"API names reachable from this subject's own callee tree\" lists real, \
-            already-resolved names found by walking that subject's OWN calls -- Ghidra resolves \
+            already-resolved names found by walking that subject's own calls (Ghidra resolves \
             calls into imported/library functions to their real names even in a fully stripped \
-            binary, so a subject that itself calls, say, an SDL render/texture function carries \
-            that evidence directly, with no hypothesis or acceptance needed at all. Treat this as \
-            strong, direct evidence of purpose. \
-            \n\n\
-            Each subject's \"Call-sequence context\" lists EVERY nearby call in each direction \
-            (not just the first one with an accepted name), each with whatever raw evidence \
-            exists for it: an accepted label if one exists, a raw (possibly never-accepted) \
-            mechanical_behavior value, and/or its own reachable API names. Reason about this the \
-            way a person reading the same decompilation would: look at the ensemble of these raw \
-            facts across the whole cluster to infer what shared purpose (a rendering step, an \
-            input/update tick, a collision check, initialization, cleanup) the cluster represents, \
-            THEN use that inferred purpose -- combined with the subject's own mechanical_behavior \
-            -- to propose a semantic_role at that level, not a restatement of the subject's own \
-            loop or arithmetic. Worked example from a real case: a subject that itself only \
-            \"iteratesOverSections\" sits between a neighbor whose reachable API names include \
-            something memset-shaped (a buffer clear) and a neighbor whose reachable API names \
-            include SDL render/texture calls -- that ensemble supports inferring a shared \
-            rendering-phase purpose for the whole cluster, and thus a semantic_role like \"draw\" \
-            for that subject, even though nothing in the cluster ever earned its own accepted name \
-            and the subject's own body never mentions a single SDL call. Weigh distance: closer \
-            calls carry more weight, and a cluster with mixed, unrelated-looking neighbors should \
-            make you more cautious, not less. The reverse also holds just as firmly: don't \
-            manufacture a phase-level role when the ensemble is genuinely uninformative or \
-            unrelated -- empty or generic evidence here is not itself evidence of anything, and \
-            omitting semantic_role is still the honest choice when the ensemble doesn't actually \
-            support one. \
+            binary). Each subject's \"Call-sequence context\" lists nearby calls in the same \
+            caller, each with whatever raw evidence exists for it -- an accepted label if one \
+            exists, or an unaccepted mechanical_behavior value, or its own reachable API names. \
+            Use these exactly like any other observation: real evidence beyond a subject's own \
+            body can support a semantic_role, but sparse, generic, or loosely-related facts in \
+            these sections don't lower the bar -- they're still held to the same standard as \
+            everything else here (no restating mechanism, no placeholder, no guess dressed up as a \
+            conclusion). When these sections don't clearly support a specific claim for a subject, \
+            that's not itself evidence of anything, and omitting semantic_role remains the honest \
+            choice. \
             \n\n\
             Return exactly one result per subject listed below, \
             each carrying that subject's own address back so results can be matched up -- order \
@@ -538,22 +501,11 @@ const CHALLENGE_SYSTEM: &str = "You are Debura's ChallengeHypothesis adversarial
     because it wasn't independently re-derived from this subject's own body alone. Judge it the \
     same way you'd judge any other well-evidenced claim: look for a genuine reason the analogy \
     doesn't hold here (a body, caller, or field pattern that contradicts it), not for the \
-    analogy's mere existence. \
-    \n\n\
-    A semantic_role can also be justified by a phase-level inference from the \"API names \
-    reachable from this subject's own callee tree\" and \"Call-sequence context\" sections below, \
-    rather than from this subject's own body alone or from any single neighbor's own ACCEPTED \
-    name -- e.g. \"draw\" for a subject that only mechanically iterates something, justified by a \
-    caller-sequence neighbor's reachable SDL render calls and another neighbor's memset-shaped \
-    buffer clear. Don't reject this kind of claim merely for not being independently re-derived \
-    from the subject's own body, or for citing a neighbor that itself has no ACCEPTED name -- \
-    that's the evidence working as intended, not a weakness. Instead, actually check the cited \
-    ensemble yourself in those two sections: does it genuinely support the claimed phase (real, \
-    specific reachable names or mechanical_behavior values pointing the same direction), or is the \
-    claim overstated relative to what's actually there (vague, sparse, or contradictory evidence \
-    dressed up as a confident phase inference)? Treat a phase-inferred role that isn't actually \
-    backed by the sections below as exactly the same kind of unsupported guess as one based on \
-    nothing at all. \
+    analogy's mere existence. The \"API names reachable from this subject's own callee tree\" and \
+    \"Call-sequence context\" sections below are raw facts on the same footing as any other \
+    observation -- weigh a claim that cites them exactly as skeptically as any other claim (does \
+    it actually hold up against what's specifically there, or is it a vague/loosely-related fact \
+    dressed up as a confident conclusion), with no special exemption either way. \
     \n\n\
     If the hypothesis under review has the predicate \"semantic_role\" (not \
     \"mechanical_behavior\" -- that one is expected to describe the body's own mechanics and \
