@@ -198,11 +198,20 @@ fn find_call_starts(text: &str) -> Vec<CallStart> {
 /// Splits a call's argument text on its top-level commas -- the same
 /// balanced-paren tracking `extract_base_constructor_call` already needs
 /// for the leading base-constructor-call case, generalized to any call
-/// site and to more than one comma. Doesn't need to understand string
-/// literals: Ghidra's own decompiled call arguments are never string
-/// literals containing a raw comma followed by more call syntax in a way
-/// that's been seen to matter here, and stopping at unbalanced quotes
-/// would be a bigger, separate parser than this pass needs.
+/// site and to more than one comma. Does track string-literal state (a
+/// real case had a format-string argument -- `"...out of range,
+/// targeting %p, yielding the value %p.\n"` -- whose own *literal text*
+/// contained two commas; without this, those got treated as real
+/// top-level argument separators, inflating a genuine 4-argument call
+/// site to a counted 6, failing the arity check against the callee's
+/// real declared signature, and leaving the call unresolved -- with a
+/// competing, conflicting *variadic* fallback declaration generated for
+/// it alongside the real, fixed-arity one, which is what a real link
+/// actually failed on). Only double-quoted string literals, with `\"` as
+/// the one escape this needs to recognize (Ghidra's own decompiled
+/// output has been observed using it; nothing else does): not a full C
+/// string-literal grammar, just enough to stop a comma inside one from
+/// looking like an argument separator.
 fn split_args(args: &str) -> Vec<&str> {
     if args.trim().is_empty() {
         return Vec::new();
@@ -210,8 +219,21 @@ fn split_args(args: &str) -> Vec<&str> {
     let mut parts = Vec::new();
     let mut depth = 0i32;
     let mut start = 0usize;
-    for (i, c) in args.char_indices() {
+    let mut in_string = false;
+    let mut chars = args.char_indices().peekable();
+    while let Some((i, c)) = chars.next() {
+        if in_string {
+            match c {
+                '\\' => {
+                    chars.next();
+                }
+                '"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
         match c {
+            '"' => in_string = true,
             '(' | '[' => depth += 1,
             ')' | ']' => depth -= 1,
             ',' if depth == 0 => {
@@ -503,5 +525,39 @@ mod tests {
             rewrite_call_sites("FUN_5(p,FUN_6(1),2); FUN_5(p,3,4);", &table, &mut unresolved);
         assert_eq!(rewritten, "((Wall *)(p))->draw(FUN_6(1),2); ((Wall *)(p))->draw(3,4);");
         assert!(unresolved.contains("FUN_6"));
+    }
+
+    /// PROJECT.md M18: a real link failed on exactly this -- a genuine
+    /// 4-argument call site whose first argument is a format-string
+    /// literal containing two commas in its own *text*
+    /// (`"...out of range, targeting %p, yielding the value %p.\n"`).
+    /// Splitting on every comma regardless of string-literal state
+    /// inflated this to a counted 6 arguments, failed the arity check
+    /// against the real 4-parameter declared signature, and left the
+    /// call unresolved -- generating a conflicting variadic fallback
+    /// declaration with no definition, which is what the linker actually
+    /// reported as undefined.
+    #[test]
+    fn a_comma_inside_a_string_literal_argument_is_not_treated_as_an_argument_separator() {
+        let functions = vec![RecoveredFunction {
+            address: "0x7".to_string(),
+            raw_name: "FUN_7".to_string(),
+            display_name: "FUN_7".to_string(),
+            name_source: NameSource::Raw,
+            return_type: "undefined".to_string(),
+            params: "undefined8 param_1, undefined8 param_2, undefined8 param_3, undefined8 param_4".to_string(),
+            decompilation: String::new(),
+        }];
+        let table = build_symbol_table(&[], &functions);
+        let mut unresolved = BTreeSet::new();
+
+        let rewritten = rewrite_call_sites(
+            r#"FUN_7("%d bit pseudo relocation at %p out of range, targeting %p, yielding the value %p.\n",a,b,c);"#,
+            &table,
+            &mut unresolved,
+        );
+
+        assert!(unresolved.is_empty(), "{unresolved:?}");
+        assert!(rewritten.starts_with("FUN_7(("), "{rewritten}");
     }
 }
