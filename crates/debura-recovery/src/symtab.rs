@@ -82,6 +82,18 @@ pub struct RecoveredSymbol {
     /// `ForwardingThunk` only -- see `forwarding_thunk.rs`. Empty for
     /// every other kind.
     pub argument_mapping: Vec<ArgumentMapping>,
+    /// The declared return type, exactly as recovered -- `Method` and
+    /// `FreeFunction` only (PROJECT.md M18.3: needed to synthesize a
+    /// vtable-slot trampoline's own signature, see
+    /// `data_symbols::VtableSlotTarget::Method`). Empty for every other
+    /// kind.
+    pub return_type: String,
+    /// The declared parameter list, exactly as recovered -- real types
+    /// *and* names (`"longlong param_2"`, not just `param_types`' bare
+    /// types), and never including the receiver. `Method`/`FreeFunction`
+    /// only, empty for every other kind, same reasoning as
+    /// `return_type`.
+    pub raw_params: String,
 }
 
 /// Counts a recovered signature's own parameters -- `""`/`"void"` mean
@@ -163,6 +175,8 @@ pub fn build_symbol_table(classes: &[RecoveredClass], functions: &[RecoveredFunc
                     param_types: Vec::new(),
                     canonical_target: String::new(),
                     argument_mapping: Vec::new(),
+                    return_type: m.return_type.clone(),
+                    raw_params: m.params.clone(),
                 },
             );
         }
@@ -178,6 +192,8 @@ pub fn build_symbol_table(classes: &[RecoveredClass], functions: &[RecoveredFunc
                 param_types: param_types(&f.params),
                 canonical_target: String::new(),
                 argument_mapping: Vec::new(),
+                return_type: f.return_type.clone(),
+                raw_params: f.params.clone(),
             },
         );
     }

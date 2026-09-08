@@ -337,6 +337,8 @@ pub fn add_forwarding_thunks(graph: &KnowledgeGraph, table: &mut SymbolTable) {
                 param_types: Vec::new(),
                 canonical_target: thunk.canonical_target,
                 argument_mapping: thunk.argument_mapping,
+                return_type: String::new(),
+                raw_params: String::new(),
             },
         );
     }

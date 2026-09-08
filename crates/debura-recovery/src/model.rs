@@ -131,4 +131,25 @@ pub struct RecoveredProgram {
     /// `main` -- see `crt_boundary::find_main_equivalent`), only its
     /// *exposure* under a specific linker-required name is new.
     pub entry_wrapper: Option<(String, String)>,
+    /// A real vtable slot's target is a recovered class method, not a
+    /// free function (PROJECT.md M18.3, see
+    /// `data_symbols::VtableSlotTarget::Method`'s own doc comment for
+    /// why this can't just be `&Class::method`) -- one entry per unique
+    /// (owner, method) pair `data_resolutions` names, deduplicated
+    /// (several classes' own vtable slots could in principle name the
+    /// same method, though no real project has shown that yet).
+    /// `render_functions_source` emits each as a small, real, static
+    /// free function in `functions.cpp`; `owner` is why every such
+    /// owner's own class is folded into `function_references` too.
+    pub vtable_trampolines: Vec<VtableTrampoline>,
+}
+
+/// See `RecoveredProgram::vtable_trampolines`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VtableTrampoline {
+    pub name: String,
+    pub owner: String,
+    pub method_name: String,
+    pub return_type: String,
+    pub params: String,
 }

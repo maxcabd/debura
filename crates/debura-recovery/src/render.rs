@@ -878,6 +878,7 @@ pub fn render_functions_source(
     functions: &[RecoveredFunction],
     references: &[String],
     entry_wrapper: Option<&(String, String)>,
+    trampolines: &[crate::model::VtableTrampoline],
 ) -> String {
     let mut out = String::new();
     out.push_str("// Recovered by Debura: standalone functions with an ACCEPTED semantic\n");
@@ -905,11 +906,63 @@ pub fn render_functions_source(
         ));
     }
 
+    for t in trampolines {
+        out.push_str(&render_vtable_trampoline(t));
+    }
+
     if let Some((symbol, target)) = entry_wrapper {
         out.push_str(&render_entry_wrapper(symbol, target));
     }
 
     out
+}
+
+/// One vtable slot's real target is a recovered class method, never
+/// portably representable as a plain function pointer on its own (see
+/// `data_symbols::VtableSlotTarget::Method`'s own doc comment for why
+/// `&Class::method` doesn't work). This is the other half of that fix: a
+/// small, real, static free function with the *exact* signature Ghidra
+/// recovered (an explicit `this`-shaped first parameter standing in for
+/// the receiver, then every other parameter unchanged) that just forwards
+/// into the real method call -- itself a real, portable, plain function
+/// pointer, exactly like `symtab.rs`'s own call-site rewriting already
+/// produces the other direction (a raw `FUN_addr(this, args...)` call
+/// becoming `((Owner *)this)->method(args...)`).
+fn render_vtable_trampoline(t: &crate::model::VtableTrampoline) -> String {
+    let names: Vec<String> = trampoline_param_names(&t.params);
+    let params = if t.params.trim().is_empty() { String::new() } else { format!(",{}", t.params) };
+    format!(
+        "// PROJECT.md M18.3: a real vtable slot's target, {}::{} -- a\n\
+         // plain function pointer this slot's own symbol can safely bind\n\
+         // to (never `&{}::{}` itself, which C++ gives a pointer-to-member\n\
+         // representation, not a plain code pointer).\n\
+         extern \"C\" {} {}(void *debura_this{})\n\
+         {{\n\
+         \x20 return (({} *)debura_this)->{}({});\n\
+         }}\n\n",
+        t.owner, t.method_name, t.owner, t.method_name, t.return_type, t.name, params, t.owner, t.method_name, names.join(",")
+    )
+}
+
+/// The bare parameter *names* out of a declared parameter list
+/// (`"longlong param_2, void *param_3"` -> `["param_2", "param_3"]`) --
+/// the same trailing-identifier convention `symtab.rs`'s own `param_type`
+/// uses for the same shape of text, just keeping the other half.
+fn trampoline_param_names(params: &str) -> Vec<String> {
+    let trimmed = params.trim();
+    if trimmed.is_empty() || trimmed == "void" {
+        return Vec::new();
+    }
+    trimmed
+        .split(',')
+        .map(|p| {
+            p.trim()
+                .rsplit(|c: char| c == ' ' || c == '*')
+                .find(|s| !s.is_empty())
+                .unwrap_or(p.trim())
+                .to_string()
+        })
+        .collect()
 }
 
 /// An ABI/linkage alias exposing an already-recovered function under a
@@ -954,7 +1007,7 @@ mod entry_wrapper_tests {
     /// no wrapper text at all.
     #[test]
     fn no_entry_wrapper_emits_nothing_extra() {
-        let out = render_functions_source(&[a_function()], &[], None);
+        let out = render_functions_source(&[a_function()], &[], None, &[]);
         assert!(!out.contains("extern \"C\""), "{out}");
     }
 
@@ -964,7 +1017,7 @@ mod entry_wrapper_tests {
     #[test]
     fn an_entry_wrapper_exposes_the_target_under_the_requested_symbol() {
         let wrapper = ("SDL_main".to_string(), "FUN_140003940".to_string());
-        let out = render_functions_source(&[a_function()], &[], Some(&wrapper));
+        let out = render_functions_source(&[a_function()], &[], Some(&wrapper), &[]);
         assert!(
             out.contains("extern \"C\" int SDL_main(int argc, char *argv[])"),
             "{out}"
@@ -982,7 +1035,47 @@ mod entry_wrapper_tests {
     #[test]
     fn an_entry_wrapper_renders_even_with_no_other_functions() {
         let wrapper = ("SDL_main".to_string(), "FUN_140003940".to_string());
-        let out = render_functions_source(&[], &[], Some(&wrapper));
+        let out = render_functions_source(&[], &[], Some(&wrapper), &[]);
         assert!(out.contains("extern \"C\" int SDL_main"), "{out}");
+    }
+
+    /// PROJECT.md M18.3: the real, confirmed case -- `Wall`'s own vtable
+    /// slot 0 targets `Wall::FUN_140002f4e(longlong param_2)`. The
+    /// trampoline must forward the receiver as an explicit cast and
+    /// every other parameter unchanged, never fabricate
+    /// `&Wall::FUN_140002f4e` as a plain function pointer.
+    #[test]
+    fn a_vtable_trampoline_forwards_the_real_method_call() {
+        let trampoline = crate::model::VtableTrampoline {
+            name: "Wall__vtable_trampoline_FUN_140002f4e".to_string(),
+            owner: "Wall".to_string(),
+            method_name: "FUN_140002f4e".to_string(),
+            return_type: "undefined".to_string(),
+            params: "longlong param_2".to_string(),
+        };
+        let out = render_functions_source(&[], &[], None, std::slice::from_ref(&trampoline));
+
+        assert!(
+            out.contains("extern \"C\" undefined Wall__vtable_trampoline_FUN_140002f4e(void *debura_this,longlong param_2)"),
+            "{out}"
+        );
+        assert!(out.contains("return ((Wall *)debura_this)->FUN_140002f4e(param_2);"), "{out}");
+    }
+
+    /// A method with no parameters of its own beyond the receiver must
+    /// still render a valid, comma-free signature and forwarding call.
+    #[test]
+    fn a_vtable_trampoline_for_a_no_argument_method_has_no_trailing_comma() {
+        let trampoline = crate::model::VtableTrampoline {
+            name: "Food__vtable_trampoline_draw".to_string(),
+            owner: "Food".to_string(),
+            method_name: "draw".to_string(),
+            return_type: "void".to_string(),
+            params: String::new(),
+        };
+        let out = render_functions_source(&[], &[], None, std::slice::from_ref(&trampoline));
+
+        assert!(out.contains("Food__vtable_trampoline_draw(void *debura_this)"), "{out}");
+        assert!(out.contains("return ((Food *)debura_this)->draw();"), "{out}");
     }
 }

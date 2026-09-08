@@ -5,7 +5,9 @@ use debura_knowledge::{
     Hypothesis, HypothesisStatus, KnowledgeGraph, Observation, Provenance,
 };
 
-use crate::model::{NameSource, RecoveredClass, RecoveredField, RecoveredFunction, RecoveredMethod, RecoveredProgram};
+use crate::model::{
+    NameSource, RecoveredClass, RecoveredField, RecoveredFunction, RecoveredMethod, RecoveredProgram, VtableTrampoline,
+};
 
 /// `ingest` can run more than once against the same subject (M8's
 /// `reextract`, or a repeated `debura analyze`), so more than one
@@ -888,7 +890,7 @@ fn extract_impl(
     for class in &mut classes {
         class.references = find_references(class, &class_names);
     }
-    let function_references = find_function_references(&functions, &class_names);
+    let mut function_references = find_function_references(&functions, &class_names);
 
     let mut ghidra_data_symbols: BTreeSet<String> = BTreeSet::new();
     let mut ghidra_intrinsics: BTreeSet<String> = BTreeSet::new();
@@ -934,6 +936,41 @@ fn extract_impl(
     }
     let ghidra_data_symbols: Vec<String> = ghidra_data_symbols.into_iter().collect();
 
+    // PROJECT.md M18.3: a vtable slot whose real target is a recovered
+    // method (not a free function) needs a real, synthesized trampoline
+    // -- see `data_symbols::VtableSlotTarget::Method`'s own doc comment
+    // for why `&Class::method` itself is never a safe function-pointer
+    // conversion. Deduplicated by trampoline name (the same deterministic
+    // function of owner+method `classify_data_symbol` already used), so
+    // two vtable slots naming the same method (not seen in any real
+    // project yet, but structurally possible) only emit one definition.
+    // Each owner class is folded into `function_references` too --
+    // `functions.cpp` calls into it (from inside the trampoline body),
+    // so it needs the same `#include` a standalone function referencing
+    // that class already gets.
+    let mut vtable_trampolines: Vec<VtableTrampoline> = Vec::new();
+    let mut seen_trampolines: BTreeSet<String> = BTreeSet::new();
+    for r in &data_resolutions {
+        if let crate::data_symbols::DataSymbolKind::VtableData {
+            slot0_target: Some(crate::data_symbols::VtableSlotTarget::Method { trampoline_name, owner, method_name, return_type, params }),
+            ..
+        } = &r.kind
+        {
+            if seen_trampolines.insert(trampoline_name.clone()) {
+                vtable_trampolines.push(VtableTrampoline {
+                    name: trampoline_name.clone(),
+                    owner: owner.clone(),
+                    method_name: method_name.clone(),
+                    return_type: return_type.clone(),
+                    params: params.clone(),
+                });
+                if !function_references.contains(owner) {
+                    function_references.push(owner.clone());
+                }
+            }
+        }
+    }
+
     // PROJECT.md M18.3: solved deterministically, from the same real
     // structural evidence `crt_boundary` already establishes -- never
     // guessed, never delegated to a reasoning model. Only takes effect
@@ -959,5 +996,6 @@ fn extract_impl(
         data_resolutions,
         ghidra_intrinsics: ghidra_intrinsics.into_iter().collect(),
         unresolved_calls: unresolved_calls.into_iter().collect(),
+        vtable_trampolines,
     }
 }

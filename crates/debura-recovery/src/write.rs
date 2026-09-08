@@ -6,7 +6,10 @@ use anyhow::Result;
 use crate::compat::{render_ghidra_compat_header, GHIDRA_COMPAT_HEADER_NAME};
 use crate::model::RecoveredProgram;
 use crate::render::{render_functions_source, render_header, render_source};
-use crate::symbols::{render_function_declarations, render_ghidra_symbols_header_resolved, GHIDRA_SYMBOLS_HEADER_NAME};
+use crate::symbols::{
+    render_function_declarations, render_ghidra_symbols_header_resolved, render_vtable_trampoline_declarations,
+    GHIDRA_SYMBOLS_HEADER_NAME,
+};
 
 #[derive(Debug, Default)]
 pub struct RecoverySummary {
@@ -33,13 +36,15 @@ pub fn write_to_disk(project_root: &Path, program: &RecoveredProgram) -> Result<
         .iter()
         .map(|f| (f.return_type.clone(), f.display_name.clone(), f.params.clone()))
         .collect();
+    let declarations = render_function_declarations(&function_declarations)
+        + &render_vtable_trampoline_declarations(&program.vtable_trampolines);
     fs::write(
         include_dir.join(GHIDRA_SYMBOLS_HEADER_NAME),
         render_ghidra_symbols_header_resolved(
             &program.ghidra_data_symbols,
             &program.data_resolutions,
             &program.unresolved_calls,
-            &render_function_declarations(&function_declarations),
+            &declarations,
         ),
     )?;
 
@@ -61,6 +66,7 @@ pub fn write_to_disk(project_root: &Path, program: &RecoveredProgram) -> Result<
                 &program.functions,
                 &program.function_references,
                 program.entry_wrapper.as_ref(),
+                &program.vtable_trampolines,
             ),
         )?;
     }

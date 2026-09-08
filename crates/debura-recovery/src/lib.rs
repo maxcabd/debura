@@ -23,13 +23,13 @@ mod write;
 
 pub use compat::{render_ghidra_compat_header, GHIDRA_COMPAT_HEADER_NAME};
 pub use crt_boundary::{crt_startup_only_addresses, find_main_equivalent};
-pub use data_symbols::{classify_data_symbols, DataResolution, DataSymbolKind};
+pub use data_symbols::{classify_data_symbols, DataResolution, DataSymbolKind, VtableSlotTarget};
 pub use disposition::{classify_recovery_disposition, DispositionEntry, RecoveryDisposition};
 pub use extract::{extract, extract_with_required_runtime_bodies};
 pub use frontier::{classify_frontier, parse_undefined_symbols, reachable_from, FrontierBucket, FrontierEntry, UnresolvedSymbol};
 pub use model::{
     NameSource, RecoveredClass, RecoveredField, RecoveredFunction, RecoveredMethod,
-    RecoveredProgram,
+    RecoveredProgram, VtableTrampoline,
 };
 pub use render::{render_functions_source, render_header, render_source};
 pub use symbols::{

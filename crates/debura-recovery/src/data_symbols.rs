@@ -95,7 +95,7 @@ pub enum DataSymbolKind {
     /// bounds on the *next* symbol, which for a vtable slot is often the
     /// very next slot, 8 bytes later -- nowhere near this record's real
     /// significance).
-    VtableData { class_name: String, slot0_target: Option<String> },
+    VtableData { class_name: String, slot0_target: Option<VtableSlotTarget> },
     /// This address's own section/permissions say it's real, executable
     /// code (`.text`, `executable=true`) -- a label taken as a value
     /// (a real, documented MinGW CRT idiom: registering a handler
@@ -110,6 +110,37 @@ pub enum DataSymbolKind {
     /// applies to global data exactly the way it already does to
     /// semantic naming.
     UnknownData,
+}
+
+/// A vtable slot's real value, once resolved (PROJECT.md M18.3). Itanium
+/// ABI vtables store a plain code pointer in every slot -- true whether
+/// the slot's own function is a free function or a class method -- but a
+/// *portable C++ expression* can only produce that same plain pointer
+/// from a free function (`&some_function`). `&Class::method` yields a
+/// pointer-to-member, a different, non-portable, differently-sized
+/// representation the Itanium ABI's real vtable slots never actually
+/// use this way; deliberately never faked as one (the whole reason this
+/// type exists instead of a bare `Option<String>` the way this field
+/// used to be).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VtableSlotTarget {
+    /// Safe to bind directly -- no member-function-pointer conversion
+    /// needed at all.
+    FreeFunction(String),
+    /// The slot's real target is a recovered class method.
+    /// `render_functions_source` synthesizes `trampoline_name` as a
+    /// small, real, static free function in `functions.cpp` that
+    /// forwards to the real method call (the exact reverse of what
+    /// `symtab.rs`'s own call-site rewriting already does) -- a real,
+    /// portable, plain function pointer this slot's own symbol binds to
+    /// instead of the method itself.
+    Method {
+        trampoline_name: String,
+        owner: String,
+        method_name: String,
+        return_type: String,
+        params: String,
+    },
 }
 
 /// One data symbol's classification, together with what real observation
@@ -201,6 +232,16 @@ fn vtable_slot0_function(graph: &KnowledgeGraph, class_name: &str) -> Option<Str
         })
 }
 
+/// A vtable-slot trampoline's own deterministic name (PROJECT.md M18.3)
+/// -- computed the same way everywhere it's needed (here, and again in
+/// `extract.rs` when deduplicating the actual `VtableTrampoline` specs
+/// to emit) so the two never drift apart. `owner`/`method_name` are
+/// always valid C++ identifiers already (a real class name, a real
+/// `FUN_<addr>`/recovered method name), so no sanitizing is needed.
+pub(crate) fn vtable_trampoline_name(owner: &str, method_name: &str) -> String {
+    format!("{owner}__vtable_trampoline_{method_name}")
+}
+
 /// Whether `address` is a real, Ghidra-recognized function -- present via
 /// `calling_convention`, a fact `ExtractFacts.py` only ever emits for a
 /// genuine `Function` object, never for data.
@@ -281,12 +322,27 @@ pub fn classify_data_symbol(graph: &KnowledgeGraph, symbol_name: &str, table: &S
             facts.push(format!("has_vtable_at({class_name}) + 0x10 == {address}"));
             let slot0 = vtable_slot0_function(graph, &class_name);
             let target = slot0.as_deref().and_then(|addr| table.get(addr)).and_then(|sym| match sym.kind {
-                SymbolKind::FreeFunction => Some(sym.display_name.clone()),
-                // A Method/Constructor/Destructor's address can't be
-                // stored as a plain function pointer the way this vtable
-                // slot idiom needs (Itanium member-function pointers are
-                // a different, larger representation) -- null is the
-                // honest choice here, not a wrong-shaped reference.
+                SymbolKind::FreeFunction => Some(VtableSlotTarget::FreeFunction(sym.display_name.clone())),
+                // PROJECT.md M18.3: unlike a free function, `&Class::method`
+                // is a pointer-to-member, not a plain code pointer -- see
+                // `VtableSlotTarget::Method`'s own doc comment. A real,
+                // synthesized trampoline (emitted once per unique
+                // owner+method pair by `extract.rs`) closes that gap
+                // without ever faking a member-function-pointer
+                // conversion.
+                SymbolKind::Method => Some(VtableSlotTarget::Method {
+                    trampoline_name: vtable_trampoline_name(&sym.owner, &sym.display_name),
+                    owner: sym.owner.clone(),
+                    method_name: sym.display_name.clone(),
+                    return_type: sym.return_type.clone(),
+                    params: sym.raw_params.clone(),
+                }),
+                // A Constructor/Destructor's address is never a real
+                // Itanium vtable slot value (constructors/destructors
+                // aren't virtual, and a real destructor *would* need its
+                // own, differently-shaped ABI thunk this module doesn't
+                // attempt) -- null is the honest choice, not a
+                // wrong-shaped reference.
                 _ => None,
             });
             if let Some(addr) = &slot0 {
@@ -586,17 +642,21 @@ mod tests {
 
         assert_eq!(
             resolution.kind,
-            DataSymbolKind::VtableData { class_name: "Food".to_string(), slot0_target: Some("draw".to_string()) }
+            DataSymbolKind::VtableData {
+                class_name: "Food".to_string(),
+                slot0_target: Some(VtableSlotTarget::FreeFunction("draw".to_string())),
+            }
         );
         assert_eq!(resolution.confidence, 1.0);
     }
 
-    /// The real, confirmed case: `PTR_FUN_140009a00`'s own slot-0 target
-    /// (0x1400018ca) is a recovered *method*, not a free function -- no
-    /// safe plain-function-pointer representation, so this must stay
-    /// `None` rather than emit something that won't compile.
+    /// PROJECT.md M18.3: the real, confirmed case -- `PTR_FUN_140009a00`'s
+    /// own slot-0 target (0x1400018ca) is a recovered *method*, not a
+    /// free function. Must resolve to a real `Method` target (a
+    /// synthesized trampoline, never a bare function-pointer conversion
+    /// of `&Food::draw`, which isn't portable C++ at all).
     #[test]
-    fn a_vtable_slot_targeting_a_method_gets_no_function_pointer_representation() {
+    fn a_vtable_slot_targeting_a_method_resolves_to_a_trampoline_target() {
         use crate::model::{RecoveredClass, RecoveredMethod};
 
         let mut graph = KnowledgeGraph::new();
@@ -614,7 +674,7 @@ mod tests {
                 display_name: "draw".to_string(),
                 name_source: NameSource::Raw,
                 return_type: "void".to_string(),
-                params: String::new(),
+                params: "int param_2".to_string(),
                 is_constructor: false,
                 is_destructor: false,
                 receiver_alias: None,
@@ -628,7 +688,16 @@ mod tests {
 
         assert_eq!(
             resolution.kind,
-            DataSymbolKind::VtableData { class_name: "Food".to_string(), slot0_target: None }
+            DataSymbolKind::VtableData {
+                class_name: "Food".to_string(),
+                slot0_target: Some(VtableSlotTarget::Method {
+                    trampoline_name: "Food__vtable_trampoline_draw".to_string(),
+                    owner: "Food".to_string(),
+                    method_name: "draw".to_string(),
+                    return_type: "void".to_string(),
+                    params: "int param_2".to_string(),
+                }),
+            }
         );
     }
 

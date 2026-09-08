@@ -926,6 +926,65 @@ fn a_data_pointer_aliases_own_target_is_transitively_collected_and_classified() 
     );
 }
 
+/// PROJECT.md M18.3: the real, confirmed case -- `Wall`'s own vtable
+/// slot 0 targets a recovered method (`FUN_140002f4e`), not a free
+/// function. `extract()` must synthesize a real trampoline, expose it
+/// via `program.vtable_trampolines`, and bind the vtable-slot data
+/// symbol to it (never to `&Wall::FUN_140002f4e` itself, which C++
+/// doesn't give a plain function-pointer representation at all).
+#[test]
+fn a_vtable_slot_targeting_a_method_gets_a_real_trampoline_end_to_end() {
+    let mut graph = KnowledgeGraph::new();
+    graph.add_observation("Wall", "has_vtable_at", "0x140009a10", 1.0, "ghidra:vtable", None);
+    graph.add_observation("Wall", "has_virtual_method", "slot 0: 0x1", 0.95, "ghidra:vtable", None);
+
+    graph.add_observation("0x1", "has_name", "FUN_1", 0.95, "ghidra:function", None);
+    graph.add_observation(
+        "0x1",
+        "decompiles_to",
+        "void __thiscall Wall::FUN_1(Wall *this,int param_2)\n\n{\n  return;\n}",
+        0.95,
+        "ghidra:decompiler",
+        None,
+    );
+    graph.add_observation("0x1", "is_method_of", "Wall", 0.95, "ghidra:function", None);
+
+    // The constructor writing its own vtable-pointer slot -- the real
+    // idiom that surfaces this: `*param_1 = &PTR_FUN_140009a20;`.
+    graph.add_observation("0x2", "has_name", "Wall", 0.95, "ghidra:function", None);
+    graph.add_observation(
+        "0x2",
+        "decompiles_to",
+        "void __thiscall Wall::Wall(Wall *this)\n\n{\n  undefined8 *param_1;\n  param_1 = (undefined8 *)this;\n  *param_1 = &PTR_FUN_140009a20;\n  return;\n}",
+        0.95,
+        "ghidra:decompiler",
+        None,
+    );
+    graph.add_observation("0x2", "is_constructor_of", "Wall", 0.95, "ghidra:function", None);
+
+    graph.add_observation("0x140009a20", "data_pointee", "0x1 (reference)", 0.95, "ghidra:data", None);
+
+    let program = extract(&graph);
+
+    assert_eq!(program.vtable_trampolines.len(), 1, "{:?}", program.vtable_trampolines);
+    let trampoline = &program.vtable_trampolines[0];
+    assert_eq!(trampoline.owner, "Wall");
+    assert_eq!(trampoline.method_name, "FUN_1");
+
+    let resolution = program.data_resolutions.iter().find(|r| r.symbol_name == "PTR_FUN_140009a20").unwrap();
+    match &resolution.kind {
+        debura_recovery::DataSymbolKind::VtableData {
+            slot0_target: Some(debura_recovery::VtableSlotTarget::Method { trampoline_name, .. }),
+            ..
+        } => assert_eq!(trampoline_name, &trampoline.name),
+        other => panic!("expected VtableData with a Method target, got {other:?}"),
+    }
+
+    // `functions.cpp` calls into Wall from inside the trampoline body --
+    // it must #include Wall.hpp.
+    assert!(program.function_references.contains(&"Wall".to_string()), "{:?}", program.function_references);
+}
+
 /// PROJECT.md M18.3: the real, confirmed case a link run found -- a
 /// recovered function calls `FUN_1400065c0`, a real, compiled sized-delete
 /// forwarding thunk (M15's library-glue exclusion correctly keeps it out

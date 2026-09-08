@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 
 use crate::compat::GHIDRA_COMPAT_HEADER_NAME;
-use crate::data_symbols::{DataResolution, DataSymbolKind};
+use crate::data_symbols::{DataResolution, DataSymbolKind, VtableSlotTarget};
 
 /// Filename the per-program Ghidra data-symbol declarations are written
 /// under, and the name every generated `.cpp` includes it by. Always
@@ -54,6 +54,24 @@ pub fn render_function_declarations(functions: &[(String, String, String)]) -> S
     let mut out = String::new();
     for (return_type, name, params) in functions {
         out.push_str(&format!("{return_type} {name}({params});\n"));
+    }
+    out
+}
+
+/// PROJECT.md M18.3: a real compile found the same forward-declaration
+/// gap `render_function_declarations` already exists to close applies to
+/// a vtable-slot trampoline too -- `functions.cpp` defines it, but this
+/// header's own pointer-alias line (which binds a vtable slot's symbol
+/// to it) is included *first*, in every generated file, well before
+/// `functions.cpp` is even compiled as its own translation unit.
+/// `extern "C"` matches `render_vtable_trampoline`'s own definition (a
+/// declaration and its definition must agree on linkage, or the linker
+/// looks for two different symbols).
+pub fn render_vtable_trampoline_declarations(trampolines: &[crate::model::VtableTrampoline]) -> String {
+    let mut out = String::new();
+    for t in trampolines {
+        let params = if t.params.trim().is_empty() { String::new() } else { format!(",{}", t.params) };
+        out.push_str(&format!("extern \"C\" {} {}(void *debura_this{});\n", t.return_type, t.name, params));
     }
     out
 }
@@ -251,8 +269,16 @@ fn render_pointer_alias_line(symbol: &str, resolution: Option<&DataSymbolKind>) 
         Some(DataSymbolKind::FunctionPointerAlias { target_function }) => {
             format!("void *{symbol} = (void *)&{target_function};\n")
         }
-        Some(DataSymbolKind::VtableData { slot0_target: Some(target), .. }) => {
+        Some(DataSymbolKind::VtableData { slot0_target: Some(VtableSlotTarget::FreeFunction(target)), .. }) => {
             format!("void *{symbol} = (void *)&{target};\n")
+        }
+        Some(DataSymbolKind::VtableData { slot0_target: Some(VtableSlotTarget::Method { trampoline_name, .. }), .. }) => {
+            // `functions.cpp` already emits `trampoline_name` as a real,
+            // plain (non-member) function -- see
+            // `VtableSlotTarget::Method`'s own doc comment -- so this
+            // binds exactly like a `FreeFunction` target once that
+            // trampoline exists.
+            format!("void *{symbol} = (void *)&{trampoline_name};\n")
         }
         Some(DataSymbolKind::DataPointerAlias { target_symbol }) => {
             // `unsigned char *`, not `void *` -- unlike
@@ -556,5 +582,52 @@ mod tests {
         let target_pos = header.find("PTR_cout_14000f688 = ").expect("target's own definition present");
         let alias_pos = header.find("PTR_PTR_cout_1400096e0 = ").expect("alias present");
         assert!(target_pos < alias_pos, "target must be defined before its address is taken:\n{header}");
+    }
+
+    /// PROJECT.md M18.3: the real, confirmed case a real link found --
+    /// a vtable-slot trampoline is defined in `functions.cpp`, but this
+    /// header's own pointer-alias line binding a vtable slot to it is
+    /// included *first*, in every generated file, well before
+    /// `functions.cpp` is compiled. Its own forward declaration must be
+    /// threaded through the same `function_declarations` text
+    /// `write.rs` already builds for ordinary recovered functions.
+    #[test]
+    fn a_vtable_trampoline_declaration_is_visible_before_the_pointer_alias_uses_it() {
+        let trampolines = vec![crate::model::VtableTrampoline {
+            name: "Wall__vtable_trampoline_FUN_140002f4e".to_string(),
+            owner: "Wall".to_string(),
+            method_name: "FUN_140002f4e".to_string(),
+            return_type: "undefined".to_string(),
+            params: "longlong param_2".to_string(),
+        }];
+        let declarations = render_vtable_trampoline_declarations(&trampolines);
+        assert_eq!(
+            declarations,
+            "extern \"C\" undefined Wall__vtable_trampoline_FUN_140002f4e(void *debura_this,longlong param_2);\n"
+        );
+
+        let symbols = vec!["PTR_FUN_140009a20".to_string()];
+        let resolutions = vec![DataResolution {
+            address: "0x140009a20".to_string(),
+            symbol_name: "PTR_FUN_140009a20".to_string(),
+            kind: DataSymbolKind::VtableData {
+                class_name: "Wall".to_string(),
+                slot0_target: Some(VtableSlotTarget::Method {
+                    trampoline_name: "Wall__vtable_trampoline_FUN_140002f4e".to_string(),
+                    owner: "Wall".to_string(),
+                    method_name: "FUN_140002f4e".to_string(),
+                    return_type: "undefined".to_string(),
+                    params: "longlong param_2".to_string(),
+                }),
+            },
+            source_facts: vec![],
+            confidence: 1.0,
+        }];
+
+        let header = render_ghidra_symbols_header_resolved(&symbols, &resolutions, &[], &declarations);
+
+        let decl_pos = header.find("extern \"C\" undefined Wall__vtable_trampoline_FUN_140002f4e").unwrap();
+        let use_pos = header.find("PTR_FUN_140009a20 = ").expect("pointer alias present");
+        assert!(decl_pos < use_pos, "the trampoline must be declared before its address is taken:\n{header}");
     }
 }
