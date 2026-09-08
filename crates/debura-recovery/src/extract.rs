@@ -855,7 +855,15 @@ fn extract_impl(
     // `find_references` can actually see, the same way it already finds
     // a class name mentioned in a signature) and the ghidra_data_symbols
     // scan need the rewritten text, not Ghidra's raw pseudocode.
-    let symbol_table = crate::symtab::build_symbol_table(&classes, &functions);
+    let mut symbol_table = crate::symtab::build_symbol_table(&classes, &functions);
+    // PROJECT.md M18.3: a real forwarding thunk (`forwarding_thunk.rs`)
+    // is never independently recovered as its own function -- M15's
+    // library-glue exclusion correctly keeps it out of `classes`/
+    // `functions` above -- but a real call site elsewhere still needs an
+    // entry to resolve against. Added after the real symbol table is
+    // built, and never overwrites an address that already has one: a
+    // real, recovered class method/function always wins.
+    crate::forwarding_thunk::add_forwarding_thunks(graph, &mut symbol_table);
     let mut unresolved_calls: BTreeSet<String> = BTreeSet::new();
     for class in &mut classes {
         for m in &mut class.methods {

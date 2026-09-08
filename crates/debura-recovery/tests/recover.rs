@@ -926,6 +926,58 @@ fn a_data_pointer_aliases_own_target_is_transitively_collected_and_classified() 
     );
 }
 
+/// PROJECT.md M18.3: the real, confirmed case a link run found -- a
+/// recovered function calls `FUN_1400065c0`, a real, compiled sized-delete
+/// forwarding thunk (M15's library-glue exclusion correctly keeps it out
+/// of `recovered/` as its own function -- there's no `FUN_1400065c0`
+/// definition anywhere in this test's own graph, matching the real
+/// project exactly). The call site must rewrite directly to
+/// `operator_delete`, with the exact argument transform the thunk's own
+/// body performs, not stay an unresolvable `FUN_1400065c0` reference.
+#[test]
+fn a_call_site_to_a_real_forwarding_thunk_resolves_directly_to_its_canonical_target() {
+    let mut graph = KnowledgeGraph::new();
+    graph.add_observation("0x1", "has_name", "FUN_1", 0.95, "ghidra:function", None);
+    graph.add_observation(
+        "0x1",
+        "decompiles_to",
+        "void FUN_1(void *param_1,longlong param_2)\n\n{\n  FUN_1400065c0(0,param_1,param_2);\n  return;\n}",
+        0.95,
+        "ghidra:decompiler",
+        None,
+    );
+    anchor_as_application(&mut graph, "0x1", "0x100");
+
+    // The thunk itself -- never independently recovered (no `has_name`/
+    // anchoring at all, matching the real project, where it has no
+    // accepted semantic_role and no Application-provenance anchor of its
+    // own), but its `decompiles_to` fact is enough for
+    // `add_forwarding_thunks` to find it.
+    graph.add_observation(
+        "0x1400065c0",
+        "decompiles_to",
+        "void FUN_1400065c0(undefined8 param_1,void *param_2,longlong param_3)\n\n{\n  operator_delete(param_2,param_3 * 8);\n  return;\n}",
+        0.95,
+        "ghidra:decompiler",
+        None,
+    );
+
+    let program = extract(&graph);
+    let function = program.functions.iter().find(|f| f.address == "0x1").unwrap();
+
+    assert!(
+        function.decompilation.contains("operator_delete(param_1,(param_2) * 8)"),
+        "{}",
+        function.decompilation
+    );
+    assert!(!function.decompilation.contains("FUN_1400065c0"), "{}", function.decompilation);
+    assert!(program.unresolved_calls.is_empty(), "{:?}", program.unresolved_calls);
+    // The thunk itself must never appear as its own recovered function --
+    // this is a rewrite of *call sites*, not a bypass of M15's own
+    // library-glue exclusion.
+    assert!(program.functions.iter().all(|f| f.address != "0x1400065c0"));
+}
+
 /// A real compile hit `*_refptr_...` (dereferencing the symbol directly)
 /// failing with "invalid type argument of unary '*'" against a plain
 /// byte declaration -- `_refptr_*` specifically means a synthesized

@@ -18,6 +18,30 @@ pub enum SymbolKind {
     Method,
     Constructor,
     Destructor,
+    /// PROJECT.md M18.3: a real, compiled forwarding thunk (see
+    /// `forwarding_thunk.rs`) -- never independently recovered as its
+    /// own function, but a real call site elsewhere still needs to
+    /// resolve through it. `RecoveredSymbol::canonical_target` and
+    /// `argument_mapping` carry what a `FreeFunction`/`Method`/etc.
+    /// entry doesn't need at all.
+    ForwardingThunk,
+}
+
+/// One canonical-target argument's real source for a `ForwardingThunk`
+/// entry -- see `forwarding_thunk.rs`'s own doc comment for the full
+/// reasoning; defined here (not there) since `RecoveredSymbol` needs it
+/// and `forwarding_thunk.rs` already depends on this module for
+/// `SymbolTable`/`SymbolKind`, so the reverse dependency would cycle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArgumentMapping {
+    pub source_param_index: usize,
+    pub transform: Option<ArgTransform>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArgTransform {
+    Multiply(u64),
+    ShiftLeft(u64),
 }
 
 #[derive(Debug, Clone)]
@@ -50,6 +74,14 @@ pub struct RecoveredSymbol {
     /// the callee's declared type, the same principle this module
     /// already applies to a method call's own receiver.
     pub param_types: Vec<String>,
+    /// `ForwardingThunk` only -- the real runtime symbol a call site
+    /// naming this address actually rewrites to (`display_name` is set
+    /// to the same value, for anything that only ever reads that field
+    /// generically). Empty for every other kind.
+    pub canonical_target: String,
+    /// `ForwardingThunk` only -- see `forwarding_thunk.rs`. Empty for
+    /// every other kind.
+    pub argument_mapping: Vec<ArgumentMapping>,
 }
 
 /// Counts a recovered signature's own parameters -- `""`/`"void"` mean
@@ -123,7 +155,15 @@ pub fn build_symbol_table(classes: &[RecoveredClass], functions: &[RecoveredFunc
             let expected_args = if m.is_destructor { 1 } else { count_params(&m.params) + 1 };
             table.insert(
                 m.address.clone(),
-                RecoveredSymbol { kind, owner: class.name.clone(), display_name, expected_args, param_types: Vec::new() },
+                RecoveredSymbol {
+                    kind,
+                    owner: class.name.clone(),
+                    display_name,
+                    expected_args,
+                    param_types: Vec::new(),
+                    canonical_target: String::new(),
+                    argument_mapping: Vec::new(),
+                },
             );
         }
     }
@@ -136,6 +176,8 @@ pub fn build_symbol_table(classes: &[RecoveredClass], functions: &[RecoveredFunc
                 display_name: f.display_name.clone(),
                 expected_args: count_params(&f.params),
                 param_types: param_types(&f.params),
+                canonical_target: String::new(),
+                argument_mapping: Vec::new(),
             },
         );
     }
@@ -363,6 +405,31 @@ pub fn rewrite_call_sites(text: &str, table: &SymbolTable, unresolved: &mut BTre
                 SymbolKind::Destructor => {
                     let ptr_expr = args.first().cloned().unwrap_or_else(|| "nullptr".to_string());
                     out.push_str(&format!("(({} *)({}))->~{}()", sym.owner, ptr_expr, sym.owner));
+                }
+                // PROJECT.md M18.3: a real, compiled forwarding thunk
+                // (see `forwarding_thunk.rs`) -- rewritten directly to
+                // the real target it forwards to, applying the exact
+                // same (bounded, deterministic) argument transform its
+                // own body performs, so the call site never needs the
+                // thunk's own address to exist as a real function at
+                // all.
+                SymbolKind::ForwardingThunk => {
+                    let mapped: Vec<String> = sym
+                        .argument_mapping
+                        .iter()
+                        .map(|m| {
+                            let base = args.get(m.source_param_index).cloned().unwrap_or_default();
+                            match m.transform {
+                                Some(ArgTransform::Multiply(n)) => format!("({base}) * {n}"),
+                                Some(ArgTransform::ShiftLeft(n)) => format!("({base}) << {n}"),
+                                None => base,
+                            }
+                        })
+                        .collect();
+                    out.push_str(&sym.canonical_target);
+                    out.push('(');
+                    out.push_str(&mapped.join(","));
+                    out.push(')');
                 }
             },
             None => {

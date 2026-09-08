@@ -13,6 +13,7 @@ mod crt_boundary;
 mod data_symbols;
 mod disposition;
 mod extract;
+mod forwarding_thunk;
 mod frontier;
 mod model;
 mod render;
