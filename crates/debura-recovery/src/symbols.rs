@@ -10,16 +10,18 @@ pub const GHIDRA_SYMBOLS_HEADER_NAME: &str = "ghidra_symbols.hpp";
 /// name a recovered body references, so the symbol at least resolves.
 /// The real type (and value) at that address isn't known, and restoring
 /// it needs real data extraction from Ghidra that doesn't exist yet --
-/// this only makes the *name* usable. A generic byte works for `DAT_*`/
-/// `PTR_*` (an arithmetic operand implicitly converts from a byte the
-/// same as any other numeric type; a vtable-pointer-slot assignment
-/// pattern gets an explicit cast inserted at the call site instead of
-/// needing the exact pointer type here, see `patch_known_idioms`), but
-/// `_refptr_*` specifically means "a synthesized pointer to a relocated
-/// global" in Ghidra's own naming convention, and is always seen
-/// *dereferenced* (`*_refptr_...`) -- a real compile confirmed a plain
-/// byte there fails with "invalid type argument of unary '*'", so this
-/// one family needs to be declared as a pointer.
+/// this only makes the *name* usable. A generic byte works for `DAT_*`
+/// (an arithmetic operand implicitly converts from a byte the same as
+/// any other numeric type; a vtable-pointer-slot assignment pattern gets
+/// an explicit cast inserted at the call site instead of needing the
+/// exact pointer type here, see `patch_known_idioms`), but `PTR_*` and
+/// `_refptr_*` both specifically mean "this address holds a pointer" in
+/// Ghidra's own naming convention (a plain data byte doesn't), and both
+/// are seen *dereferenced* (`*PTR_DAT_...`, `*_refptr_...`) -- a real
+/// compile confirmed a plain byte there fails two different ways
+/// (`_refptr_*`: "invalid type argument of unary '*'"; `PTR_*`, same
+/// error, found later against a different real body), so both families
+/// need to be declared as pointers.
 /// `unresolved_calls` are call-site names (`FUN_x`, `thunk_FUN_x`) M15's
 /// symbol-resolution pass (`symtab.rs`) couldn't match to any recovered
 /// class method or standalone function -- Debura found no definition for
@@ -78,7 +80,7 @@ pub fn render_ghidra_symbols_header(
         out.push('\n');
     }
     for symbol in symbols {
-        if symbol.starts_with("_refptr_") {
+        if symbol.starts_with("_refptr_") || symbol.starts_with("PTR_") {
             out.push_str(&format!("extern unsigned char *{symbol};\n"));
         } else {
             out.push_str(&format!("extern unsigned char {symbol};\n"));

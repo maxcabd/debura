@@ -605,6 +605,20 @@ fn refptr_symbols_are_declared_as_pointers_not_plain_bytes() {
     );
 }
 
+/// PROJECT.md M17 (compile-viability pass): a real compile hit this --
+/// `*PTR_DAT_1400096a0` (dereferencing a `PTR_*`-prefixed symbol, Ghidra's
+/// own naming convention for "this address holds a pointer") against a
+/// plain `unsigned char` declaration fails with "invalid type argument of
+/// unary '*'", the same failure `_refptr_*` was already fixed for.
+#[test]
+fn ptr_prefixed_symbols_are_declared_as_pointers_too() {
+    let header = render_ghidra_symbols_header(&["PTR_DAT_1400096a0".to_string()], &[], "");
+    assert!(
+        header.contains("extern unsigned char *PTR_DAT_1400096a0;"),
+        "header:\n{header}"
+    );
+}
+
 /// A compact sanity check that the compat header actually declares what
 /// this session's real compile attempt against the Snake fixture showed
 /// was missing -- not exhaustive, just a guard against silently deleting
