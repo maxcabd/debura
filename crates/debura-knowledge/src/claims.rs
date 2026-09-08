@@ -243,10 +243,37 @@ fn classify_provenance_bounded(
     // not after: `Screen::init`'s own callees are almost entirely SDL/TTF
     // imports (real library calls), so dominance alone would misclassify
     // it as library, not just leave it Unknown.
-    if let Some(body) = latest_decompilation(graph, subject) {
-        if let Some(param) = first_param_name(&body) {
-            if distinct_param_slots_accessed(&body, &param) >= MIN_OWN_STATE_SLOTS {
-                return Provenance::Application;
+    //
+    // The own-state check alone isn't enough, though: a real run found it
+    // firing on plain STL container internals too (`std::vector`'s
+    // `push_back` growth path touches its own begin/end/capacity fields
+    // the same structural way) -- accessing several of your own fields
+    // isn't unique to application code. What *is* distinctive about
+    // `Screen::init`/`close` is that they reach a real import through a
+    // genuine thunk -- a tiny, single-callee forwarding stub (Ghidra's
+    // own `SDL_RenderClear` wrapper is a real, observed case: 6 bytes,
+    // one call, straight to the import) -- while the vector internals'
+    // own callees are real, multi-statement STL functions with actual
+    // branching logic, never thunk-shaped, however many hops they are
+    // from an eventual `operator_new`/`malloc`. Requiring the callee to
+    // thunk-resolve to an import specifically (not just "is somewhere in
+    // a chain that eventually reaches one", which almost any code
+    // technically is) is what keeps this from re-admitting exactly the
+    // library-leakage case the M17 provenance gate was built to close.
+    if let Some(decompilation) = latest_decompilation(graph, subject) {
+        if let Some(param) = first_param_name(&decompilation) {
+            // Body only, not the full text: the parameter's own
+            // declaration (`TYPE *param_1`) contains the same `*param_1`
+            // substring `distinct_param_slots_accessed`'s bare-dereference
+            // case matches, which would otherwise count every pointer-
+            // typed subject's own signature as a spurious extra slot.
+            if let Some(body_start) = decompilation.find('{') {
+                let body = &decompilation[body_start..];
+                if distinct_param_slots_accessed(body, &param) >= MIN_OWN_STATE_SLOTS
+                    && calls_something_that_thunks_to_an_import(graph, subject)
+                {
+                    return Provenance::Application;
+                }
             }
         }
     }
@@ -373,6 +400,46 @@ fn distinct_param_slots_accessed(body: &str, param_name: &str) -> usize {
     }
 
     slots.len()
+}
+
+/// How many thunk-hops to follow looking for a real import before giving
+/// up. 3 comfortably covers a real observed case (`Screen::init` calling
+/// one Ghidra-named wrapper -- itself a 1-hop thunk straight to the
+/// import) without walking so far that it starts crediting a subject for
+/// an import buried deep in an unrelated call chain.
+const MAX_IMPORT_THUNK_DEPTH: u32 = 3;
+
+/// Whether any of `subject`'s own direct callees resolves, through a
+/// chain of pure thunks (see `thunk_target`), to a real imported symbol.
+/// Deliberately narrower than "is this callee's own provenance
+/// `LibraryOrRuntime`" (which `distinct_param_slots_accessed`'s own
+/// caller can't use without re-opening the exact false positive it was
+/// built to close): a real compiled `std::vector::push_back` growth path
+/// also touches several of its own fields, but its callees are genuine,
+/// multi-statement STL functions -- never thunk-shaped, however many
+/// hops they are from an eventual allocator call. A real, directly-
+/// imported API call, by contrast, is reached through a *thunk* -- a
+/// tiny, single-callee forwarding stub, the exact shape Ghidra's own
+/// `SDL_RenderClear` wrapper has (6 bytes, one call, straight to the
+/// import).
+fn calls_something_that_thunks_to_an_import(graph: &KnowledgeGraph, subject: &str) -> bool {
+    graph
+        .observations()
+        .filter(|o| o.subject == subject && o.predicate == "calls")
+        .any(|o| thunks_to_an_import(graph, &o.value, MAX_IMPORT_THUNK_DEPTH))
+}
+
+fn thunks_to_an_import(graph: &KnowledgeGraph, addr: &str, depth: u32) -> bool {
+    if graph.observations().any(|o| o.subject == addr && o.predicate == "imports") {
+        return true;
+    }
+    if depth == 0 {
+        return false;
+    }
+    match thunk_target(graph, addr) {
+        Some(target) => thunks_to_an_import(graph, &target, depth - 1),
+        None => false,
+    }
 }
 
 /// How much of `subject`'s own behavior, by call composition, is really
@@ -638,6 +705,100 @@ mod tests {
         }
 
         assert_eq!(classify_provenance(&graph, "0x1"), Provenance::Application);
+    }
+
+    /// The real shape this signal actually has to handle: Ghidra's own
+    /// `SDL_RenderClear`-style wrapper is a genuine 1-hop *thunk* (a
+    /// tiny, single-callee forwarding stub), not a direct call to the
+    /// import itself -- confirmed against the real recovered binary.
+    #[test]
+    fn own_state_plus_a_thunked_import_call_is_application() {
+        let mut graph = KnowledgeGraph::new();
+        graph.add_observation("0x1", "has_name", "FUN_1", 0.95, "ghidra:function", None);
+        graph.add_observation(
+            "0x1",
+            "decompiles_to",
+            "void FUN_1(longlong *param_1)\n\n{\n  param_1[0] = SDL_RenderClear();\n  param_1[1] = 2;\n  return;\n}",
+            0.95,
+            "ghidra:decompiler",
+            None,
+        );
+        graph.add_observation("0x1", "calls", "0xthunk", 0.95, "ghidra:call_graph", None);
+        // The thunk itself: one callee, tiny body, straight to the import.
+        graph.add_observation("0xthunk", "size_bytes", "6", 0.95, "ghidra:function", None);
+        graph.add_observation("0xthunk", "calls", "0xreal_import", 0.95, "ghidra:call_graph", None);
+        graph.add_observation("0xreal_import", "imports", "SDL2.DLL!SDL_RenderClear", 1.0, "ghidra:imports", None);
+
+        assert_eq!(classify_provenance(&graph, "0x1"), Provenance::Application);
+    }
+
+    /// The real false positive this refinement was built to close: a
+    /// compiled `std::vector::push_back` growth path (real, observed
+    /// shape) also touches 2 distinct fields of its own receiver
+    /// (begin/end iterators) -- but its callees are genuine, multi-
+    /// statement STL functions, never thunk-shaped, so this must NOT
+    /// resolve to Application just because *some* chain eventually
+    /// reaches an allocator.
+    #[test]
+    fn own_state_access_alone_does_not_rescue_a_generic_container_internal() {
+        let mut graph = KnowledgeGraph::new();
+        graph.add_observation("0x1", "has_name", "FUN_1", 0.95, "ghidra:function", None);
+        graph.add_observation(
+            "0x1",
+            "decompiles_to",
+            "void FUN_1(void **param_1,undefined8 param_2)\n\n{\n  \
+             if (param_1[1] == param_1[2]) {\n    FUN_2(param_1,param_2);\n  }\n  \
+             else {\n    param_1[1] = (void *)((longlong)param_1[1] + 8);\n  }\n  \
+             return;\n}",
+            0.95,
+            "ghidra:decompiler",
+            None,
+        );
+        graph.add_observation("0x1", "calls", "0x2", 0.95, "ghidra:call_graph", None);
+        // Not thunk-shaped: real logic, more than one callee, well above
+        // the thunk size bound -- and its own callees eventually reach an
+        // allocator, several real hops away, which must not count.
+        graph.add_observation("0x2", "size_bytes", "120", 0.95, "ghidra:function", None);
+        graph.add_observation("0x2", "calls", "0x3", 0.95, "ghidra:call_graph", None);
+        graph.add_observation("0x2", "calls", "0x4", 0.95, "ghidra:call_graph", None);
+        graph.add_observation("0x3", "size_bytes", "50", 0.95, "ghidra:function", None);
+        graph.add_observation("0x3", "calls", "0x5", 0.95, "ghidra:call_graph", None);
+        graph.add_observation("0x5", "imports", "MSVCRT.DLL!operator_new", 1.0, "ghidra:imports", None);
+
+        assert_eq!(classify_provenance(&graph, "0x1"), Provenance::Unknown);
+    }
+
+    /// A pointer-typed first parameter's own declaration (`int *param_1`)
+    /// contains the same `*param_1` substring the bare-dereference case
+    /// matches inside a real body -- an early version of this signal
+    /// scanned the *whole* decompilation text, including the header, so
+    /// every pointer-typed subject's own signature silently counted as
+    /// one extra slot access it never actually made. With a single real
+    /// body access plus that spurious header match, the own-state check
+    /// would have crossed the 2-slot bar and returned Application; scoped
+    /// to the body only, it correctly doesn't fire at all, leaving the
+    /// subject's provenance to fall through to the ordinary dominance
+    /// check below (a single callee that's 100% library -- correctly
+    /// LibraryOrRuntime, and unrelated to what this test is actually
+    /// checking).
+    #[test]
+    fn the_parameter_declarations_own_pointer_syntax_is_not_counted_as_a_body_access() {
+        let mut graph = KnowledgeGraph::new();
+        graph.add_observation("0x1", "has_name", "FUN_1", 0.95, "ghidra:function", None);
+        graph.add_observation(
+            "0x1",
+            "decompiles_to",
+            "void FUN_1(int *param_1)\n\n{\n  param_1[0] = 5;\n  return;\n}",
+            0.95,
+            "ghidra:decompiler",
+            None,
+        );
+        graph.add_observation("0x1", "calls", "0xthunk", 0.95, "ghidra:call_graph", None);
+        graph.add_observation("0xthunk", "size_bytes", "6", 0.95, "ghidra:function", None);
+        graph.add_observation("0xthunk", "calls", "0xreal_import", 0.95, "ghidra:call_graph", None);
+        graph.add_observation("0xreal_import", "imports", "SDL2.DLL!Thing", 1.0, "ghidra:imports", None);
+
+        assert_eq!(classify_provenance(&graph, "0x1"), Provenance::LibraryOrRuntime);
     }
 
     /// The other real half of the same case (Screen::clear, stripped to
