@@ -63,8 +63,10 @@ enum Stmt<'a> {
 /// confused by a differently-bracketed construct inside, e.g. a call's
 /// own parens while scanning for a brace) -- the same approach
 /// `symtab.rs`'s `matching_close_paren` already uses, generalized to
-/// either bracket pair since this module needs both.
-fn matching_close(text: &str, open: usize, open_ch: u8, close_ch: u8) -> Option<usize> {
+/// either bracket pair since this module needs both. `pub(crate)`:
+/// `return_forwarding.rs` needs the exact same brace-matching, not worth
+/// a third copy.
+pub(crate) fn matching_close(text: &str, open: usize, open_ch: u8, close_ch: u8) -> Option<usize> {
     let bytes = text.as_bytes();
     let mut depth = 0i32;
     for (i, &b) in bytes.iter().enumerate().skip(open) {

@@ -835,6 +835,13 @@ fn extract_impl(
     }
     functions.sort_by(|a, b| a.address.cmp(&b.address));
     disambiguate_function_names(&mut functions);
+    // PROJECT.md M18.3: a real, repeated pattern -- a pure return-
+    // forwarding wrapper Ghidra's own return-type inference left as the
+    // bare, uncommitted `undefined` placeholder. Corrects the return
+    // type and body wherever the real callee's own type is already
+    // known, before anything downstream (the symbol table, vtable
+    // trampoline signatures, call-site casting) reads either.
+    crate::return_forwarding::propagate_forwarded_return_types(&mut functions);
 
     // PROJECT.md M18: a real compile found a genuinely surprising
     // self-rewrite -- `rewrite_call_sites` used to run on the *whole*

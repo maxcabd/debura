@@ -17,6 +17,7 @@ mod forwarding_thunk;
 mod frontier;
 mod model;
 mod render;
+mod return_forwarding;
 mod symbols;
 mod symtab;
 mod write;
