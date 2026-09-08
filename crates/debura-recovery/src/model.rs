@@ -36,15 +36,6 @@ pub struct RecoveredMethod {
     pub params: String,
     pub is_constructor: bool,
     pub is_destructor: bool,
-    /// Whether `params` already excludes an explicit `this`-recognized
-    /// receiver (true), or -- a method M7's structural vtable detection
-    /// found, that Ghidra's own type system never recognized as a method
-    /// at all -- still includes it as an ordinary parameter like
-    /// `param_1` (false). `symtab.rs`'s `build_symbol_table` needs this
-    /// to compute a method's real call-site arity without double-
-    /// counting the receiver a call site's own leading argument always
-    /// supplies either way.
-    pub receiver_stripped: bool,
     /// Ghidra's decompiled body (PROJECT.md S31 doesn't specify how
     /// faithful the recovered body must be -- this is annotated decompiler
     /// output, not hand-lifted C++, and says so where it's rendered).

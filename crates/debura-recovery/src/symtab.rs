@@ -82,23 +82,8 @@ pub fn build_symbol_table(classes: &[RecoveredClass], functions: &[RecoveredFunc
             // Destructors take no parameters of their own by language
             // rule, regardless of what `m.params` says (Ghidra's own
             // signature parsing doesn't specially distinguish them) --
-            // only the this/ptr argument is ever expected. Otherwise, a
-            // call site's own leading argument always supplies the
-            // receiver -- but `m.params` only sometimes still contains
-            // it too, depending on whether Ghidra's own type system ever
-            // recognized this address as a method at all (see
-            // `RecoveredMethod::receiver_stripped`'s own doc comment). A
-            // real link found this wasn't previously tracked: adding 1
-            // unconditionally double-counted the receiver for every
-            // structurally-discovered method, and rejected all 3 of
-            // their real call sites as an arity mismatch.
-            let expected_args = if m.is_destructor {
-                1
-            } else if m.receiver_stripped {
-                count_params(&m.params) + 1
-            } else {
-                count_params(&m.params)
-            };
+            // only the this/ptr argument is ever expected.
+            let expected_args = if m.is_destructor { 1 } else { count_params(&m.params) + 1 };
             table.insert(
                 m.address.clone(),
                 RecoveredSymbol { kind, owner: class.name.clone(), display_name, expected_args },
@@ -323,10 +308,6 @@ mod tests {
     use super::*;
     use crate::model::{NameSource, RecoveredField, RecoveredMethod};
 
-    /// Models a Ghidra-*recognized* method: `params` excludes the
-    /// receiver (already stripped, matching a real `has_signature` like
-    /// `Class *this, int x`), so `build_symbol_table` must add it back
-    /// for the call-site arity check.
     fn method(
         address: &str,
         display_name: &str,
@@ -343,20 +324,7 @@ mod tests {
             params: params.to_string(),
             is_constructor,
             is_destructor,
-            receiver_stripped: true,
             decompilation: String::new(),
-        }
-    }
-
-    /// Models a method M7's *structural* vtable detection found, which
-    /// Ghidra's own type system never recognized as one at all: `params`
-    /// still includes the receiver as an ordinary leading parameter
-    /// (e.g. `param_1` in `longlong param_1, int x`), so
-    /// `build_symbol_table` must NOT add it back a second time.
-    fn structural_method(address: &str, display_name: &str, params: &str) -> RecoveredMethod {
-        RecoveredMethod {
-            receiver_stripped: false,
-            ..method(address, display_name, params, false, false)
         }
     }
 
@@ -432,26 +400,6 @@ mod tests {
         let rewritten = rewrite_call_sites("FUN_1(this,1);", &table, &mut unresolved);
         assert_eq!(rewritten, "FUN_1(this,1);");
         assert!(unresolved.contains("FUN_1"));
-    }
-
-    /// The real link failure this was fixed for: a structurally-
-    /// discovered method's own `params` still includes its receiver as
-    /// an ordinary `param_1` (Ghidra's type system never recognized it
-    /// as a method), so a real call site passing exactly that many raw
-    /// arguments (receiver included) must still resolve -- not be
-    /// rejected as an arity mismatch by double-counting the receiver.
-    #[test]
-    fn a_structurally_discovered_methods_own_receiver_is_not_double_counted() {
-        let classes = vec![class_with(
-            "Food",
-            vec![structural_method("0x1", "draw", "longlong param_1, longlong param_2")],
-        )];
-        let table = build_symbol_table(&classes, &[]);
-        let mut unresolved = BTreeSet::new();
-
-        let rewritten = rewrite_call_sites("FUN_1(local_c8,local_88);", &table, &mut unresolved);
-        assert_eq!(rewritten, "((Food *)(local_c8))->draw(local_88);");
-        assert!(unresolved.is_empty());
     }
 
     #[test]
