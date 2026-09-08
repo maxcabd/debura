@@ -40,6 +40,23 @@ pub enum DataSymbolKind {
     /// `ConstantData`/`MutableStaticData` would be) and this pointer,
     /// bound to its address.
     DataPointerAlias { target_symbol: String },
+    /// This address's own pointee is a real, well-known symbol the MinGW
+    /// toolchain's own linker provides at link time -- never fabricated
+    /// bytes, never a guess from this symbol's own name (only ever set
+    /// from the *pointee's* independently-observed type+section, the
+    /// same discipline `ExternalGlobalAlias`/`DataPointerAlias` already
+    /// follow). Currently recognizes exactly one real, structural case:
+    /// a pointee Ghidra typed `IMAGE_DOS_HEADER` in its own synthetic
+    /// "Headers" section -- the PE image's own DOS header, always at the
+    /// module's real load address, which every MinGW-linked binary
+    /// exposes as `__ImageBase`. Binding to the toolchain-provided symbol
+    /// (rather than emitting the *original* binary's own captured header
+    /// bytes) matters: a freshly linked binary's own image base
+    /// genuinely differs from the original's, so copying the old bytes
+    /// would be actively wrong, not just unhelpful -- the same reasoning
+    /// `crt_boundary` already applies to the binary's own CRT-startup
+    /// code.
+    RuntimeAlias { runtime_symbol: String, runtime_type: String },
     /// A real, bounded-size, initialized, non-pointer object with known
     /// content -- typically `.rdata` (read-only). Safe to emit its exact
     /// captured bytes: unlike an address-shaped value, raw content bytes
@@ -319,6 +336,24 @@ pub fn classify_data_symbol(graph: &KnowledgeGraph, symbol_name: &str, table: &S
             }
         } else if is_known_import(graph, target) {
             facts.push(format!("{target} is a known import"));
+        } else if single_value(graph, target, "data_type_name").as_deref() == Some("IMAGE_DOS_HEADER")
+            && single_value(graph, target, "data_section").as_deref() == Some("Headers")
+        {
+            // The PE image's own DOS header, at the module's real load
+            // address -- see `RuntimeAlias`'s own doc comment for why
+            // this binds to the toolchain-provided `__ImageBase` rather
+            // than emitting the original binary's own captured bytes.
+            facts.push(format!("{target} is this module's own real PE image base (IMAGE_DOS_HEADER, Headers section) -- binding to the toolchain-provided __ImageBase"));
+            return DataResolution {
+                address,
+                symbol_name: symbol_name.to_string(),
+                kind: DataSymbolKind::RuntimeAlias {
+                    runtime_symbol: "__ImageBase".to_string(),
+                    runtime_type: "IMAGE_DOS_HEADER".to_string(),
+                },
+                source_facts: facts,
+                confidence: 1.0,
+            };
         } else if let Some(pointee_symbol) = single_value(graph, target, "data_symbol_name") {
             // Not a known function or import, but Ghidra still gave this
             // address its own real name -- if it also has the same
@@ -656,6 +691,32 @@ mod tests {
         let resolution = classify_data_symbol(&graph, "PTR_DAT_140009700", &table);
 
         assert_eq!(resolution.kind, DataSymbolKind::ExternalGlobalAlias { pointee: "0x140007ad0".to_string() });
+    }
+
+    /// PROJECT.md M18.3: the real, confirmed case --
+    /// `PTR_IMAGE_DOS_HEADER_140009710`'s pointee is typed
+    /// `IMAGE_DOS_HEADER` in Ghidra's own synthetic "Headers" section --
+    /// the PE image's own DOS header, always at the module's real load
+    /// address. Must bind to the MinGW-provided `__ImageBase`, never
+    /// emit the *original* binary's own captured header bytes (a freshly
+    /// linked binary's own image base genuinely differs).
+    #[test]
+    fn an_image_dos_header_pointee_is_a_runtime_alias_to_image_base() {
+        let mut graph = KnowledgeGraph::new();
+        graph.add_observation("0x140009710", "data_pointee", "0x140000000 (reference)", 0.95, "ghidra:data", None);
+        graph.add_observation("0x140000000", "data_type_name", "IMAGE_DOS_HEADER", 0.95, "ghidra:data", None);
+        graph.add_observation("0x140000000", "data_section", "Headers", 0.95, "ghidra:data", None);
+
+        let table = SymbolTable::new();
+        let resolution = classify_data_symbol(&graph, "PTR_IMAGE_DOS_HEADER_140009710", &table);
+
+        assert_eq!(
+            resolution.kind,
+            DataSymbolKind::RuntimeAlias {
+                runtime_symbol: "__ImageBase".to_string(),
+                runtime_type: "IMAGE_DOS_HEADER".to_string(),
+            }
+        );
     }
 
     /// The real, confirmed case: `LAB_140001000`/`LAB_140003a80` are

@@ -1044,6 +1044,35 @@ fn known_crt_functions_called_by_real_name_get_a_permissive_fallback_declaration
     assert!(header.contains("long long _initterm(...);"), "header:\n{header}");
 }
 
+/// PROJECT.md M18.3: a real link found the previous test's own
+/// declaration wasn't enough -- with no `extern "C"`, a real g++ mangles
+/// it (`_ismbblead` compiled to `_Z10_ismbbleadz`), which can never match
+/// the plain C symbol the real, already-linked MinGW CRT import library
+/// actually exports. The call site compiled but stayed unresolved at
+/// link time -- a real, previously-undetected bug this test locks in.
+#[test]
+fn the_permissive_fallback_declaration_uses_c_linkage_so_it_can_match_the_real_crt_symbol() {
+    let mut graph = KnowledgeGraph::new();
+    graph.add_observation("0x1", "has_name", "FUN_1", 0.95, "ghidra:function", None);
+    graph.add_observation(
+        "0x1",
+        "decompiles_to",
+        "void FUN_1(void)\n\n{\n  _ismbblead(0);\n  return;\n}",
+        0.95,
+        "ghidra:decompiler",
+        None,
+    );
+    anchor_as_application(&mut graph, "0x1", "0x100");
+
+    let program = extract(&graph);
+    let header = render_ghidra_symbols_header(&program.ghidra_data_symbols, &program.unresolved_calls, "");
+
+    let extern_c_pos = header.find("extern \"C\" {").expect("extern \"C\" block present");
+    let decl_pos = header.find("long long _ismbblead(...);").expect("declaration present");
+    let close_pos = header[decl_pos..].find('}').map(|i| i + decl_pos).expect("closing brace present");
+    assert!(extern_c_pos < decl_pos && decl_pos < close_pos, "declaration must be inside the extern \"C\" block:\n{header}");
+}
+
 /// A real run showed `&LAB_x` isn't a goto target at all -- it's a
 /// MinGW CRT startup idiom taking a label's *address* as a function
 /// pointer value (`(_invalid_parameter_handler)&LAB_140001000`). Handled

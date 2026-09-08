@@ -139,6 +139,7 @@ pub fn render_ghidra_symbols_header_resolved(
                 DataSymbolKind::FunctionPointerAlias { .. }
                     | DataSymbolKind::VtableData { slot0_target: Some(_), .. }
                     | DataSymbolKind::DataPointerAlias { .. }
+                    | DataSymbolKind::RuntimeAlias { .. }
             )
         );
         if is_definition || is_pointer_alias {
@@ -179,6 +180,18 @@ pub fn render_ghidra_symbols_header_resolved(
                 // symbol ended up defined or left as a placeholder.
                 out.push_str(&format!("unsigned char *{symbol} = (unsigned char *)&{target_symbol};\n"));
             }
+            Some(DataSymbolKind::RuntimeAlias { runtime_symbol, runtime_type }) => {
+                // `runtime_symbol` is never one of `symbols` -- it's a
+                // fixed, toolchain-provided constant (currently only
+                // `__ImageBase`), not a Ghidra placeholder needing the
+                // generic collection/classification treatment, so its
+                // own declaration is emitted directly here rather than
+                // threaded through the bare-`extern` pass above.
+                // `extern "C"` so C++ name-mangling never hides the
+                // real, unmangled symbol the linker actually provides.
+                out.push_str(&format!("extern \"C\" {runtime_type} {runtime_symbol};\n"));
+                out.push_str(&format!("unsigned char *{symbol} = (unsigned char *)&{runtime_symbol};\n"));
+            }
             _ => {}
         }
     }
@@ -187,9 +200,21 @@ pub fn render_ghidra_symbols_header_resolved(
         out.push_str("// definition for at all -- not a class method, not a standalone\n");
         out.push_str("// function. Fully variadic so any call shape parses; still needs a\n");
         out.push_str("// real definition from somewhere before the program can link.\n");
+        // PROJECT.md M18.3: a real link found this declared without
+        // `extern \"C\"` gets C++-mangled (`_ismbblead` became
+        // `_Z10_ismbbleadz` in the compiled object) -- for a genuine
+        // MinGW CRT function like `_ismbblead`, that mangled name can
+        // never match the plain C symbol the real, already-linked CRT
+        // import library actually exports, so the declaration compiled
+        // but the call still failed at link time. A raw `FUN_<addr>`
+        // name (Debura's own placeholder, never a real overloaded C++
+        // function) is unaffected either way -- `extern \"C\"` is always
+        // the safe, correct choice here.
+        out.push_str("extern \"C\" {\n");
         for name in unresolved_calls {
             out.push_str(&format!("long long {name}(...);\n"));
         }
+        out.push_str("}\n");
     }
     out
 }
@@ -369,5 +394,33 @@ mod tests {
         // `void *` -- `'void*' is not a pointer-to-object type`.
         assert!(!header.contains("void *PTR_PTR_cout_1400096e0"), "{header}");
         assert!(header.contains("unsigned char *PTR_PTR_cout_1400096e0 = (unsigned char *)&PTR_cout_14000f688;"), "{header}");
+    }
+
+    /// The real, confirmed case: `__ImageBase` is a fixed,
+    /// toolchain-provided constant, never a member of `symbols` itself --
+    /// its own declaration must still appear (with the real type
+    /// `classify_data_symbol` recorded), and `extern "C"` so C++
+    /// name-mangling never hides the real, unmangled linker symbol.
+    #[test]
+    fn a_runtime_alias_declares_and_binds_to_its_toolchain_provided_symbol() {
+        let symbols = vec!["PTR_IMAGE_DOS_HEADER_140009710".to_string()];
+        let resolutions = vec![DataResolution {
+            address: "0x140009710".to_string(),
+            symbol_name: "PTR_IMAGE_DOS_HEADER_140009710".to_string(),
+            kind: DataSymbolKind::RuntimeAlias {
+                runtime_symbol: "__ImageBase".to_string(),
+                runtime_type: "IMAGE_DOS_HEADER".to_string(),
+            },
+            source_facts: vec![],
+            confidence: 1.0,
+        }];
+
+        let header = render_ghidra_symbols_header_resolved(&symbols, &resolutions, &[], "");
+
+        assert!(header.contains("extern \"C\" IMAGE_DOS_HEADER __ImageBase;"), "{header}");
+        assert!(
+            header.contains("unsigned char *PTR_IMAGE_DOS_HEADER_140009710 = (unsigned char *)&__ImageBase;"),
+            "{header}"
+        );
     }
 }
