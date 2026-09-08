@@ -582,6 +582,14 @@ def extract_data_objects(sym_table, mem, addr_factory, fm, ref_manager):
             addr = addr_iter.next()
             for ref in ref_manager.getReferencesFrom(addr):
                 to = ref.getToAddress()
+                if not to.isMemoryAddress():
+                    # A real run crashed on this: a STACK/register-space
+                    # "address" (Ghidra's own synthetic representation of
+                    # a local variable/register reference, not a real
+                    # binary location) isn't a data object at all --
+                    # `getReferencesTo` itself refuses to accept one
+                    # ("not supported for stack/register addresses").
+                    continue
                 if fm_get_function_at(to) is not None:
                     continue  # a real function entry point -- already covered by extract_functions
                 candidates.add(to)
@@ -626,11 +634,17 @@ def extract_data_objects(sym_table, mem, addr_factory, fm, ref_manager):
 
         pointee_address = None
         pointee_source = None
+        # `getReferencesFrom` returns a plain `Reference[]` array, not a
+        # Java iterator -- unlike `getReferencesTo` a few lines below,
+        # which really does return a `ReferenceIterator`. A real run
+        # crashed here on `.hasNext()` (an array has no such attribute);
+        # plain iteration is correct and works on both shapes.
         outgoing = ref_manager.getReferencesFrom(addr)
-        if outgoing.hasNext():
-            pointee_address = addr_str(outgoing.next().getToAddress())
+        for ref in outgoing:
+            pointee_address = addr_str(ref.getToAddress())
             pointee_source = "reference"
-        elif bytes_hex is not None and size == 8:
+            break
+        if pointee_address is None and bytes_hex is not None and size == 8:
             try:
                 raw_value = mem.getLong(addr)
                 candidate = resolve_pointer(mem, addr_factory, raw_value)
