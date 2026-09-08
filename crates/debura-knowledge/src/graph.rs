@@ -230,6 +230,23 @@ impl KnowledgeGraph {
         self.set_status(hypothesis, HypothesisStatus::Rejected)
     }
 
+    /// Backfills `rejection_reason` on a hypothesis REJECTED before that
+    /// field existed, when a caller has independently proven from another
+    /// real record (e.g. a `provenance_gate_rejected` observation with
+    /// matching subject/value) what the reason actually was. No-op unless
+    /// the hypothesis is REJECTED with no reason recorded yet -- never
+    /// overwrites a reason already on file. Returns whether it backfilled.
+    pub fn backfill_rejection_reason(&mut self, hypothesis: HypothesisId, reason: RejectionReason) -> bool {
+        match self.hypotheses.get(&hypothesis) {
+            Some(h) if h.status == HypothesisStatus::Rejected && h.rejection_reason.is_none() => {}
+            _ => return false,
+        }
+        if let Some(h) = self.hypotheses.get_mut(&hypothesis) {
+            h.rejection_reason = Some(reason);
+        }
+        true
+    }
+
     /// A deliberate, narrow exception to REJECTED's terminal status
     /// (PROJECT.md S4): moves `hypothesis` to STALE -- eligible for
     /// normal reevaluation, not silently resurrected straight to

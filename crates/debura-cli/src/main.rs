@@ -113,6 +113,19 @@ enum Command {
         /// `-` to read stdin)
         linker_log: PathBuf,
     },
+    /// Re-examine REJECTED semantic_role hypotheses whose rejection
+    /// premise has since changed (PROJECT.md M18): the provenance gate's
+    /// REJECTED verdict is a hard structural exclusion, correctly terminal
+    /// against the generic dependency cascade -- but `classify_provenance`
+    /// itself can gain a new signal, making an old rejection's premise
+    /// ("this subject's provenance isn't Application") no longer true.
+    /// Moves any such hypothesis to STALE (never straight back to
+    /// ACCEPTED) so the normal investigate/challenge pipeline decides it
+    /// fresh; does not itself call any AgentProvider.
+    Reconsider {
+        /// Project id, as printed by `debura new`
+        project: String,
+    },
     /// Run the autonomous loop
     Run {
         /// Project id, as printed by `debura new`
@@ -548,6 +561,23 @@ fn main() -> Result<()> {
             );
             for e in &deferred {
                 println!("  {} ({}){}", e.address, e.literal_name, if e.reachable { "" } else { " [unreachable]" });
+            }
+        }
+        Command::Reconsider { project } => {
+            let root = debura_core::config::projects_dir().join(&project);
+            anyhow::ensure!(root.is_dir(), "no such project: {project}");
+
+            let conn = debura_storage::init_project_db(&root.join("project.sqlite"))?;
+            let mut graph = debura_storage::knowledge::load(&conn)?;
+
+            let reconsidered = debura_verifier::reconsider_stale_provenance_rejections(&mut graph);
+
+            debura_storage::knowledge::save(&conn, &graph)?;
+
+            println!("Reconsidered: {}", reconsidered.len());
+            for id in &reconsidered {
+                let h = graph.hypothesis(*id).context("hypothesis vanished during reconsideration")?;
+                println!("  {id}: {} {} = {} (now {:?})", h.subject, h.predicate, h.value, h.status);
             }
         }
         Command::Run {
