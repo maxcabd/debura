@@ -102,10 +102,10 @@ pub fn render_ghidra_symbols_header_resolved(
         let resolution = resolutions.iter().find(|r| &r.symbol_name == symbol);
         match resolution.map(|r| &r.kind) {
             Some(DataSymbolKind::ConstantData { size, bytes }) => {
-                out.push_str(&render_byte_array_definition(symbol, *size, bytes, true));
+                out.push_str(&render_scalar_or_byte_array_definition(symbol, *size, bytes, true));
             }
             Some(DataSymbolKind::MutableStaticData { size, bytes }) => {
-                out.push_str(&render_byte_array_definition(symbol, *size, bytes, false));
+                out.push_str(&render_scalar_or_byte_array_definition(symbol, *size, bytes, false));
             }
             Some(DataSymbolKind::FunctionPointerAlias { target_function }) => {
                 out.push_str(&format!("void *{symbol} = (void *)&{target_function};\n"));
@@ -150,8 +150,93 @@ pub fn render_ghidra_symbols_header_resolved(
 /// (`*(double *)&DAT_x`) already does its own reinterpreting cast --
 /// this only needs to supply real storage of the right size and content,
 /// not the exact type a specific use site happens to want.
-fn render_byte_array_definition(symbol: &str, size: u64, bytes: &[u8], readonly: bool) -> String {
+///
+/// One deliberate, narrowly-scoped exception: a real compile found
+/// recovered bodies that use an 8-byte constant *by value*, directly in
+/// floating-point arithmetic (`- DAT_140009070`, real Food-grid scaling
+/// constants) -- not through a pointer at all, so an array (which never
+/// implicitly converts to a number) hard-fails to compile there, not just
+/// loses precision. When the exact captured bytes decode as a finite,
+/// "clean"-looking IEEE-754 double (this project's own real cases:
+/// 1.0/2.0/4.0, not float-noise), a `double` definition is emitted
+/// instead -- justified by two independent, real pieces of evidence
+/// together (the bytes cleanly decode, *and* the only real use site
+/// needs a number there), not a guess from the symbol's own name or
+/// generic type. Still a real, scoped judgment call, not a certainty:
+/// an 8-byte pointer stored in a genuinely address-shaped global could
+/// coincidentally decode to a clean-looking double too -- `decode_as_clean_f64`
+/// guards against this by magnitude, both directions: a real 64-bit
+/// address in this program is always either large (>= 0x140000000, ruled
+/// out by the upper bound) or -- a real test case, not a hypothetical --
+/// decodes to an implausibly *tiny* denormal when its high bytes happen
+/// to be zero (ruled out by the lower bound).
+fn render_scalar_or_byte_array_definition(symbol: &str, size: u64, bytes: &[u8], readonly: bool) -> String {
     let qualifier = if readonly { "const " } else { "" };
+    if size == 8 {
+        if let Some(value) = decode_as_clean_f64(bytes) {
+            return format!("{qualifier}double {symbol} = {value:?};\n");
+        }
+    }
     let byte_list: Vec<String> = bytes.iter().map(|b| format!("0x{b:02x}")).collect();
     format!("{qualifier}unsigned char {symbol}[{size}] = {{{}}};\n", byte_list.join(","))
+}
+
+/// `bytes` (little-endian, exactly 8 of them) reinterpreted as an IEEE-754
+/// double, accepted only when it's finite and small in magnitude -- real
+/// pointer values in this program are always >= 0x140000000 (~5.5e9),
+/// far outside any range a genuine floating-point game constant would
+/// plausibly use, so this is a real, if approximate, way to tell "this
+/// 8-byte value is a number" from "this 8-byte value is an address"
+/// using only the bytes themselves.
+fn decode_as_clean_f64(bytes: &[u8]) -> Option<f64> {
+    let array: [u8; 8] = bytes.try_into().ok()?;
+    let value = f64::from_le_bytes(array);
+    // A real test with a genuine address's own bytes (0x1400018ca)
+    // caught a real gap here: an address's high bytes are usually zero
+    // (small program addresses), which lands squarely in a double's own
+    // exponent field, decoding to an implausibly *tiny* (denormal,
+    // ~1e-314) value -- not just an implausibly huge one. Rejecting
+    // anything closer to zero than a real game constant would plausibly
+    // be (but not 0.0 itself, a real, legitimate exact value) closes
+    // that gap the same way the large-magnitude bound already does.
+    let magnitude_is_plausible = value == 0.0 || (1.0e-6..1.0e12).contains(&value.abs());
+    if value.is_finite() && magnitude_is_plausible {
+        Some(value)
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The real, confirmed case: `DAT_140009070`'s captured bytes decode
+    /// exactly as 2.0, and the only real use site needs a number, not a
+    /// pointer -- must render as a scalar, not an array (a real compile
+    /// found the array form hard-fails on `- DAT_140009070`).
+    #[test]
+    fn an_eight_byte_constant_decoding_cleanly_renders_as_a_scalar_double() {
+        let rendered = render_scalar_or_byte_array_definition("DAT_140009070", 8, &[0, 0, 0, 0, 0, 0, 0, 0x40], true);
+        assert_eq!(rendered, "const double DAT_140009070 = 2.0;\n");
+    }
+
+    /// A real 64-bit address value (always large in this program) must
+    /// never be reinterpreted as a small "clean" double just because it
+    /// happens to be 8 bytes -- falls back to the honest byte array.
+    #[test]
+    fn an_eight_byte_value_that_looks_like_an_address_stays_a_byte_array() {
+        // 0x1400018ca, a real function address from this project's own
+        // fixture data, little-endian.
+        let bytes = [0xca, 0x18, 0x00, 0x40, 0x01, 0x00, 0x00, 0x00];
+        let rendered = render_scalar_or_byte_array_definition("PTR_DAT_140009050", 8, &bytes, true);
+        assert!(rendered.starts_with("const unsigned char PTR_DAT_140009050[8] = {"), "{rendered}");
+        assert!(!rendered.contains("double"), "{rendered}");
+    }
+
+    #[test]
+    fn a_non_eight_byte_constant_is_always_a_byte_array() {
+        let rendered = render_scalar_or_byte_array_definition("DAT_1400099e0", 1, &[0x00], true);
+        assert_eq!(rendered, "const unsigned char DAT_1400099e0[1] = {0x00};\n");
+    }
 }

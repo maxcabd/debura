@@ -285,21 +285,36 @@ pub fn classify_data_symbol(graph: &KnowledgeGraph, symbol_name: &str, table: &S
         };
     }
 
-    if let (Some(size), Some(hex)) = (size_confident.or(size_estimated), bytes_hex) {
+    // PROJECT.md M18.2: a real compile found `DAT_140009121`'s own real
+    // extent was badly undersold by the next-symbol-distance estimate
+    // (1 byte -- an immediately adjacent symbol -- when the real use
+    // site, `SDL_Log(&DAT_140009121, ...)`, treats it as the start of a
+    // longer C string). Emitting a fixed-size array/scalar from an
+    // *estimated* size is exactly the kind of confidently-wrong guess
+    // this project's whole discipline exists to avoid -- only a real,
+    // Ghidra-defined Data object's own length (`size_confident`, never
+    // the next-symbol fallback) is trusted enough to emit a real
+    // definition from. An estimated size falls through to `UnknownData`
+    // below, which renders as the exact same bare-`extern` scalar
+    // declaration this address had before M18.2 existed -- a real
+    // regression-safety net, not a loss of information (the estimate is
+    // still in `source_facts` for a human to look at).
+    if let (Some(size), Some(hex)) = (size_confident, bytes_hex) {
         if let Some(bytes) = parse_hex_bytes(&hex) {
-            facts.push(format!("data_bytes_hex = {hex} (size {size})"));
+            facts.push(format!("data_bytes_hex = {hex} (size {size}, confident)"));
             if let Some(init) = initialized {
                 facts.push(format!("data_initialized = {init}"));
             }
-            let confidence = if size_confident.is_some() { 1.0 } else { 0.6 };
             let is_writable = writable.unwrap_or(false);
             let kind = if is_writable {
                 DataSymbolKind::MutableStaticData { size, bytes }
             } else {
                 DataSymbolKind::ConstantData { size, bytes }
             };
-            return DataResolution { address, symbol_name: symbol_name.to_string(), kind, source_facts: facts, confidence };
+            return DataResolution { address, symbol_name: symbol_name.to_string(), kind, source_facts: facts, confidence: 1.0 };
         }
+    } else if let Some(size) = size_estimated {
+        facts.push(format!("data_size_bytes_estimated = {size} (not confident enough to emit a definition from)"));
     }
 
     DataResolution {
@@ -518,5 +533,34 @@ mod tests {
 
         assert_eq!(resolution.kind, DataSymbolKind::UnknownData);
         assert_eq!(resolution.confidence, 0.0);
+    }
+
+    /// PROJECT.md M18.2: a real compile found this exact case --
+    /// `DAT_140009121`'s next-symbol-distance estimate said 1 byte, but
+    /// the real use site (`SDL_Log(&DAT_140009121, ...)`) treats it as
+    /// the start of a longer C string. Emitting a fixed-size definition
+    /// from an *estimated* size is exactly the confidently-wrong guess
+    /// this project's discipline exists to avoid -- must fall back to
+    /// `UnknownData` (a bare `extern` scalar, the same as before this
+    /// module existed), not a 1-byte array/scalar that breaks the real
+    /// call site.
+    #[test]
+    fn an_estimated_size_never_produces_a_confident_data_definition() {
+        let mut graph = KnowledgeGraph::new();
+        graph.add_observation("0x140009121", "data_section", ".rdata", 0.95, "ghidra:data", None);
+        graph.add_observation("0x140009121", "data_readable", "true", 0.95, "ghidra:data", None);
+        graph.add_observation("0x140009121", "data_writable", "false", 0.95, "ghidra:data", None);
+        graph.add_observation("0x140009121", "data_size_bytes_estimated", "1", 0.95, "ghidra:data", None);
+        graph.add_observation("0x140009121", "data_bytes_hex", "25", 0.95, "ghidra:data", None);
+
+        let table = SymbolTable::new();
+        let resolution = classify_data_symbol(&graph, "DAT_140009121", &table);
+
+        assert_eq!(resolution.kind, DataSymbolKind::UnknownData);
+        assert!(
+            resolution.source_facts.iter().any(|f| f.contains("data_size_bytes_estimated")),
+            "the estimate should still be on record for a human to inspect: {:?}",
+            resolution.source_facts
+        );
     }
 }
