@@ -494,7 +494,19 @@ const CHALLENGE_SYSTEM: &str = "You are Debura's ChallengeHypothesis adversarial
 const RESOLVE_SYSTEM: &str = "You are Debura's ResolveContradiction step. A hypothesis has been \
     marked CONTESTED because contradicting evidence was found. Weigh the supporting evidence \
     against the contradicting evidence and decide whether the contradiction actually holds up, \
-    or can be explained away.";
+    or can be explained away. \
+    \n\n\
+    Contradicting evidence sourced from \"debura:mechanical_shape_check\" is not a free-form \
+    guess -- it's a deterministic finding that the hypothesis's semantic_role value contains no \
+    word that isn't already in this same subject's own mechanical_behavior value, i.e. the name \
+    is, by construction, a restatement of mechanism rather than an independent claim about the \
+    function's role. Don't let it survive just because a sibling class independently agreed on \
+    the same word (sibling agreement on a restated-mechanism name is still a restated-mechanism \
+    name for all of them, not corroboration) or because the confidence number is high (the \
+    number reflects how sure the model was, not whether the word choice itself says anything \
+    beyond mechanism). Only let it survive if the supporting evidence adds something this check \
+    couldn't see -- a caller's own purpose, a field-access pattern, or another structural fact \
+    that gives the value a claim beyond what the subject's own body mechanically does.";
 
 /// Shared by the single and batched ResolveContradiction paths: maps the
 /// wire-shape `RawResolution` onto the real `Resolution` enum (a payload
