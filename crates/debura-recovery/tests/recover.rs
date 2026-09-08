@@ -5,6 +5,22 @@ use debura_recovery::{
     render_header, render_source, NameSource, GHIDRA_COMPAT_HEADER_NAME,
 };
 
+/// PROJECT.md M17: `extract()` now excludes anything whose provenance
+/// isn't Application (the fix for library/CRT internals leaking
+/// application-sounding names into recovered output) -- so a standalone
+/// function fixture with no other context needs a real Application
+/// anchor to stay recovered, the same way it would in a real graph via a
+/// call to (or ownership by) actual game code. Adds a `calls` edge to a
+/// synthetic, minimally-described method of a real (non-reserved) class
+/// rather than making `subject` itself `is_method_of` anything, since
+/// that would route it into class-method recovery instead of the
+/// standalone-function path these tests are actually exercising.
+fn anchor_as_application(graph: &mut KnowledgeGraph, subject: &str, anchor: &str) {
+    graph.add_observation(subject, "calls", anchor, 0.95, "ghidra:call_graph", None);
+    graph.add_observation(anchor, "has_name", "anchorMethod", 0.95, "ghidra:function", None);
+    graph.add_observation(anchor, "is_method_of", "Wall", 0.95, "ghidra:function", None);
+}
+
 /// Builds a graph shaped like real debura-analysis output for the
 /// Entity/Player fixture (crates/debura-testbins/fixtures/entity_player.cpp),
 /// plus one ACCEPTED semantic_role hypothesis -- the shape a real M4/M5 run
@@ -284,10 +300,11 @@ fn functions_dominated_by_library_callees_are_not_recovered_despite_an_applicati
 #[test]
 fn colliding_function_names_are_disambiguated_by_address() {
     let mut graph = KnowledgeGraph::new();
-    for (addr, raw) in [("0x10", "FUN_10"), ("0x20", "FUN_20")] {
+    for (addr, raw, anchor) in [("0x10", "FUN_10", "0xa10"), ("0x20", "FUN_20", "0xa20")] {
         graph.add_observation(addr, "has_name", raw, 0.95, "ghidra:function", None);
         graph.add_observation(addr, "has_signature", format!("void {raw}(void)"), 0.95, "ghidra:function", None);
         graph.add_observation(addr, "decompiles_to", format!("void {raw}(void)\n\n{{\n  return;\n}}"), 0.95, "ghidra:decompiler", None);
+        anchor_as_application(&mut graph, addr, anchor);
         let h = graph.propose_hypothesis(addr, "semantic_role", "invokeFunction", 0.95, None);
         graph.mark_verified(h, Utc::now()).unwrap();
         graph.set_status(h, HypothesisStatus::Accepted).unwrap();
@@ -310,6 +327,7 @@ fn colliding_function_names_are_disambiguated_by_address() {
 fn a_subject_with_several_accepted_semantic_role_hypotheses_recovers_once() {
     let mut graph = KnowledgeGraph::new();
     graph.add_observation("0x1bf2", "has_name", "processEvents", 0.95, "ghidra:function", None);
+    anchor_as_application(&mut graph, "0x1bf2", "0xa1bf2");
 
     for _ in 0..3 {
         let h = graph.propose_hypothesis("0x1bf2", "semantic_role", "processEvents", 0.95, None);
@@ -330,6 +348,7 @@ fn a_subject_with_several_accepted_semantic_role_hypotheses_recovers_once() {
 fn a_non_identifier_accepted_value_falls_back_to_the_raw_name() {
     let mut graph = KnowledgeGraph::new();
     graph.add_observation("0x1", "has_name", "FUN_drawtext", 0.95, "ghidra:function", None);
+    anchor_as_application(&mut graph, "0x1", "0xa1");
     let h = graph.propose_hypothesis(
         "0x1",
         "semantic_role",
@@ -597,6 +616,7 @@ fn lab_symbols_taken_by_address_are_declared_as_placeholders() {
         "ghidra:decompiler",
         None,
     );
+    anchor_as_application(&mut graph, "0x1", "0xa1");
     let h = graph.propose_hypothesis("0x1", "semantic_role", "installHandler", 0.95, None);
     graph.mark_verified(h, Utc::now()).unwrap();
     graph.set_status(h, HypothesisStatus::Accepted).unwrap();
@@ -654,6 +674,7 @@ fn standalone_functions_forward_declare_each_other_regardless_of_address_order()
     graph.add_observation("0x1", "has_name", "FUN_1", 0.95, "ghidra:function", None);
     graph.add_observation("0x1", "has_signature", "void FUN_1(void)", 0.95, "ghidra:function", None);
     graph.add_observation("0x1", "decompiles_to", "void FUN_1(void)\n\n{\n  FUN_2();\n  return;\n}", 0.95, "ghidra:decompiler", None);
+    anchor_as_application(&mut graph, "0x1", "0xa1");
     let h1 = graph.propose_hypothesis("0x1", "semantic_role", "runFirst", 0.95, None);
     graph.mark_verified(h1, Utc::now()).unwrap();
     graph.set_status(h1, HypothesisStatus::Accepted).unwrap();
@@ -661,6 +682,7 @@ fn standalone_functions_forward_declare_each_other_regardless_of_address_order()
     graph.add_observation("0x2", "has_name", "FUN_2", 0.95, "ghidra:function", None);
     graph.add_observation("0x2", "has_signature", "void FUN_2(void)", 0.95, "ghidra:function", None);
     graph.add_observation("0x2", "decompiles_to", "void FUN_2(void)\n\n{\n  return;\n}", 0.95, "ghidra:decompiler", None);
+    anchor_as_application(&mut graph, "0x2", "0xa2");
     let h2 = graph.propose_hypothesis("0x2", "semantic_role", "runSecond", 0.95, None);
     graph.mark_verified(h2, Utc::now()).unwrap();
     graph.set_status(h2, HypothesisStatus::Accepted).unwrap();
@@ -698,6 +720,10 @@ fn standalone_functions_reference_a_class_their_resolved_body_constructs() {
     graph.add_observation("0x2", "has_name", "FUN_2", 0.95, "ghidra:function", None);
     graph.add_observation("0x2", "has_signature", "void FUN_2(void * ptr)", 0.95, "ghidra:function", None);
     graph.add_observation("0x2", "decompiles_to", "void FUN_2(void *ptr)\n\n{\n  FUN_1(ptr);\n  return;\n}", 0.95, "ghidra:decompiler", None);
+    // PROJECT.md M17: makes 0x2's own provenance resolve to Application
+    // via its callee (0x1, Wall's constructor) rather than needing its
+    // own name/owner signal -- the real relationship this fixture models.
+    graph.add_observation("0x2", "calls", "0x1", 0.95, "ghidra:call_graph", None);
     let h = graph.propose_hypothesis("0x2", "semantic_role", "spawnWall", 0.95, None);
     graph.mark_verified(h, Utc::now()).unwrap();
     graph.set_status(h, HypothesisStatus::Accepted).unwrap();
