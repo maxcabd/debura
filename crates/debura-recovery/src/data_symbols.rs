@@ -57,6 +57,23 @@ pub enum DataSymbolKind {
     /// `crt_boundary` already applies to the binary's own CRT-startup
     /// code.
     RuntimeAlias { runtime_symbol: String, runtime_type: String },
+    /// This address's own pointee is a real import Ghidra's own analysis
+    /// already resolved by exact qualified name (a `debura_knowledge`
+    /// `imports` fact -- Ghidra's own EXTERNAL-address-space import/
+    /// relocation resolution, a structural fact about the ORIGINAL
+    /// binary, never a guess from this symbol's own auto-generated
+    /// `PTR_*` name shape), matching a small, fixed, real allowlist of
+    /// C++ standard-library globals safe to bind to directly (currently
+    /// just `std::cout`, the one real case a real run found: Ghidra
+    /// resolved `PTR_cout_14000f688`'s own outgoing reference to its
+    /// real EXTERNAL-space import, named `std!cout` in the extracted
+    /// facts). Unlike `ExternalGlobalAlias` (a known import Debura has
+    /// no safe binding for, or an import outside this allowlist), this
+    /// always gets a real definition: the qualified name is already
+    /// declared by whatever standard header the recovered code already
+    /// includes (`<iostream>` for `std::cout`), so binding needs nothing
+    /// beyond taking its address.
+    KnownImportAlias { qualified_name: String },
     /// A real, bounded-size, initialized, non-pointer object with known
     /// content -- typically `.rdata` (read-only). Safe to emit its exact
     /// captured bytes: unlike an address-shaped value, raw content bytes
@@ -193,6 +210,20 @@ fn is_known_function(graph: &KnowledgeGraph, address: &str) -> bool {
 
 fn is_known_import(graph: &KnowledgeGraph, address: &str) -> bool {
     graph.observations().any(|o| o.subject == address && o.predicate == "imports")
+}
+
+/// `KnownImportAlias`'s own fixed, real allowlist -- see that variant's
+/// doc comment for why this is safe to trust (Ghidra's own real
+/// EXTERNAL-space import resolution, never this symbol's own name
+/// shape). Deliberately narrow: `std::cout` is the one real case a real
+/// run found; nothing else is added speculatively. `import_value` is
+/// `debura-analysis`'s own `"{namespace}!{name}"` rendering of an
+/// `imports` fact (see `ghidra/scripts/ExtractFacts.py::extract_imports`).
+fn known_import_alias(import_value: Option<&str>) -> Option<String> {
+    match import_value?.split_once('!')? {
+        ("std", "cout") => Some("std::cout".to_string()),
+        _ => None,
+    }
 }
 
 /// The same "is this address's own size real evidence, not a next-symbol
@@ -335,7 +366,18 @@ pub fn classify_data_symbol(graph: &KnowledgeGraph, symbol_name: &str, table: &S
                 facts.push(format!("{target} is a known function but not itself recovered"));
             }
         } else if is_known_import(graph, target) {
-            facts.push(format!("{target} is a known import"));
+            let import_value = single_value(graph, target, "imports");
+            facts.push(format!("{target} is a known import ({})", import_value.as_deref().unwrap_or("?")));
+            if let Some(qualified_name) = known_import_alias(import_value.as_deref()) {
+                facts.push(format!("{qualified_name} is a real C++ standard-library global -- binding directly"));
+                return DataResolution {
+                    address,
+                    symbol_name: symbol_name.to_string(),
+                    kind: DataSymbolKind::KnownImportAlias { qualified_name },
+                    source_facts: facts,
+                    confidence: 1.0,
+                };
+            }
         } else if single_value(graph, target, "data_type_name").as_deref() == Some("IMAGE_DOS_HEADER")
             && single_value(graph, target, "data_section").as_deref() == Some("Headers")
         {
@@ -717,6 +759,42 @@ mod tests {
                 runtime_type: "IMAGE_DOS_HEADER".to_string(),
             }
         );
+    }
+
+    /// PROJECT.md M18.3: the real, confirmed case a real link found --
+    /// `PTR_cout_14000f688`'s own outgoing reference resolves to Ghidra's
+    /// synthetic EXTERNAL address space, which `debura-analysis` already
+    /// ingests as a real `imports` fact (`std!cout`) at that same
+    /// address. The gap wasn't in Ghidra extraction at all -- the fact
+    /// was already there -- `is_known_import` found it but the
+    /// classifier used to just note it and still fall through to
+    /// `ExternalGlobalAlias`, which a real link can never resolve.
+    #[test]
+    fn a_known_std_cout_import_binds_directly() {
+        let mut graph = KnowledgeGraph::new();
+        graph.add_observation("0x140009800", "data_pointee", "0x16 (reference)", 0.95, "ghidra:data", None);
+        graph.add_observation("0x16", "imports", "std!cout", 1.0, "ghidra:imports", None);
+
+        let table = SymbolTable::new();
+        let resolution = classify_data_symbol(&graph, "PTR_cout_140009800", &table);
+
+        assert_eq!(resolution.kind, DataSymbolKind::KnownImportAlias { qualified_name: "std::cout".to_string() });
+    }
+
+    /// A known import outside the narrow, real allowlist (anything other
+    /// than `std::cout`, the one demonstrated case) must stay an
+    /// `ExternalGlobalAlias` -- never speculatively bound to a symbol
+    /// name Debura hasn't actually confirmed is safe.
+    #[test]
+    fn a_known_import_outside_the_allowlist_stays_an_external_global_alias() {
+        let mut graph = KnowledgeGraph::new();
+        graph.add_observation("0x140009800", "data_pointee", "0x20 (reference)", 0.95, "ghidra:data", None);
+        graph.add_observation("0x20", "imports", "kernel32.dll!VirtualProtect", 1.0, "ghidra:imports", None);
+
+        let table = SymbolTable::new();
+        let resolution = classify_data_symbol(&graph, "PTR_DAT_140009800", &table);
+
+        assert_eq!(resolution.kind, DataSymbolKind::ExternalGlobalAlias { pointee: "0x20".to_string() });
     }
 
     /// The real, confirmed case: `LAB_140001000`/`LAB_140003a80` are

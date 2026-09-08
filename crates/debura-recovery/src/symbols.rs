@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use crate::compat::GHIDRA_COMPAT_HEADER_NAME;
 use crate::data_symbols::{DataResolution, DataSymbolKind};
 
@@ -98,23 +100,28 @@ pub fn render_ghidra_symbols_header_resolved(
         out.push_str(function_declarations);
         out.push('\n');
     }
-    // Three passes, not one: a pointer-alias line (`DataPointerAlias`,
-    // `VtableData`'s own pointer form, `FunctionPointerAlias`) takes the
-    // address of *another* symbol in this same list -- a real dependency
-    // between two lines in this generated file, not just two independent
-    // facts -- and a real run found that dependency isn't always one hop:
-    // `PTR_PTR_cout_1400096e0` (a `DataPointerAlias`) points at
-    // `PTR_cout_14000f688` (an `ExternalGlobalAlias`, so only ever a bare
-    // `extern` declaration, never a value definition). `symbols` has no
-    // guaranteed relationship between a pointer's own position and its
-    // target's (collection order, not dependency order), so every real
-    // value definition is emitted first, then every bare `extern`
-    // placeholder (a pure declaration -- no initializer, so it can never
-    // itself depend on anything emitted after it), and only then anything
-    // that takes an address: by that point every possible target -- a
-    // real value, a bare-declared placeholder, or (via
-    // `function_declarations` above) a recovered function -- is already
-    // visible.
+    // Not a fixed number of passes: a pointer-alias line
+    // (`DataPointerAlias`, `VtableData`'s own pointer form,
+    // `FunctionPointerAlias`, `RuntimeAlias`, `KnownImportAlias`) takes
+    // the address of *another* symbol -- a real dependency between two
+    // lines in this generated file, not just two independent facts.
+    // Every real value definition (`ConstantData`/`MutableStaticData`)
+    // is emitted first, in one pass, since it can never depend on
+    // anything else in this file. Every remaining, non-pointer-alias
+    // kind (`ExternalGlobalAlias`, `RuntimeData`, `CodeAddressAlias`,
+    // `UnknownData`, no resolution) is a bare `extern` *declaration* --
+    // no initializer, so it can never depend on anything emitted after
+    // it either -- and goes next. Pointer-alias lines go last, but
+    // `symbols` has no guaranteed relationship between one pointer's own
+    // position and its target's, and a real run found the dependency
+    // isn't always one hop: `PTR_PTR_cout_1400096e0` (`DataPointerAlias`)
+    // targets `PTR_cout_14000f688`, which is *itself* a pointer-alias
+    // line (`KnownImportAlias`), not a value definition or bare
+    // placeholder -- a fixed two-pass split got this exact case wrong.
+    // Emitted via a small fixed-point loop instead: a pointer-alias
+    // symbol whose own target is also a pointer-alias symbol waits until
+    // that target has actually been emitted, so any real chain depth
+    // resolves in true dependency order regardless of collection order.
     for symbol in symbols {
         let resolution = resolutions.iter().find(|r| &r.symbol_name == symbol);
         match resolution.map(|r| &r.kind) {
@@ -129,20 +136,7 @@ pub fn render_ghidra_symbols_header_resolved(
     }
     for symbol in symbols {
         let resolution = resolutions.iter().find(|r| &r.symbol_name == symbol);
-        let is_definition = matches!(
-            resolution.map(|r| &r.kind),
-            Some(DataSymbolKind::ConstantData { .. } | DataSymbolKind::MutableStaticData { .. })
-        );
-        let is_pointer_alias = matches!(
-            resolution.map(|r| &r.kind),
-            Some(
-                DataSymbolKind::FunctionPointerAlias { .. }
-                    | DataSymbolKind::VtableData { slot0_target: Some(_), .. }
-                    | DataSymbolKind::DataPointerAlias { .. }
-                    | DataSymbolKind::RuntimeAlias { .. }
-            )
-        );
-        if is_definition || is_pointer_alias {
+        if is_pointer_alias_kind(resolution) || is_value_definition_kind(resolution) {
             continue;
         }
         // `VtableData` with no safe function-pointer representation (a
@@ -158,42 +152,49 @@ pub fn render_ghidra_symbols_header_resolved(
             out.push_str(&format!("extern unsigned char {symbol};\n"));
         }
     }
-    for symbol in symbols {
-        let resolution = resolutions.iter().find(|r| &r.symbol_name == symbol);
-        match resolution.map(|r| &r.kind) {
-            Some(DataSymbolKind::FunctionPointerAlias { target_function }) => {
-                out.push_str(&format!("void *{symbol} = (void *)&{target_function};\n"));
+
+    let mut pending: Vec<&String> =
+        symbols.iter().filter(|s| is_pointer_alias_kind(resolutions.iter().find(|r| &r.symbol_name == *s))).collect();
+    let mut emitted: BTreeSet<&str> = BTreeSet::new();
+    while !pending.is_empty() {
+        let mut still_pending = Vec::new();
+        let mut progressed = false;
+        for symbol in pending {
+            let resolution = resolutions.iter().find(|r| &r.symbol_name == symbol).map(|r| &r.kind);
+            // Only `DataPointerAlias` can ever target another symbol in
+            // this same pointer-alias set -- every other kind targets a
+            // recovered function (already visible via
+            // `function_declarations`) or a fixed external constant
+            // (`__ImageBase`/`std::cout`, never a member of `symbols` at
+            // all), neither of which this file's own emission order can
+            // affect.
+            let blocked = matches!(
+                resolution,
+                Some(DataSymbolKind::DataPointerAlias { target_symbol })
+                    if symbols.contains(target_symbol) && !emitted.contains(target_symbol.as_str())
+            );
+            if blocked {
+                still_pending.push(symbol);
+                continue;
             }
-            Some(DataSymbolKind::VtableData { slot0_target: Some(target), .. }) => {
-                out.push_str(&format!("void *{symbol} = (void *)&{target};\n"));
-            }
-            Some(DataSymbolKind::DataPointerAlias { target_symbol }) => {
-                // `unsigned char *`, not `void *` -- unlike
-                // `FunctionPointerAlias`/`VtableData` (whose call sites
-                // already cast explicitly through a concrete type before
-                // using the result), a real run found `PTR_*` targets
-                // dereferenced directly (`*PTR_DAT_x`), which a `void *`
-                // can't be (`'void*' is not a pointer-to-object type`).
-                // Matches the exact type the bare-`extern` fallback above
-                // already declares every other `PTR_*`/`_refptr_*` symbol
-                // as, so a use site behaves identically whether this
-                // symbol ended up defined or left as a placeholder.
-                out.push_str(&format!("unsigned char *{symbol} = (unsigned char *)&{target_symbol};\n"));
-            }
-            Some(DataSymbolKind::RuntimeAlias { runtime_symbol, runtime_type }) => {
-                // `runtime_symbol` is never one of `symbols` -- it's a
-                // fixed, toolchain-provided constant (currently only
-                // `__ImageBase`), not a Ghidra placeholder needing the
-                // generic collection/classification treatment, so its
-                // own declaration is emitted directly here rather than
-                // threaded through the bare-`extern` pass above.
-                // `extern "C"` so C++ name-mangling never hides the
-                // real, unmangled symbol the linker actually provides.
-                out.push_str(&format!("extern \"C\" {runtime_type} {runtime_symbol};\n"));
-                out.push_str(&format!("unsigned char *{symbol} = (unsigned char *)&{runtime_symbol};\n"));
-            }
-            _ => {}
+            out.push_str(&render_pointer_alias_line(symbol, resolution));
+            emitted.insert(symbol.as_str());
+            progressed = true;
         }
+        if !progressed {
+            // A real cycle, or a target this pass's own `blocked` check
+            // can't see resolved elsewhere -- shouldn't happen given how
+            // `extract.rs` builds `DataPointerAlias` chains (see its own
+            // fixed-point discovery loop), but emitting every remaining
+            // entry anyway beats looping forever; a real compile would
+            // surface a genuine "not declared" error if this ever fires.
+            for symbol in &still_pending {
+                let resolution = resolutions.iter().find(|r| &r.symbol_name == *symbol).map(|r| &r.kind);
+                out.push_str(&render_pointer_alias_line(symbol, resolution));
+            }
+            break;
+        }
+        pending = still_pending;
     }
     if !unresolved_calls.is_empty() {
         out.push_str("\n// Call targets M15's symbol resolution pass found no recovered\n");
@@ -217,6 +218,76 @@ pub fn render_ghidra_symbols_header_resolved(
         out.push_str("}\n");
     }
     out
+}
+
+fn is_value_definition_kind(resolution: Option<&DataResolution>) -> bool {
+    matches!(
+        resolution.map(|r| &r.kind),
+        Some(DataSymbolKind::ConstantData { .. } | DataSymbolKind::MutableStaticData { .. })
+    )
+}
+
+fn is_pointer_alias_kind(resolution: Option<&DataResolution>) -> bool {
+    matches!(
+        resolution.map(|r| &r.kind),
+        Some(
+            DataSymbolKind::FunctionPointerAlias { .. }
+                | DataSymbolKind::VtableData { slot0_target: Some(_), .. }
+                | DataSymbolKind::DataPointerAlias { .. }
+                | DataSymbolKind::RuntimeAlias { .. }
+                | DataSymbolKind::KnownImportAlias { .. }
+        )
+    )
+}
+
+/// One pointer-alias symbol's own definition line -- assumes its target
+/// is already visible (a recovered function, a fixed external constant,
+/// or another pointer-alias/value-definition symbol this same file
+/// already emitted earlier); the caller (the fixed-point loop in
+/// `render_ghidra_symbols_header_resolved`) is what actually guarantees
+/// that.
+fn render_pointer_alias_line(symbol: &str, resolution: Option<&DataSymbolKind>) -> String {
+    match resolution {
+        Some(DataSymbolKind::FunctionPointerAlias { target_function }) => {
+            format!("void *{symbol} = (void *)&{target_function};\n")
+        }
+        Some(DataSymbolKind::VtableData { slot0_target: Some(target), .. }) => {
+            format!("void *{symbol} = (void *)&{target};\n")
+        }
+        Some(DataSymbolKind::DataPointerAlias { target_symbol }) => {
+            // `unsigned char *`, not `void *` -- unlike
+            // `FunctionPointerAlias`/`VtableData` (whose call sites
+            // already cast explicitly through a concrete type before
+            // using the result), a real run found `PTR_*` targets
+            // dereferenced directly (`*PTR_DAT_x`), which a `void *`
+            // can't be (`'void*' is not a pointer-to-object type`).
+            // Matches the exact type the bare-`extern` fallback already
+            // declares every other `PTR_*`/`_refptr_*` symbol as, so a
+            // use site behaves identically whether this symbol ended up
+            // defined or left as a placeholder.
+            format!("unsigned char *{symbol} = (unsigned char *)&{target_symbol};\n")
+        }
+        Some(DataSymbolKind::RuntimeAlias { runtime_symbol, runtime_type }) => {
+            // `runtime_symbol` is never one of `symbols` -- it's a
+            // fixed, toolchain-provided constant (currently only
+            // `__ImageBase`), not a Ghidra placeholder needing the
+            // generic collection/classification treatment, so its own
+            // declaration is emitted directly here rather than threaded
+            // through the bare-`extern` pass. `extern "C"` so C++
+            // name-mangling never hides the real, unmangled symbol the
+            // linker actually provides.
+            format!("extern \"C\" {runtime_type} {runtime_symbol};\nunsigned char *{symbol} = (unsigned char *)&{runtime_symbol};\n")
+        }
+        Some(DataSymbolKind::KnownImportAlias { qualified_name }) => {
+            // No extra declaration needed, unlike `RuntimeAlias` --
+            // `qualified_name` (currently only `std::cout`) is already
+            // declared by whatever standard header the recovered code
+            // already includes (`ghidra_compat.hpp` pulls in
+            // `<iostream>`).
+            format!("unsigned char *{symbol} = (unsigned char *)&{qualified_name};\n")
+        }
+        _ => String::new(),
+    }
 }
 
 /// `unsigned char NAME[SIZE] = {0x.., ...};` (or `const unsigned char`
@@ -422,5 +493,68 @@ mod tests {
             header.contains("unsigned char *PTR_IMAGE_DOS_HEADER_140009710 = (unsigned char *)&__ImageBase;"),
             "{header}"
         );
+    }
+
+    /// The real, confirmed case: `std::cout` needs no extra declaration
+    /// line at all (unlike `RuntimeAlias`'s `__ImageBase`) -- it's
+    /// already declared by `<iostream>`, which `ghidra_compat.hpp`
+    /// already includes.
+    #[test]
+    fn a_known_import_alias_binds_directly_with_no_extra_declaration() {
+        let symbols = vec!["PTR_cout_14000f688".to_string()];
+        let resolutions = vec![DataResolution {
+            address: "0x14000f688".to_string(),
+            symbol_name: "PTR_cout_14000f688".to_string(),
+            kind: DataSymbolKind::KnownImportAlias { qualified_name: "std::cout".to_string() },
+            source_facts: vec![],
+            confidence: 1.0,
+        }];
+
+        let header = render_ghidra_symbols_header_resolved(&symbols, &resolutions, &[], "");
+
+        assert!(
+            header.contains("unsigned char *PTR_cout_14000f688 = (unsigned char *)&std::cout;"),
+            "{header}"
+        );
+        assert!(!header.contains("extern"), "{header}");
+    }
+
+    /// PROJECT.md M18.3: the real, confirmed case a first version of the
+    /// pointer-alias ordering fix still got wrong -- `PTR_PTR_cout_1400096e0`
+    /// (`DataPointerAlias`) targets `PTR_cout_14000f688`, which is *itself*
+    /// a pointer-alias line (`KnownImportAlias`), not a value definition
+    /// or a bare `extern` placeholder. A fixed two-pass split (values,
+    /// then bare externs, then every pointer alias in one pass) put both
+    /// pointer-alias lines in the same pass, in `symbols`' own
+    /// (alphabetical, not dependency) order -- "PTR_PTR_cout..." sorts
+    /// before "PTR_cout...", so the alias was emitted before its own
+    /// target. The fixed-point loop must wait for a pointer-alias
+    /// target to be emitted first, regardless of which pass it belongs
+    /// to.
+    #[test]
+    fn a_pointer_alias_chain_through_another_pointer_alias_resolves_in_dependency_order() {
+        let symbols = vec!["PTR_PTR_cout_1400096e0".to_string(), "PTR_cout_14000f688".to_string()];
+        let resolutions = vec![
+            DataResolution {
+                address: "0x1400096e0".to_string(),
+                symbol_name: "PTR_PTR_cout_1400096e0".to_string(),
+                kind: DataSymbolKind::DataPointerAlias { target_symbol: "PTR_cout_14000f688".to_string() },
+                source_facts: vec![],
+                confidence: 1.0,
+            },
+            DataResolution {
+                address: "0x14000f688".to_string(),
+                symbol_name: "PTR_cout_14000f688".to_string(),
+                kind: DataSymbolKind::KnownImportAlias { qualified_name: "std::cout".to_string() },
+                source_facts: vec![],
+                confidence: 1.0,
+            },
+        ];
+
+        let header = render_ghidra_symbols_header_resolved(&symbols, &resolutions, &[], "");
+
+        let target_pos = header.find("PTR_cout_14000f688 = ").expect("target's own definition present");
+        let alias_pos = header.find("PTR_PTR_cout_1400096e0 = ").expect("alias present");
+        assert!(target_pos < alias_pos, "target must be defined before its address is taken:\n{header}");
     }
 }
