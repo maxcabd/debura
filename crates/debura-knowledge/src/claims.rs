@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use crate::{HypothesisStatus, KnowledgeGraph};
 
 /// PROJECT.md M15: whether an ACCEPTED semantic_role hypothesis reflects
@@ -46,24 +48,26 @@ pub fn is_reserved_identifier(name: &str) -> bool {
 /// underscore-prefixed, so it never matched `is_reserved_identifier` at
 /// all -- diluting a library-dominated function's callee ratio with
 /// calls that were just as clearly not application code, only shaped
-/// differently. Defaults to `Application` when none of these observations
-/// are present or none matches -- an unnamed structurally-discovered
-/// class (`Class_1400080e0`) counts as Application too, since it's
-/// genuinely unverified rather than known to be library code;
-/// ground-truth classification (a separate, manual process) is still
-/// needed to judge its accuracy.
+/// differently.
+///
+/// Deliberately does NOT default to `Application` when nothing matches
+/// (PROJECT.md M17): on a genuinely stripped binary, a real audit found
+/// this cheap check has *no signal at all* for most subjects -- their
+/// only observation is `has_name = FUN_<addr>`, which isn't
+/// reserved-shaped, isn't an import, and has no `is_method_of` -- so
+/// `classify_subject` alone can't tell Application from "no idea yet".
+/// Use `classify_provenance` for a real per-subject verdict; this
+/// function only answers the narrower, cheaper question "does this
+/// subject's own name/owner/import status look like library code",
+/// leaving everything else to whoever calls it.
 pub fn classify_subject(graph: &KnowledgeGraph, subject: &str) -> ClaimClass {
     let imported = graph.observations().any(|o| o.subject == subject && o.predicate == "imports");
     if imported {
         return ClaimClass::LibraryOrCompiler;
     }
 
-    let owner = graph
-        .observations()
-        .find(|o| o.subject == subject && o.predicate == "is_method_of")
-        .map(|o| o.value.as_str());
-    if let Some(owner) = owner {
-        if is_reserved_identifier(owner) {
+    if let Some(owner) = method_owner(graph, subject) {
+        if is_reserved_identifier(&owner) {
             return ClaimClass::LibraryOrCompiler;
         }
     }
@@ -81,70 +85,194 @@ pub fn classify_subject(graph: &KnowledgeGraph, subject: &str) -> ClaimClass {
     ClaimClass::Application
 }
 
-/// PROJECT.md M15: name/owner shape alone isn't enough. A real run's
-/// `constructString` earned an ACCEPTED semantic_role and *looked* like
-/// application code -- a readable, model-given name, no reserved-shaped
-/// owner -- but its entire body was calls into `std::string`'s own
-/// private implementation (`_M_create`, `_M_data`, `_M_capacity`,
-/// `_M_set_length`): an inlined instantiation of the standard library's
-/// own constructor logic that happened to get compiled as a separate
-/// symbol, not anything the binary's author wrote. `ClaimClass` alone
-/// can't see this -- it only ever looks at the subject's own name.
+/// The class a subject belongs to, whether as an ordinary method, a
+/// constructor, or a destructor -- the same three predicates
+/// debura-recovery's own `class_method_addresses` treats as equivalent
+/// ownership signals (`extract.rs`), so a constructor doesn't fall
+/// through this crate's own name-shape/provenance checks just because
+/// `is_method_of` specifically isn't the predicate Ghidra extraction used
+/// for it.
+fn method_owner(graph: &KnowledgeGraph, subject: &str) -> Option<String> {
+    graph
+        .observations()
+        .find(|o| {
+            o.subject == subject
+                && matches!(o.predicate.as_str(), "is_method_of" | "is_constructor_of" | "is_destructor_of")
+        })
+        .map(|o| o.value.clone())
+}
+
+/// PROJECT.md M17: a real audit against a genuinely stripped Snake binary
+/// found 10 of 37 ACCEPTED semantic_role claims were libstdc++/CRT
+/// internals (`std::vector::_M_erase_at_end`, `_S_max_size`,
+/// `__relocate_a`, MinGW's own `_pei386_runtime_relocator`) that had
+/// earned application-sounding names (`invokeFunctionConditionally`,
+/// `retrievePointer`, `initializeSettings`) and made it all the way into
+/// the recovered `.cpp` output -- because the *previous* two-state
+/// `Provenance` (Application / CompilerLibraryGlue) fell back to
+/// `Application` whenever `classify_subject`'s name-shape check had
+/// nothing to go on, which on a stripped binary is most of the time (see
+/// `classify_subject`'s own doc comment). That fallback is exactly the
+/// bug: "no recognizable library name" is not evidence *for*
+/// Application, it's an absence of evidence either way.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Provenance {
-    /// Not library/compiler by name, and not dominated by calls into
-    /// library/compiler internals either.
+    /// Positively identified as application code: either its own name
+    /// isn't library-shaped and it's a method of a real (non-reserved)
+    /// class, or its callees are themselves dominated by confirmed
+    /// Application code.
     Application,
-    /// Either named like library/compiler code directly (subsumes every
-    /// `ClaimClass::LibraryOrCompiler`), or -- the harder case --
-    /// application-looking by name but almost entirely composed of
-    /// calls into library internals with no other application-facing
-    /// signal.
-    CompilerLibraryGlue,
+    /// Confirmed library/runtime/compiler-generated code -- by direct
+    /// name/import shape, by being a thunk to something confirmed
+    /// library, or by callee composition dominated by confirmed library
+    /// code (thunk-resolved, propagated up to `MAX_PROPAGATION_DEPTH`
+    /// hops). Finer distinctions (hand-written STL vs. compiler-emitted
+    /// relocation glue vs. a bare trampoline) aren't attempted here --
+    /// the gate this feeds only needs "not application", and manufacturing
+    /// a confident split the evidence doesn't support would repeat the
+    /// exact mistake `mechanical_shape_check` exists to catch elsewhere.
+    LibraryOrRuntime,
+    /// No signal either way. MUST NOT be treated as Application by
+    /// anything gating semantic_role generation -- this is the state the
+    /// old fallback used to silently erase.
+    Unknown,
+}
+
+/// How many calls a function may make and still be considered small
+/// enough to be a pure single-target thunk/trampoline, by its own
+/// `size_bytes` fact -- generous enough to include parameter shuffling
+/// around one delegated call, not so generous it starts matching real
+/// multi-step application logic.
+const THUNK_MAX_SIZE_BYTES: u64 = 32;
+
+/// A function whose entire recorded behavior is exactly one distinct
+/// callee and a small enough body -- pure delegation, so its own
+/// provenance is really its target's. Structural, using facts
+/// debura-ghidra already extracts (`calls`, `size_bytes`); no decompiled
+/// text parsing needed. Deliberately approximate (PROJECT.md M15's
+/// documented thunk-normalization TODO, finally acted on): a real
+/// compiler-emitted thunk and a one-line application forwarding wrapper
+/// look the same by this measure, but both cases really do want their
+/// own provenance to be inherited from their single callee, so the
+/// approximation is sound either way.
+fn thunk_target(graph: &KnowledgeGraph, subject: &str) -> Option<String> {
+    let callees: HashSet<&str> = graph
+        .observations()
+        .filter(|o| o.subject == subject && o.predicate == "calls")
+        .map(|o| o.value.as_str())
+        .collect();
+    if callees.len() != 1 {
+        return None;
+    }
+    let size: u64 = graph
+        .observations()
+        .find(|o| o.subject == subject && o.predicate == "size_bytes")
+        .and_then(|o| o.value.parse().ok())?;
+    if size > THUNK_MAX_SIZE_BYTES {
+        return None;
+    }
+    callees.into_iter().next().map(str::to_string)
+}
+
+/// How many hops of thunk-resolution and callee-composition propagation
+/// to follow before giving up and calling a subject Unknown rather than
+/// walking the whole call graph. A real chain this was measured against:
+/// MinGW's `_pei386_runtime_relocator` (depth 0) calls four unnamed local
+/// helpers (depth 1), one of which calls straight into an imported
+/// symbol (depth 2) -- 5 comfortably covers chains like that without
+/// unbounded graph traversal on a large binary.
+const MAX_PROPAGATION_DEPTH: u32 = 5;
+
+/// Dominance threshold above which a subject's callee composition decides
+/// its provenance -- deliberately high (not "calls any library function
+/// at all"), so real application code that calls a couple of library
+/// helpers along the way isn't misclassified.
+const LIBRARY_GLUE_THRESHOLD: f64 = 0.8;
+
+/// The provenance judgment PROJECT.md M17 asks for, computed structurally
+/// rather than assumed from a naming default: `classify_subject`'s
+/// name/import shape first (cheap, and the strongest signal when it
+/// fires), then a real application class's own (non-reserved-shaped)
+/// method, then thunk resolution (inherit the single delegated-to
+/// target's provenance), then callee-composition dominance -- computed
+/// with callees *recursively* classified the same way (not just
+/// name-shape), so a classification can propagate several hops from a
+/// confirmed anchor (an import, a known application class) toward
+/// something with no direct signal of its own. Only when none of that
+/// produces an answer does this return `Unknown` -- never `Application`
+/// by default.
+pub fn classify_provenance(graph: &KnowledgeGraph, subject: &str) -> Provenance {
+    classify_provenance_bounded(graph, subject, &mut HashSet::new(), MAX_PROPAGATION_DEPTH)
+}
+
+fn classify_provenance_bounded(
+    graph: &KnowledgeGraph,
+    subject: &str,
+    visited: &mut HashSet<String>,
+    depth: u32,
+) -> Provenance {
+    // Cycle guard. A real single-inheritance/call chain doesn't usually
+    // cycle, but a diamond in the call graph (two callees of the same
+    // subject sharing a common sub-callee) will hit this too -- an
+    // under-classification (falling to Unknown) rather than
+    // over-classification, which is the safe direction to err in here.
+    if !visited.insert(subject.to_string()) {
+        return Provenance::Unknown;
+    }
+
+    if classify_subject(graph, subject) == ClaimClass::LibraryOrCompiler {
+        return Provenance::LibraryOrRuntime;
+    }
+
+    if let Some(owner) = method_owner(graph, subject) {
+        if !is_reserved_identifier(&owner) {
+            return Provenance::Application;
+        }
+    }
+
+    if depth == 0 {
+        return Provenance::Unknown;
+    }
+
+    if let Some(target) = thunk_target(graph, subject) {
+        return classify_provenance_bounded(graph, &target, visited, depth - 1);
+    }
+
+    let callees: Vec<String> = graph
+        .observations()
+        .filter(|o| o.subject == subject && o.predicate == "calls")
+        .map(|o| o.value.clone())
+        .collect();
+    if callees.is_empty() {
+        return Provenance::Unknown;
+    }
+
+    let resolved: Vec<Provenance> = callees
+        .iter()
+        .map(|c| classify_provenance_bounded(graph, c, visited, depth - 1))
+        .collect();
+    let library_count = resolved.iter().filter(|p| **p == Provenance::LibraryOrRuntime).count();
+    if library_count as f64 / resolved.len() as f64 >= LIBRARY_GLUE_THRESHOLD {
+        return Provenance::LibraryOrRuntime;
+    }
+    if resolved.iter().any(|p| *p == Provenance::Application) {
+        return Provenance::Application;
+    }
+
+    Provenance::Unknown
 }
 
 /// How much of `subject`'s own behavior, by call composition, is really
 /// library/compiler internals rather than anything application-specific
-/// -- dominance, not presence: real application code often calls one or
-/// two STL helpers (`name += suffix`, `vector.push_back(x)`) without
-/// being *defined by* them, so only a heavily library-dominated callee
-/// list should count. Callees are judged by `classify_subject`'s own
-/// cheap name-shape check -- library internals like
-/// `std::string::_M_create` are already reserved-identifier-shaped, so
-/// this needs no separate library-signature database. Returns 0.0 (never
-/// glue on this signal alone) for a subject with no recorded callees at
-/// all, rather than treating "nothing known" as "entirely library".
-///
-/// Known limitation, deliberately not fixed here (PROJECT.md M15): this
-/// only ever looks at each callee's own direct classification, one hop
-/// deep. A real run found the gap concretely: `formattedOutput` calls an
-/// address Ghidra named plain `operator<<` -- itself just a one-
-/// instruction thunk/trampoline to the *real* imported `operator<<` --
-/// which isn't reserved-identifier-shaped and isn't itself in the import
-/// table, so it reads as ordinary application code even though it's
-/// pure library glue one hop removed. Confirmed this is exactly what
-/// held `formattedOutput`'s ratio below `LIBRARY_GLUE_THRESHOLD` when it
-/// should have cleared it.
-///
-/// The right general fix, when this gets picked back up, is thunk
-/// *normalization* before classification runs at all, not a recursive
-/// classification walk (which would make this function's own behavior
-/// harder to reason about, and risks pulling arbitrarily distant/
-/// unrelated call chains into one subject's ratio): detect a thunk
-/// (a function whose entire body is a single tail call, structurally --
-/// the same shape Ghidra already marks with its own "indirect jump
-/// treated as call" warning), resolve it to its canonical target, and
-/// substitute that target everywhere the thunk would otherwise appear
-/// as a callee -- so `F -> thunk -> std::operator<<` collapses to
-/// `F -> std::operator<<` for every consumer of this classification,
-/// once, instead of teaching each consumer to chase through thunks
-/// itself. A narrow `operator<<`/`operator>>` name-based special case
-/// was considered and rejected: it would fix this one instance while
-/// accumulating exactly the kind of classifier-debt this module is
-/// trying to avoid (`operator=` is a real, application-authored method
-/// on `Drawable`/`Collideable` in the same binary, so name alone can't
-/// distinguish the thunk case from a genuine application operator
-/// overload -- only the thunk's own body shape can).
+/// -- dominance, not presence. Single-hop only (callees judged by
+/// `classify_subject`'s cheap name-shape check, not recursively): kept as
+/// its own function because it's a genuinely different, simpler question
+/// than `classify_provenance` answers ("does this subject's *own direct*
+/// callee list look library-shaped" vs. "what is this subject's actual
+/// provenance, propagated through the whole reachable graph"). Returns
+/// 0.0 (never glue on this signal alone) for a subject with no recorded
+/// callees at all, rather than treating "nothing known" as "entirely
+/// library".
 pub fn library_callee_ratio(graph: &KnowledgeGraph, subject: &str) -> f64 {
     let callees: Vec<&str> = graph
         .observations()
@@ -161,42 +289,22 @@ pub fn library_callee_ratio(graph: &KnowledgeGraph, subject: &str) -> f64 {
     library_count as f64 / callees.len() as f64
 }
 
-/// Dominance threshold for `library_callee_ratio` above which a subject
-/// counts as compiler/library glue despite an application-looking name
-/// -- deliberately high (not "calls any library function at all"), so
-/// real application code that calls a couple of STL helpers along the
-/// way isn't misclassified as glue.
-const LIBRARY_GLUE_THRESHOLD: f64 = 0.8;
-
-/// The provenance judgment PROJECT.md M15 asks for: `classify_subject`'s
-/// name-shape check first (cheap, and already catches most library/
-/// compiler code), then -- only for a subject whose own name looks like
-/// application code -- the harder callee-composition check for a
-/// function that's actually dominated by library internals despite
-/// looking like application code by name alone.
-pub fn classify_provenance(graph: &KnowledgeGraph, subject: &str) -> Provenance {
-    if classify_subject(graph, subject) == ClaimClass::LibraryOrCompiler {
-        return Provenance::CompilerLibraryGlue;
-    }
-    if library_callee_ratio(graph, subject) >= LIBRARY_GLUE_THRESHOLD {
-        return Provenance::CompilerLibraryGlue;
-    }
-    Provenance::Application
-}
-
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ClaimBreakdown {
     pub application_accepted: usize,
-    pub library_or_compiler_accepted: usize,
+    pub library_or_runtime_accepted: usize,
+    /// PROJECT.md M17: ACCEPTED semantic_role claims on a subject whose
+    /// provenance is genuinely undetermined. Should read zero once the
+    /// provenance gate (reevaluate_hypothesis) is in place -- a nonzero
+    /// count here means something reached ACCEPTED without going through
+    /// that gate, which is itself worth knowing.
+    pub unknown_provenance_accepted: usize,
 }
 
 /// Counts ACCEPTED semantic_role hypotheses by provenance -- the split
 /// PROJECT.md M15 asks for instead of one blended "accepted" number,
 /// since only the application count says anything about how well Debura
-/// understands the program it's actually reversing. Uses
-/// `classify_provenance` (not just `classify_subject`) so a
-/// library-dominated function that merely *looks* application-named
-/// (PROJECT.md M15's `constructString` case) is counted correctly too.
+/// understands the program it's actually reversing.
 pub fn claim_breakdown(graph: &KnowledgeGraph) -> ClaimBreakdown {
     let mut breakdown = ClaimBreakdown::default();
     for h in graph.hypotheses() {
@@ -205,7 +313,8 @@ pub fn claim_breakdown(graph: &KnowledgeGraph) -> ClaimBreakdown {
         }
         match classify_provenance(graph, &h.subject) {
             Provenance::Application => breakdown.application_accepted += 1,
-            Provenance::CompilerLibraryGlue => breakdown.library_or_compiler_accepted += 1,
+            Provenance::LibraryOrRuntime => breakdown.library_or_runtime_accepted += 1,
+            Provenance::Unknown => breakdown.unknown_provenance_accepted += 1,
         }
     }
     breakdown
@@ -256,9 +365,9 @@ mod tests {
         assert_eq!(classify_subject(&graph, "0x4"), ClaimClass::Application);
     }
 
-    /// The exact real-world case this exists for: a function named and
-    /// owned like application code, whose entire body is calls into
-    /// std::string's own private implementation.
+    /// The exact real-world case `library_callee_ratio` exists for: a
+    /// function named and owned like application code, whose entire body
+    /// is calls into std::string's own private implementation.
     #[test]
     fn library_dominated_callees_reclassify_an_application_looking_name() {
         let mut graph = KnowledgeGraph::new();
@@ -270,9 +379,11 @@ mod tests {
 
         // Name/owner shape alone still sees this as application code.
         assert_eq!(classify_subject(&graph, "0x1"), ClaimClass::Application);
-        // Callee composition (100% library) reclassifies it as glue.
+        // Callee composition (100% library) confirms it either way:
+        // the simple single-hop ratio,
         assert_eq!(library_callee_ratio(&graph, "0x1"), 1.0);
-        assert_eq!(classify_provenance(&graph, "0x1"), Provenance::CompilerLibraryGlue);
+        // and the full recursive provenance classifier.
+        assert_eq!(classify_provenance(&graph, "0x1"), Provenance::LibraryOrRuntime);
     }
 
     /// The dominance requirement: real application code calling *one*
@@ -282,6 +393,7 @@ mod tests {
     fn a_couple_of_library_calls_does_not_make_application_code_glue() {
         let mut graph = KnowledgeGraph::new();
         graph.add_observation("0x1", "has_name", "buildScoreText", 0.95, "ghidra:function", None);
+        graph.add_observation("0x1", "is_method_of", "Screen", 0.95, "ghidra:function", None);
         graph.add_observation("0x1", "calls", "0x2", 0.95, "ghidra:call_graph", None); // drawText
         graph.add_observation("0x1", "calls", "0x3", 0.95, "ghidra:call_graph", None); // _M_append
         graph.add_observation("0x1", "calls", "0x4", 0.95, "ghidra:call_graph", None); // getScore
@@ -318,6 +430,93 @@ mod tests {
 
         let breakdown = claim_breakdown(&graph);
         assert_eq!(breakdown.application_accepted, 1);
-        assert_eq!(breakdown.library_or_compiler_accepted, 1);
+        assert_eq!(breakdown.library_or_runtime_accepted, 1);
+        assert_eq!(breakdown.unknown_provenance_accepted, 0);
+    }
+
+    /// The core bug the M17 audit found: a subject with genuinely no
+    /// name-shape signal (only `has_name = FUN_<addr>`, no `is_method_of`,
+    /// no callees at all -- a small leaf function) must come back
+    /// `Unknown`, not silently `Application`.
+    #[test]
+    fn a_stripped_leaf_function_with_no_signal_is_unknown_not_application() {
+        let mut graph = KnowledgeGraph::new();
+        graph.add_observation("0x140005bd0", "has_name", "FUN_140005bd0", 0.95, "ghidra:function", None);
+        graph.add_observation("0x140005bd0", "size_bytes", "29", 0.95, "ghidra:function", None);
+
+        assert_eq!(classify_provenance(&graph, "0x140005bd0"), Provenance::Unknown);
+    }
+
+    /// Regression test for the exact real chain the M17 audit traced:
+    /// MinGW's `_pei386_runtime_relocator` (stripped to `FUN_1400045a8`)
+    /// calls four unnamed local helpers, one of which (`FUN_1400040ff`)
+    /// calls straight into an imported symbol. None of these five
+    /// subjects has a real name anywhere in the graph -- the only
+    /// evidence available on a genuinely stripped binary -- yet the top
+    /// of the chain must still resolve to LibraryOrRuntime via thunk/
+    /// dominance propagation, not fall back to Application.
+    #[test]
+    fn a_stripped_runtime_relocator_chain_resolves_to_library_via_propagation() {
+        let mut graph = KnowledgeGraph::new();
+        for addr in ["0x1400045a8", "0x1400040ff", "0x14000421e", "0x140004e4b", "0x140005480"] {
+            graph.add_observation(addr, "has_name", format!("FUN_{}", &addr[2..]), 0.95, "ghidra:function", None);
+        }
+        // The relocator calls four local helpers, none named, none a
+        // pure thunk (each has more than one callee or is above the
+        // thunk size bound) -- so this can only resolve through the
+        // dominance path, not thunk resolution.
+        graph.add_observation("0x1400045a8", "size_bytes", "164", 0.95, "ghidra:function", None);
+        for callee in ["0x1400040ff", "0x14000421e", "0x140004e4b", "0x140005480"] {
+            graph.add_observation("0x1400045a8", "calls", callee, 0.95, "ghidra:call_graph", None);
+        }
+        // Each helper is itself a real (non-thunk-sized) function that
+        // happens to call straight into an imported CRT/runtime symbol --
+        // the one piece of ground truth available even on a stripped
+        // binary.
+        for (helper, import_addr) in [
+            ("0x1400040ff", "0x33"),
+            ("0x14000421e", "0x34"),
+            ("0x140004e4b", "0x35"),
+            ("0x140005480", "0x36"),
+        ] {
+            graph.add_observation(helper, "size_bytes", "200", 0.95, "ghidra:function", None);
+            graph.add_observation(helper, "calls", import_addr, 0.95, "ghidra:call_graph", None);
+            graph.add_observation(import_addr, "imports", format!("KERNEL32.DLL!Thing{import_addr}"), 1.0, "ghidra:imports", None);
+        }
+
+        assert_eq!(
+            classify_provenance(&graph, "0x1400045a8"),
+            Provenance::LibraryOrRuntime
+        );
+    }
+
+    /// A pure single-callee, small-bodied function is treated as a thunk
+    /// and inherits its target's provenance directly, regardless of its
+    /// own name shape.
+    #[test]
+    fn a_small_single_callee_function_inherits_its_targets_provenance() {
+        let mut graph = KnowledgeGraph::new();
+        graph.add_observation("0x1", "has_name", "FUN_1", 0.95, "ghidra:function", None);
+        graph.add_observation("0x1", "size_bytes", "12", 0.95, "ghidra:function", None);
+        graph.add_observation("0x1", "calls", "0x2", 0.95, "ghidra:call_graph", None);
+        graph.add_observation("0x2", "imports", "MSVCRT.DLL!malloc", 1.0, "ghidra:imports", None);
+
+        assert_eq!(classify_provenance(&graph, "0x1"), Provenance::LibraryOrRuntime);
+    }
+
+    /// A large function with a single callee is NOT treated as a thunk --
+    /// it's doing real work of its own beyond delegation, so its target's
+    /// classification shouldn't simply override it.
+    #[test]
+    fn a_large_single_callee_function_is_not_treated_as_a_thunk() {
+        let mut graph = KnowledgeGraph::new();
+        graph.add_observation("0x1", "is_method_of", "Wall", 0.95, "ghidra:function", None);
+        graph.add_observation("0x1", "size_bytes", "500", 0.95, "ghidra:function", None);
+        graph.add_observation("0x1", "calls", "0x2", 0.95, "ghidra:call_graph", None);
+        graph.add_observation("0x2", "imports", "MSVCRT.DLL!malloc", 1.0, "ghidra:imports", None);
+
+        // is_method_of a real application class wins outright here --
+        // this subject was never in doubt regardless of the thunk check.
+        assert_eq!(classify_provenance(&graph, "0x1"), Provenance::Application);
     }
 }
