@@ -135,6 +135,21 @@ enum Command {
         /// Subject address to classify, e.g. 0x1400016e4
         address: String,
     },
+    /// Diagnose every unresolved function by recovery necessity
+    /// (PROJECT.md M18's `RecoveryDisposition`), independent of whether
+    /// `classify_provenance` has (or ever will have) grounds to call it
+    /// Application: RequiredApplication, RequiredUnknown (reachable, real
+    /// body, but no semantic ownership claim), ExternalLibrary,
+    /// CompilerRuntime, Unreachable, or Deferred. A diagnostic report --
+    /// unlike `frontier`, generates nothing and changes no recovered
+    /// output.
+    Disposition {
+        /// Project id, as printed by `debura new`
+        project: String,
+        /// Path to a file containing the linker's stderr output (or
+        /// `-` to read stdin)
+        linker_log: PathBuf,
+    },
     /// Run the autonomous loop
     Run {
         /// Project id, as printed by `debura new`
@@ -571,6 +586,67 @@ fn main() -> Result<()> {
             for e in &deferred {
                 println!("  {} ({}){}", e.address, e.literal_name, if e.reachable { "" } else { " [unreachable]" });
             }
+        }
+        Command::Disposition { project, linker_log } => {
+            let root = debura_core::config::projects_dir().join(&project);
+            anyhow::ensure!(root.is_dir(), "no such project: {project}");
+
+            let conn = debura_storage::init_project_db(&root.join("project.sqlite"))?;
+            let graph = debura_storage::knowledge::load(&conn)?;
+
+            let entry = graph
+                .observations()
+                .find(|o| o.predicate == "exports" && o.value == "entry")
+                .map(|o| o.subject.clone())
+                .context("no 'entry' export found -- was this project analyzed?")?;
+
+            let log_text = if linker_log.as_os_str() == "-" {
+                std::io::read_to_string(std::io::stdin()).context("reading linker log from stdin")?
+            } else {
+                std::fs::read_to_string(&linker_log)
+                    .with_context(|| format!("reading linker log at {}", linker_log.display()))?
+            };
+
+            let unresolved = debura_recovery::parse_undefined_symbols(&log_text);
+            let mut entries = debura_recovery::classify_recovery_disposition(&graph, &unresolved, &entry);
+            entries.sort_by(|a, b| a.address.cmp(&b.address));
+
+            println!("Entry point: {entry}");
+            println!("Unresolved functions: {}\n", entries.len());
+
+            for e in &entries {
+                let tag = match e.disposition {
+                    debura_recovery::RecoveryDisposition::RequiredApplication => "RequiredApplication",
+                    debura_recovery::RecoveryDisposition::RequiredUnknown => "RequiredUnknown",
+                    debura_recovery::RecoveryDisposition::ExternalLibrary => "ExternalLibrary",
+                    debura_recovery::RecoveryDisposition::CompilerRuntime => "CompilerRuntime",
+                    debura_recovery::RecoveryDisposition::Unreachable => "Unreachable",
+                    debura_recovery::RecoveryDisposition::Deferred => "Deferred",
+                };
+                println!(
+                    "{} ({}) [{tag}] provenance={:?} reachable={} body_size={} recoverable_body={} sole_callee={} callers={}/{} recovered",
+                    e.address,
+                    e.literal_name,
+                    e.provenance,
+                    e.reachable,
+                    e.body_size.map(|s| s.to_string()).unwrap_or_else(|| "?".to_string()),
+                    e.has_recoverable_body,
+                    e.sole_callee.as_deref().unwrap_or("-"),
+                    e.direct_recovered_callers.len(),
+                    e.direct_callers.len(),
+                );
+            }
+
+            let count = |want: debura_recovery::RecoveryDisposition| {
+                entries.iter().filter(|e| e.disposition == want).count()
+            };
+            println!("\nSummary ({} total unresolved functions):", entries.len());
+            println!("  RequiredApplication: {}", count(debura_recovery::RecoveryDisposition::RequiredApplication));
+            println!("  RequiredUnknown:     {}", count(debura_recovery::RecoveryDisposition::RequiredUnknown));
+            println!("  ExternalLibrary:     {}", count(debura_recovery::RecoveryDisposition::ExternalLibrary));
+            println!("  CompilerRuntime:     {}", count(debura_recovery::RecoveryDisposition::CompilerRuntime));
+            println!("  Unreachable:         {}", count(debura_recovery::RecoveryDisposition::Unreachable));
+            println!("  Deferred:            {}", count(debura_recovery::RecoveryDisposition::Deferred));
         }
         Command::Reconsider { project } => {
             let root = debura_core::config::projects_dir().join(&project);

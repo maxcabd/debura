@@ -28,7 +28,7 @@ fn latest<'a>(graph: &'a KnowledgeGraph, subject: &str, predicate: &str) -> Opti
 /// was literally the three characters `...`. Prefers the most recent
 /// *substantive* decompilation over the most recent of any kind, falling
 /// back to the latest overall only if every one on record is degenerate.
-fn latest_decompilation<'a>(graph: &'a KnowledgeGraph, subject: &str) -> Option<&'a Observation> {
+pub(crate) fn latest_decompilation<'a>(graph: &'a KnowledgeGraph, subject: &str) -> Option<&'a Observation> {
     let mut candidates: Vec<&Observation> = graph
         .observations()
         .filter(|o| o.subject == subject && o.predicate == "decompiles_to")
@@ -45,7 +45,7 @@ fn latest_decompilation<'a>(graph: &'a KnowledgeGraph, subject: &str) -> Option<
 /// A decompilation whose body is empty or just an elided `{...}`
 /// placeholder -- Ghidra emits this on some re-analysis passes for a
 /// subject it successfully decompiled fully on an earlier pass.
-fn is_degenerate_decompilation(text: &str) -> bool {
+pub(crate) fn is_degenerate_decompilation(text: &str) -> bool {
     match text.find('{') {
         Some(idx) => matches!(text[idx..].trim(), "{...}" | "{ ... }"),
         None => true,

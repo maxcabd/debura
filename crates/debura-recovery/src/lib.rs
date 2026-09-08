@@ -9,6 +9,7 @@
 //! marked as such. Every recovered name says which of the two it is.
 
 mod compat;
+mod disposition;
 mod extract;
 mod frontier;
 mod model;
@@ -18,6 +19,7 @@ mod symtab;
 mod write;
 
 pub use compat::{render_ghidra_compat_header, GHIDRA_COMPAT_HEADER_NAME};
+pub use disposition::{classify_recovery_disposition, DispositionEntry, RecoveryDisposition};
 pub use extract::extract;
 pub use frontier::{classify_frontier, parse_undefined_symbols, reachable_from, FrontierBucket, FrontierEntry, UnresolvedSymbol};
 pub use model::{
