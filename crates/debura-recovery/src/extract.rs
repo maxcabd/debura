@@ -106,6 +106,59 @@ fn parse_signature(signature: &str, raw_name: &str) -> ParsedSignature {
     }
 }
 
+/// `has_signature` and the signature line embedded at the top of
+/// `decompiles_to` are supposed to describe the same function, but a real
+/// compile found dozens of cases where they disagree: `has_signature`
+/// claims `(void)` while `decompiles_to`'s own header -- captured
+/// together with the body that follows it, so always self-consistent --
+/// lists real parameters (`param_1`, `param_2`, ...) the body actually
+/// references. Trusting the stale `has_signature` params rendered a
+/// method whose body referenced undeclared identifiers. Preferring the
+/// decompiled header's own params whenever a body is available fixes this
+/// at the source instead of patching each symptom; `None` (falling back
+/// to `has_signature`'s own params) only when there's no decompiled body
+/// to check against at all.
+fn params_from_decompilation(decompilation: &str) -> Option<String> {
+    let header_end = decompilation.find('{')?;
+    // Ghidra sometimes emits `/* WARNING: ... (addr, addr) */` comments
+    // before the real signature line -- a real case had exactly this,
+    // and a naive search for the first `(` grabbed the warning's own
+    // parenthesized address pair instead of the function's parameter
+    // list. Strip comments first so only real code is searched.
+    let header = strip_c_comments(&decompilation[..header_end]);
+    let open = header.find('(')?;
+    let close = header.rfind(')')?;
+    if close <= open {
+        return None;
+    }
+    let mut params: Vec<&str> = header[open + 1..close]
+        .split(',')
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .collect();
+    if params.first().is_some_and(|p| p.ends_with("this")) {
+        params.remove(0);
+    }
+    Some(params.join(", "))
+}
+
+/// Removes every `/* ... */` block from `text` -- just enough to keep
+/// Ghidra's own `/* WARNING: ... */` decompiler notes from being mistaken
+/// for real code when searching for the real signature's parens.
+fn strip_c_comments(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find("/*") {
+        out.push_str(&rest[..start]);
+        rest = match rest[start..].find("*/") {
+            Some(end) => &rest[start + end + 2..],
+            None => "",
+        };
+    }
+    out.push_str(rest);
+    out
+}
+
 fn build_method(
     graph: &KnowledgeGraph,
     address: &str,
@@ -133,13 +186,15 @@ fn build_method(
         parsed.return_type
     };
 
+    let params = params_from_decompilation(&decompilation).unwrap_or(parsed.params);
+
     Some(RecoveredMethod {
         address: address.to_string(),
         raw_name,
         display_name,
         name_source,
         return_type,
-        params: parsed.params,
+        params,
         is_constructor,
         is_destructor,
         decompilation,
@@ -487,6 +542,7 @@ pub fn extract(graph: &KnowledgeGraph) -> RecoveredProgram {
             .map(|o| o.value.clone())
             .unwrap_or_default();
         let parsed = parse_signature(&signature, &raw_name);
+        let params = params_from_decompilation(&decompilation).unwrap_or(parsed.params);
 
         functions.push(RecoveredFunction {
             address: subject,
@@ -494,7 +550,7 @@ pub fn extract(graph: &KnowledgeGraph) -> RecoveredProgram {
             display_name,
             name_source,
             return_type: parsed.return_type,
-            params: parsed.params,
+            params,
             decompilation,
         });
     }

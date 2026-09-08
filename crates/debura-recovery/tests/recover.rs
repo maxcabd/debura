@@ -208,6 +208,70 @@ fn a_renamed_constructor_still_renders_with_the_class_name() {
     assert!(!source.contains("initializeFood"), "source:\n{source}");
 }
 
+/// PROJECT.md M17 (compile-viability pass): a real compile hit this
+/// exactly -- `has_signature` claimed `(void)` for a method whose
+/// `decompiles_to` body (and that body's own header line) plainly uses
+/// two parameters, so the rendered signature declared zero params while
+/// the body referenced `param_1`/`param_2` as if they existed --
+/// undeclared identifiers, a hard compile error. `decompiles_to`'s own
+/// header is always self-consistent with the body that follows it, so it
+/// must win over a stale `has_signature`.
+#[test]
+fn a_stale_void_signature_does_not_override_the_decompiled_bodys_own_params() {
+    let mut graph = KnowledgeGraph::new();
+    graph.add_observation("Section", "has_vtable_at", "0x9d0", 1.0, "ghidra:vtable", None);
+    graph.add_observation("0x1", "has_name", "FUN_1", 0.95, "ghidra:function", None);
+    graph.add_observation("0x1", "has_signature", "undefined FUN_1(void)", 0.95, "ghidra:function", None);
+    graph.add_observation(
+        "0x1",
+        "decompiles_to",
+        "void FUN_1(longlong param_1,longlong param_2)\n\n{\n  FUN_2(param_2,param_1);\n  return;\n}",
+        0.95,
+        "ghidra:decompiler",
+        None,
+    );
+    graph.add_observation("0x1", "is_method_of", "Section", 0.95, "ghidra:function", None);
+    let h = graph.propose_hypothesis("0x1", "semantic_role", "populateGrid", 0.9, None);
+    graph.mark_verified(h, Utc::now()).unwrap();
+    graph.set_status(h, HypothesisStatus::Accepted).unwrap();
+
+    let program = extract(&graph);
+    let section = program.classes.iter().find(|c| c.name == "Section").unwrap();
+    let method = &section.methods[0];
+
+    assert_eq!(method.params, "longlong param_1, longlong param_2");
+}
+
+/// PROJECT.md M17 (compile-viability pass): a real case had Ghidra's own
+/// `/* WARNING: ... (addr, addr) */` decompiler notes sitting before the
+/// real signature line -- a naive search for the first `(` grabbed the
+/// warning's own parenthesized address pair instead of the function's
+/// real parameter list, corrupting both the params and the rendered
+/// signature line.
+#[test]
+fn a_leading_ghidra_warning_comment_does_not_corrupt_the_parsed_params() {
+    let mut graph = KnowledgeGraph::new();
+    graph.add_observation("0x1", "has_name", "FUN_1", 0.95, "ghidra:function", None);
+    graph.add_observation("0x1", "has_signature", "undefined FUN_1(void)", 0.95, "ghidra:function", None);
+    graph.add_observation(
+        "0x1",
+        "decompiles_to",
+        "/* WARNING: Removing unreachable block (ram, 0x0001400017b4) */\n\nvoid FUN_1(undefined8 *param_1)\n\n{\n  return;\n}",
+        0.95,
+        "ghidra:decompiler",
+        None,
+    );
+    anchor_as_application(&mut graph, "0x1", "0xa1");
+    let h = graph.propose_hypothesis("0x1", "semantic_role", "spawnFood", 0.9, None);
+    graph.mark_verified(h, Utc::now()).unwrap();
+    graph.set_status(h, HypothesisStatus::Accepted).unwrap();
+
+    let program = extract(&graph);
+    let function = program.functions.iter().find(|f| f.address == "0x1").unwrap();
+
+    assert_eq!(function.params, "undefined8 *param_1");
+}
+
 #[test]
 fn functions_without_an_accepted_hypothesis_are_not_recovered() {
     let mut graph = KnowledgeGraph::new();
