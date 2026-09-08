@@ -1,7 +1,7 @@
 use debura_analysis::ingest;
 use debura_ghidra::{
-    AnalysisResult, ExportFact, FieldFact, FunctionFact, ImportFact, InheritanceFact, StringFact,
-    VirtualMethodFact, VtableFact, XrefFact,
+    AnalysisResult, DataObjectFact, ExportFact, FieldFact, FunctionFact, ImportFact,
+    InheritanceFact, StringFact, VirtualMethodFact, VtableFact, XrefFact,
 };
 use debura_knowledge::KnowledgeGraph;
 
@@ -17,6 +17,7 @@ fn empty_result() -> AnalysisResult {
         virtual_methods: Vec::new(),
         inheritance: Vec::new(),
         fields: Vec::new(),
+        data_objects: Vec::new(),
     }
 }
 
@@ -320,4 +321,99 @@ fn m1_facts_are_unaffected() {
     assert!(graph
         .observations()
         .any(|o| o.predicate == "exports" && o.value == "DllMain"));
+}
+
+/// PROJECT.md M18.2: `DataObjectFact` restates exactly what Ghidra found
+/// -- no semantic claim (no `data_kind`) is ever written here.
+#[test]
+fn m18_2_data_object_facts_become_observations() {
+    let mut analysis = empty_result();
+    analysis.data_objects.push(DataObjectFact {
+        address: "0x140009a00".to_string(),
+        symbol_name: Some("PTR_FUN_140009a00".to_string()),
+        section: Some(".data".to_string()),
+        readable: Some(true),
+        writable: Some(true),
+        executable: Some(false),
+        initialized: Some(true),
+        data_type: Some("undefined8".to_string()),
+        size: Some(8),
+        size_confident: true,
+        bytes_hex: Some("5017001400000000".to_string()),
+        inside_function: None,
+        pointee_address: Some("0x140001750".to_string()),
+        pointee_source: Some("reference".to_string()),
+        referenced_from: vec!["0x1400030a7".to_string()],
+    });
+    // A second real case: no defined Data object, no confident size --
+    // must not synthesize a `data_size_bytes` fact for it.
+    analysis.data_objects.push(DataObjectFact {
+        address: "0x14000e130".to_string(),
+        symbol_name: Some("DAT_14000e130".to_string()),
+        section: Some(".bss".to_string()),
+        readable: Some(true),
+        writable: Some(true),
+        executable: Some(false),
+        initialized: Some(false),
+        data_type: None,
+        size: None,
+        size_confident: false,
+        bytes_hex: None,
+        inside_function: None,
+        pointee_address: None,
+        pointee_source: None,
+        referenced_from: Vec::new(),
+    });
+
+    // A third case: a real size, but only estimated from the next
+    // symbol's distance, not a defined Data object -- must land under
+    // the visibly-different `data_size_bytes_estimated` predicate, never
+    // silently pass as an authoritative `data_size_bytes`.
+    analysis.data_objects.push(DataObjectFact {
+        address: "0x140009070".to_string(),
+        symbol_name: Some("DAT_140009070".to_string()),
+        section: Some(".data".to_string()),
+        readable: Some(true),
+        writable: Some(true),
+        executable: Some(false),
+        initialized: Some(true),
+        data_type: None,
+        size: Some(16),
+        size_confident: false,
+        bytes_hex: None,
+        inside_function: None,
+        pointee_address: None,
+        pointee_source: None,
+        referenced_from: Vec::new(),
+    });
+
+    let mut graph = KnowledgeGraph::new();
+    ingest(&mut graph, &analysis, "artifacts/analysis.json");
+
+    let has = |subject: &str, predicate: &str, value: &str| {
+        graph.observations().any(|o| o.subject == subject && o.predicate == predicate && o.value == value)
+    };
+
+    assert!(has("0x140009a00", "data_symbol_name", "PTR_FUN_140009a00"));
+    assert!(has("0x140009a00", "data_section", ".data"));
+    assert!(has("0x140009a00", "data_writable", "true"));
+    assert!(has("0x140009a00", "data_size_bytes", "8"));
+    assert!(has("0x140009a00", "data_pointee", "0x140001750 (reference)"));
+    assert!(has("0x140009a00", "data_referenced_from", "0x1400030a7"));
+
+    assert!(has("0x14000e130", "data_initialized", "false"));
+    assert!(
+        !graph.observations().any(|o| o.subject == "0x14000e130" && o.predicate == "data_size_bytes"),
+        "an unconfident size must not be recorded as an authoritative one"
+    );
+    assert!(
+        !graph.observations().any(|o| o.subject == "0x14000e130" && o.predicate.starts_with("data_size_bytes_estimated")),
+        "no real size was known at all, so nothing -- not even an estimate -- should be recorded"
+    );
+
+    assert!(has("0x140009070", "data_size_bytes_estimated", "16"));
+    assert!(
+        !graph.observations().any(|o| o.subject == "0x140009070" && o.predicate == "data_size_bytes"),
+        "an estimated size must never masquerade as the confident predicate"
+    );
 }

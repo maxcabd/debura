@@ -324,4 +324,70 @@ pub fn ingest(graph: &mut KnowledgeGraph, analysis: &AnalysisResult, artifact_pa
             None,
         );
     }
+
+    // PROJECT.md M18.2: `DAT_*`/`PTR_*`/`LAB_*` linker placeholders were,
+    // until now, never their own subject at all -- Debura had no facts
+    // about the data an unresolved `DAT_x`/`PTR_x` name actually refers
+    // to, only that recovered code mentions it by name. Every predicate
+    // here restates exactly one Ghidra-observed fact from
+    // `DataObjectFact`, none of it a semantic claim (`data_kind`
+    // classification is `debura-recovery`'s job, working from these,
+    // matching the same trust split M7's own vtable/field facts already
+    // use).
+    for d in &analysis.data_objects {
+        if let Some(symbol_name) = &d.symbol_name {
+            add_once(graph, &mut seen, &d.address, "data_symbol_name", symbol_name, HEURISTIC_CONFIDENCE, "ghidra:data", None);
+        }
+        if let Some(section) = &d.section {
+            add_once(graph, &mut seen, &d.address, "data_section", section, HEURISTIC_CONFIDENCE, "ghidra:data", None);
+        }
+        if let Some(readable) = d.readable {
+            add_once(graph, &mut seen, &d.address, "data_readable", readable.to_string(), HEURISTIC_CONFIDENCE, "ghidra:data", None);
+        }
+        if let Some(writable) = d.writable {
+            add_once(graph, &mut seen, &d.address, "data_writable", writable.to_string(), HEURISTIC_CONFIDENCE, "ghidra:data", None);
+        }
+        if let Some(executable) = d.executable {
+            add_once(graph, &mut seen, &d.address, "data_executable", executable.to_string(), HEURISTIC_CONFIDENCE, "ghidra:data", None);
+        }
+        if let Some(initialized) = d.initialized {
+            add_once(graph, &mut seen, &d.address, "data_initialized", initialized.to_string(), HEURISTIC_CONFIDENCE, "ghidra:data", None);
+        }
+        if let Some(data_type) = &d.data_type {
+            add_once(graph, &mut seen, &d.address, "data_type_name", data_type, HEURISTIC_CONFIDENCE, "ghidra:data", None);
+        }
+        if let Some(size) = d.size {
+            add_once(
+                graph,
+                &mut seen,
+                &d.address,
+                if d.size_confident { "data_size_bytes" } else { "data_size_bytes_estimated" },
+                size.to_string(),
+                HEURISTIC_CONFIDENCE,
+                "ghidra:data",
+                None,
+            );
+        }
+        if let Some(bytes_hex) = &d.bytes_hex {
+            add_once(graph, &mut seen, &d.address, "data_bytes_hex", bytes_hex, HEURISTIC_CONFIDENCE, "ghidra:data", None);
+        }
+        if let Some(inside_function) = &d.inside_function {
+            add_once(graph, &mut seen, &d.address, "data_inside_function", inside_function, HEURISTIC_CONFIDENCE, "ghidra:data", None);
+        }
+        if let (Some(pointee), Some(source)) = (&d.pointee_address, &d.pointee_source) {
+            add_once(
+                graph,
+                &mut seen,
+                &d.address,
+                "data_pointee",
+                format!("{pointee} ({source})"),
+                HEURISTIC_CONFIDENCE,
+                "ghidra:data",
+                None,
+            );
+        }
+        for from in &d.referenced_from {
+            add_once(graph, &mut seen, &d.address, "data_referenced_from", from, HEURISTIC_CONFIDENCE, "ghidra:data", None);
+        }
+    }
 }

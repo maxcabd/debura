@@ -10,7 +10,7 @@ pub mod model;
 
 pub use headless::{analyze, reextract};
 pub use model::{
-    AnalysisResult, ExportFact, FieldFact, FunctionFact, ImportFact, InheritanceFact, StringFact,
-    VirtualMethodFact, VtableFact, XrefFact,
+    AnalysisResult, DataObjectFact, ExportFact, FieldFact, FunctionFact, ImportFact,
+    InheritanceFact, StringFact, VirtualMethodFact, VtableFact, XrefFact,
 };
 pub use mutation::{apply_renames, is_valid_symbol_name, RenameOutcome, RenameRequest};

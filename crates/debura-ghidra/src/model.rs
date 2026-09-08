@@ -99,6 +99,56 @@ pub struct FieldFact {
     pub field_type: String,
 }
 
+/// A deterministic fact about one address recovered code references that
+/// isn't itself a known function entry point (PROJECT.md M18.2) --
+/// exactly the shape a `DAT_*`/`PTR_*`/`LAB_*` linker placeholder is.
+/// Every field here is Ghidra's own observation, never an interpretation
+/// of it: `size`/`bytes_hex` are only ever set from a real, bounded
+/// extent (a defined Data object, or a next symbol close enough to trust
+/// as a bound), never guessed from a name shape; `pointee_address` is
+/// only set when Ghidra's own reference analysis found one, or a
+/// bounds-checked raw 8-byte read resolves to a real in-program address
+/// (`pointee_source` says which). Deriving a semantic kind (mutable
+/// global vs. constant, pointer-to-function vs. pointer-to-import, ...)
+/// from these is `debura-analysis`'s/the recovery layer's job, not this
+/// crate's -- see `ExtractFacts.py`'s own `extract_data_objects`
+/// docstring for the full reasoning (a real, deliberate design
+/// correction: an earlier draft classified `kind` directly in the
+/// extraction script itself, exactly the premature semantic claim this
+/// whole project's own discipline exists to avoid).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DataObjectFact {
+    pub address: String,
+    pub symbol_name: Option<String>,
+    pub section: Option<String>,
+    pub readable: Option<bool>,
+    pub writable: Option<bool>,
+    pub executable: Option<bool>,
+    pub initialized: Option<bool>,
+    pub data_type: Option<String>,
+    pub size: Option<u64>,
+    /// `false` when `size` was only estimated from a next-symbol
+    /// distance (not a real Ghidra-defined Data object's own length) --
+    /// still bounded/sane, but not authoritative the way a defined
+    /// type's length is.
+    pub size_confident: bool,
+    /// Only ever populated when `size` is both known and small enough
+    /// to be worth reading (`ExtractFacts.py`'s own bounded cap) --
+    /// `None` otherwise, deliberately never an unbounded/guessed read.
+    pub bytes_hex: Option<String>,
+    /// The containing function's own entry-point address, if this
+    /// address falls inside one -- the concrete, checkable answer to
+    /// "is this actually a code label taken as a value, not real data".
+    pub inside_function: Option<String>,
+    pub pointee_address: Option<String>,
+    /// `"reference"` (Ghidra's own reference analysis) or
+    /// `"raw_bytes"` (a bounds-checked reinterpretation of this
+    /// address's own 8 raw bytes) -- `None` alongside a `None`
+    /// `pointee_address`.
+    pub pointee_source: Option<String>,
+    pub referenced_from: Vec<String>,
+}
+
 /// The full set of deterministic observations extracted from one program
 /// (PROJECT.md S21, M1/M7). Raw material for M2's Observation/Evidence
 /// model -- this crate does not interpret any of it.
@@ -114,4 +164,5 @@ pub struct AnalysisResult {
     pub virtual_methods: Vec<VirtualMethodFact>,
     pub inheritance: Vec<InheritanceFact>,
     pub fields: Vec<FieldFact>,
+    pub data_objects: Vec<DataObjectFact>,
 }

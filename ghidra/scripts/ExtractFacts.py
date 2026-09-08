@@ -526,6 +526,145 @@ def extract_xrefs():
     return xrefs
 
 
+DATA_OBJECT_MAX_BYTES = 64  # deliberately small -- see extract_data_objects's own docstring
+DATA_OBJECT_BOUNDARY_SEARCH_LIMIT = 256  # only trust a next-symbol-derived size this close
+
+
+def read_bytes_hex(mem, addr, length):
+    try:
+        raw = []
+        for i in range(length):
+            raw.append(mem.getByte(addr.add(i)) & 0xff)
+        return "".join("%02x" % b for b in raw)
+    except:
+        return None
+
+
+def extract_data_objects(sym_table, mem, addr_factory, fm, ref_manager):
+    """Deterministic facts about every address recovered code actually
+    references that isn't itself a known function's entry point (PROJECT.md
+    M18.2) -- i.e. exactly the `DAT_*`/`PTR_*`/`LAB_*`-shaped placeholder
+    names a real recovery/link attempt runs into, scoped to what's
+    genuinely used rather than a whole-binary data dump. Reuses
+    `extract_xrefs()`'s own reference-target set as that scope: every
+    `to` address any recovered function's own instructions reference.
+
+    Deliberately facts only, no interpretation (PROJECT.md S21) -- this
+    was a real design correction mid-build: an earlier draft would have
+    written `kind = MutableGlobal`/`PointerToFunction` here directly, but
+    that's exactly the kind of premature semantic claim this whole
+    project's own discipline exists to avoid making from Ghidra's naming
+    convention alone (`DAT_`/`PTR_` are Ghidra's own renderings, not
+    proof of anything). What's recorded instead: this address's own
+    section/permissions/initialization state, its real size and raw
+    bytes *only* when a real extent is known (a defined Data object, or a
+    next symbol close enough to trust as a bound -- never a blind,
+    unbounded read past whatever the object's true size actually is),
+    whether it falls inside a known function's own body (the concrete,
+    checkable question behind "is this actually a code label, not
+    data"), and -- when Ghidra's own reference analysis or a bounds-
+    checked raw 8-byte read plausibly resolves to another address in the
+    program -- that address as a candidate pointee, tagged with which of
+    the two ways it was found. `debura-analysis`'s Rust-side classifier
+    derives everything else (mutable-global vs. constant, pointer-to-
+    function vs. pointer-to-import, ...) from these facts, never
+    guessed here.
+    """
+    fm_get_function_at = fm.getFunctionAt
+    fm_get_function_containing = fm.getFunctionContaining
+
+    candidates = set()
+    for func in fm.getFunctions(True):
+        if func.isExternal():
+            continue
+        addr_iter = func.getBody().getAddresses(True)
+        while addr_iter.hasNext():
+            addr = addr_iter.next()
+            for ref in ref_manager.getReferencesFrom(addr):
+                to = ref.getToAddress()
+                if fm_get_function_at(to) is not None:
+                    continue  # a real function entry point -- already covered by extract_functions
+                candidates.add(to)
+
+    objects = []
+    for addr in candidates:
+        symbol = sym_table.getPrimarySymbol(addr)
+        symbol_name = symbol.getName() if symbol is not None else None
+
+        block = mem.getBlock(addr)
+        section = block.getName() if block is not None else None
+        readable = block.isRead() if block is not None else None
+        writable = block.isWrite() if block is not None else None
+        executable = block.isExecute() if block is not None else None
+        initialized = block.isInitialized() if block is not None else None
+
+        data_type = None
+        size = None
+        size_confident = False
+        data = None
+        try:
+            data = mem.getBlock(addr) and currentProgram.getListing().getDataAt(addr)
+        except:
+            data = None
+        if data is not None:
+            data_type = data.getDataType().getDisplayName()
+            size = data.getLength()
+            size_confident = True
+        else:
+            boundary = next_symbol_boundary(sym_table, addr)
+            if boundary is not None:
+                distance = boundary.subtract(addr)
+                if 0 < distance <= DATA_OBJECT_BOUNDARY_SEARCH_LIMIT:
+                    size = distance
+
+        bytes_hex = None
+        if size is not None and 0 < size <= DATA_OBJECT_MAX_BYTES:
+            bytes_hex = read_bytes_hex(mem, addr, size)
+
+        containing_func = fm_get_function_containing(addr)
+        inside_function = addr_str(containing_func.getEntryPoint()) if containing_func is not None else None
+
+        pointee_address = None
+        pointee_source = None
+        outgoing = ref_manager.getReferencesFrom(addr)
+        if outgoing.hasNext():
+            pointee_address = addr_str(outgoing.next().getToAddress())
+            pointee_source = "reference"
+        elif bytes_hex is not None and size == 8:
+            try:
+                raw_value = mem.getLong(addr)
+                candidate = resolve_pointer(mem, addr_factory, raw_value)
+                if candidate is not None and mem.contains(candidate):
+                    pointee_address = addr_str(candidate)
+                    pointee_source = "raw_bytes"
+            except:
+                pass
+
+        referenced_from = sorted(set(
+            addr_str(ref.getFromAddress()) for ref in ref_manager.getReferencesTo(addr)
+        ))
+
+        objects.append({
+            "address": addr_str(addr),
+            "symbol_name": symbol_name,
+            "section": section,
+            "readable": readable,
+            "writable": writable,
+            "executable": executable,
+            "initialized": initialized,
+            "data_type": data_type,
+            "size": size,
+            "size_confident": size_confident,
+            "bytes_hex": bytes_hex,
+            "inside_function": inside_function,
+            "pointee_address": pointee_address,
+            "pointee_source": pointee_source,
+            "referenced_from": referenced_from,
+        })
+
+    return objects
+
+
 def next_symbol_boundary(sym_table, addr):
     """The address of the next symbol strictly after `addr`, or None at the
     end of the symbol table. Used to bound reads into a vtable/typeinfo
@@ -743,6 +882,7 @@ def run():
                 extract_type_info(sym_table, mem, addr_factory), struct_inheritance
             ),
             "fields": fields,
+            "data_objects": extract_data_objects(sym_table, mem, addr_factory, fm, ref_manager),
         }
     finally:
         decompiler.dispose()
