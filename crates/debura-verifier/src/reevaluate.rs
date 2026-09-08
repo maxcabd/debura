@@ -1,5 +1,7 @@
+use debura_agent::commit_contradiction;
 use debura_knowledge::{HypothesisId, HypothesisStatus, KnowledgeGraph};
 
+use crate::mechanical_shape::mechanically_shaped_reason;
 use crate::policy::VerificationPolicy;
 use crate::vtable_propagation::propagate_vtable_slot_role;
 
@@ -25,6 +27,7 @@ pub fn reevaluate_hypothesis(
         return Some(h.status);
     }
 
+    let old_status = h.status;
     let verified = h.last_verified_at.is_some();
     let confidence = h.confidence;
 
@@ -36,7 +39,26 @@ pub fn reevaluate_hypothesis(
         HypothesisStatus::Proposed
     };
 
-    if new_status != h.status {
+    if new_status == HypothesisStatus::Accepted {
+        if let Some(reason) = mechanically_shaped_reason(graph, id) {
+            // PROJECT.md M17: caught in practice -- three sibling classes'
+            // semantic_role of "iteratesGrid" all reached here with a
+            // qualifying confidence and verification stamp, restating each
+            // subject's own mechanical_behavior word-for-word, and
+            // CHALLENGE_SYSTEM's free-form side-effect question missed all
+            // three. Don't let this one silently coast to ACCEPTED just
+            // because the number-crunching above cleared the bar -- push it
+            // through the same CONTESTED -> ResolveContradiction path any
+            // other contradiction takes (commit_contradiction sets the
+            // status), so a human-legible reason and the normal adversarial
+            // pass still decide it, rather than this check silently
+            // vetoing it on its own.
+            commit_contradiction(graph, id, &reason, "debura:mechanical_shape_check");
+            return graph.hypothesis(id).map(|h| h.status);
+        }
+    }
+
+    if new_status != old_status {
         let _ = graph.set_status(id, new_status);
         if new_status == HypothesisStatus::Accepted {
             // PROJECT.md M17: this is the single choke point every path

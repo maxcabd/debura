@@ -7,11 +7,13 @@
 //! verification attempt on record (`last_verified_at`). Confidence alone
 //! is never enough.
 
+mod mechanical_shape;
 mod policy;
 mod reevaluate;
 mod verify;
 mod vtable_propagation;
 
+pub use mechanical_shape::mechanically_shaped_reason;
 pub use policy::VerificationPolicy;
 pub use reevaluate::reevaluate_hypothesis;
 pub use verify::{
