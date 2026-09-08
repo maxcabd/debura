@@ -239,7 +239,82 @@ fn a_stale_void_signature_does_not_override_the_decompiled_bodys_own_params() {
     let section = program.classes.iter().find(|c| c.name == "Section").unwrap();
     let method = &section.methods[0];
 
-    assert_eq!(method.params, "longlong param_1, longlong param_2");
+    // The receiver (param_1) is always excluded from the declared
+    // params -- a call site's own leading argument always supplies it --
+    // and re-bound inside the body instead (PROJECT.md M18), so the
+    // body's own `FUN_2(param_2,param_1)` still resolves correctly.
+    assert_eq!(method.params, "longlong param_2");
+    assert!(method.decompilation.contains("longlong param_1 = (longlong)this;"), "{}", method.decompilation);
+    assert!(method.decompilation.contains("FUN_2(param_2,param_1)"), "{}", method.decompilation);
+}
+
+/// PROJECT.md M18: the real end-to-end regression this was built for --
+/// a real link had `Food`'s constructor calling `Collideable`'s own
+/// constructor (a real structurally-discovered address, never recognized
+/// by Ghidra's own type system as a method at all, so its receiver shows
+/// up as an ordinary `param_1` used for real field writes, not as
+/// `this`) NOT through the leading-base-constructor-call special case
+/// (no `inherits_from` edge existed for this pair in the real graph),
+/// but through `rewrite_call_sites`'s general path. An earlier version
+/// of the params fix either left the receiver in the declaration
+/// (breaking the call site's arity against `symtab.rs`'s always-add-1
+/// convention) or dropped it outright (breaking the body, which uses it
+/// directly). This is the exact shape that must both compile *and* link.
+#[test]
+fn a_structurally_discovered_constructor_call_resolves_through_the_general_path() {
+    let mut graph = KnowledgeGraph::new();
+    graph.add_observation("Collideable", "has_vtable_at", "0x980", 1.0, "ghidra:vtable", None);
+    graph.add_observation("Food", "has_vtable_at", "0x9c0", 1.0, "ghidra:vtable", None);
+    // Deliberately no `inherits_from` -- models the real graph shape
+    // where this call site was never caught by the leading-base-
+    // constructor-call special case, only the general one.
+
+    graph.add_observation("0x1", "has_name", "FUN_1", 0.95, "ghidra:function", None);
+    graph.add_observation("0x1", "has_signature", "undefined FUN_1(undefined8 *param_1, undefined4 param_2, undefined4 param_3)", 0.95, "ghidra:function", None);
+    graph.add_observation(
+        "0x1",
+        "decompiles_to",
+        "void FUN_1(undefined8 *param_1,undefined4 param_2,undefined4 param_3)\n\n{\n  \
+         *param_1 = &DAT_140009a60;\n  \
+         *(undefined4 *)(param_1 + 1) = param_2;\n  \
+         return;\n}",
+        0.95,
+        "ghidra:decompiler",
+        None,
+    );
+    graph.add_observation("0x1", "is_constructor_of", "Collideable", 0.95, "ghidra:function", None);
+
+    graph.add_observation("0x2", "has_name", "Food", 0.95, "ghidra:function", None);
+    graph.add_observation("0x2", "has_signature", "undefined FUN_2(undefined8 *param_1)", 0.95, "ghidra:function", None);
+    graph.add_observation(
+        "0x2",
+        "decompiles_to",
+        "void FUN_2(undefined8 *param_1)\n\n{\n  FUN_1(param_1,0,0);\n  *param_1 = &PTR_draw_140009a00;\n  return;\n}",
+        0.95,
+        "ghidra:decompiler",
+        None,
+    );
+    graph.add_observation("0x2", "is_constructor_of", "Food", 0.95, "ghidra:function", None);
+
+    let program = extract(&graph);
+    let food = program.classes.iter().find(|c| c.name == "Food").unwrap();
+    let source = render_source(food);
+
+    assert!(
+        source.contains("new ((void *)(param_1)) Collideable(0,0)"),
+        "the base's constructor call must resolve through the general path: {source}"
+    );
+    assert!(!source.contains("FUN_1("), "no raw unresolved call should remain: {source}");
+
+    let collideable = program.classes.iter().find(|c| c.name == "Collideable").unwrap();
+    let ctor = &collideable.methods[0];
+    assert_eq!(ctor.params, "undefined4 param_2, undefined4 param_3");
+    let body = ctor.decompilation.replace(' ', "");
+    assert!(
+        body.contains("undefined8*param_1=(undefined8*)this;"),
+        "the receiver must be re-bound to the real `this` inside the body: {}",
+        ctor.decompilation
+    );
 }
 
 /// PROJECT.md M17 (compile-viability pass): a real case had Ghidra's own

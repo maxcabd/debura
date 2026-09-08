@@ -103,12 +103,28 @@ struct ParsedSignature {
     params: String,
 }
 
+/// A method's own declared parameters always exclude the receiver -- a
+/// call site's own leading argument always supplies it, whether Ghidra's
+/// type system recognized this address as a method (`Class *this`,
+/// textually named `this`) or not (M7's *structural* vtable detection
+/// found it instead, so it shows up as an ordinary `param_1`). When it's
+/// the latter, the body still references that name directly for raw
+/// pointer arithmetic on the receiver -- so it can't simply be dropped;
+/// `alias` carries what a caller needs to re-bind it to the real,
+/// compiler-provided `this` instead (see `render_receiver_alias`).
+struct ReceiverAlias {
+    ty: String,
+    name: String,
+}
+
 /// Ghidra's own signature strings look like `RETTYPE raw_name(TYPE * this,
 /// TYPE2 param_1, ...)` for anything with a recognized `this` parameter.
 /// This is a best-effort split, not a real C parser -- good enough for the
 /// shapes Ghidra's decompiler actually produces, not a guarantee for every
-/// possible one.
-fn parse_signature(signature: &str, raw_name: &str) -> ParsedSignature {
+/// possible one. `is_method` must be true for a constructor/destructor/
+/// method, false for a standalone function -- only a method has any
+/// receiver to strip at all.
+fn parse_signature(signature: &str, raw_name: &str, is_method: bool) -> (ParsedSignature, Option<ReceiverAlias>) {
     let open = signature.find('(').unwrap_or(signature.len());
     let close = signature.rfind(')').unwrap_or(signature.len());
 
@@ -125,18 +141,44 @@ fn parse_signature(signature: &str, raw_name: &str) -> ParsedSignature {
         .map(str::trim)
         .filter(|p| !p.is_empty())
         .collect();
-    if params.first().is_some_and(|p| p.ends_with("this")) {
-        params.remove(0);
-    }
+    let alias = if is_method { strip_receiver_param(&mut params) } else { None };
 
-    ParsedSignature {
-        return_type: if return_type.is_empty() {
-            "void".to_string()
-        } else {
-            return_type.to_string()
+    (
+        ParsedSignature {
+            return_type: if return_type.is_empty() {
+                "void".to_string()
+            } else {
+                return_type.to_string()
+            },
+            params: params.join(", "),
         },
-        params: params.join(", "),
+        alias,
+    )
+}
+
+/// Drops a method's own leading receiver parameter from `params`
+/// unconditionally -- a call site's own leading argument always supplies
+/// it either way (see `ReceiverAlias`'s own doc comment) -- and returns
+/// an alias to re-bind inside the body when it wasn't textually named
+/// `this` (nothing to re-bind in that case: the body's own uses of the
+/// identifier `this` already correctly resolve to the real, compiler-
+/// provided one once the declared parameter naming it is gone).
+fn strip_receiver_param(params: &mut Vec<&str>) -> Option<ReceiverAlias> {
+    let first = params.first()?;
+    if first.ends_with("this") {
+        params.remove(0);
+        return None;
     }
+    let name = first
+        .rsplit(|c: char| c == ' ' || c == '*')
+        .find(|s| !s.is_empty())?
+        .to_string();
+    let ty = first[..first.len() - name.len()].trim_end().to_string();
+    if ty.is_empty() {
+        return None;
+    }
+    params.remove(0);
+    Some(ReceiverAlias { ty, name })
 }
 
 /// `has_signature` and the signature line embedded at the top of
@@ -151,7 +193,7 @@ fn parse_signature(signature: &str, raw_name: &str) -> ParsedSignature {
 /// at the source instead of patching each symptom; `None` (falling back
 /// to `has_signature`'s own params) only when there's no decompiled body
 /// to check against at all.
-fn params_from_decompilation(decompilation: &str) -> Option<String> {
+fn params_from_decompilation(decompilation: &str, is_method: bool) -> Option<(String, Option<ReceiverAlias>)> {
     let header_end = decompilation.find('{')?;
     // Ghidra sometimes emits `/* WARNING: ... (addr, addr) */` comments
     // before the real signature line -- a real case had exactly this,
@@ -169,10 +211,36 @@ fn params_from_decompilation(decompilation: &str) -> Option<String> {
         .map(str::trim)
         .filter(|p| !p.is_empty())
         .collect();
-    if params.first().is_some_and(|p| p.ends_with("this")) {
-        params.remove(0);
+    let alias = if is_method { strip_receiver_param(&mut params) } else { None };
+    Some((params.join(", "), alias))
+}
+
+/// The local-variable declaration that re-binds a structurally-
+/// discovered method's own raw receiver name back to the real, implicit
+/// `this` -- `<type> <name> = (<type>)this;`, a plain C-style cast valid
+/// for any pointer-shaped or integer-shaped raw type Ghidra emits (both
+/// shapes are observed: `longlong *param_1` and bare `longlong param_1`
+/// used as an address value). Inserted as the body's own first
+/// statement, right after its opening `{`, so every other reference to
+/// that name in the body resolves exactly as it did when it was a real
+/// parameter -- the only thing that changed is where the value comes
+/// from.
+fn render_receiver_alias(alias: &ReceiverAlias) -> String {
+    format!("\n  {} {} = ({}){};\n", alias.ty, alias.name, alias.ty, "this")
+}
+
+/// Splices `alias`'s declaration in as the first statement of
+/// `decompilation`'s own body (right after its opening `{`), leaving
+/// everything else -- including the header/signature line before it --
+/// untouched.
+fn splice_receiver_alias(decompilation: &str, alias: &ReceiverAlias) -> String {
+    match decompilation.find('{') {
+        Some(brace) => {
+            let (before, after) = decompilation.split_at(brace + 1);
+            format!("{before}{}{after}", render_receiver_alias(alias))
+        }
+        None => decompilation.to_string(),
     }
-    Some(params.join(", "))
 }
 
 /// Removes every `/* ... */` block from `text` -- just enough to keep
@@ -203,7 +271,7 @@ fn build_method(
     let signature = latest(graph, address, "has_signature").map(|o| o.value.clone()).unwrap_or_default();
     let decompilation = latest_decompilation(graph, address).map(|o| o.value.clone()).unwrap_or_default();
     let (display_name, name_source) = name_source(graph, address).unwrap_or_else(|| (raw_name.clone(), NameSource::Raw));
-    let parsed = parse_signature(&signature, &raw_name);
+    let (parsed, parsed_alias) = parse_signature(&signature, &raw_name, true);
 
     // Itanium ABI's calling convention returns `this` in the return
     // register for `operator=`, which Ghidra always decompiles as
@@ -219,7 +287,24 @@ fn build_method(
         parsed.return_type
     };
 
-    let params = params_from_decompilation(&decompilation).unwrap_or(parsed.params);
+    let (params, alias) = match params_from_decompilation(&decompilation, true) {
+        Some((params, alias)) => (params, alias),
+        None => (parsed.params, parsed_alias),
+    };
+    // PROJECT.md M18: a real link found this exact gap -- a method M7's
+    // structural detection found (never recognized by Ghidra's own type
+    // system) has its receiver in the body as an ordinary parameter
+    // (`param_1`), used for raw pointer arithmetic on the receiver, not
+    // the keyword `this`. Dropping it from the declaration (needed so
+    // `symtab.rs`'s call-site rewriting -- which always supplies the
+    // receiver implicitly, via `->method(...)`/placement-new -- has the
+    // right arity) would leave the body referencing an undeclared name;
+    // splicing a local alias back in (`<type> param_1 = (<type>)this;`)
+    // keeps every other line of the body exactly as Ghidra wrote it.
+    let decompilation = match &alias {
+        Some(alias) => splice_receiver_alias(&decompilation, alias),
+        None => decompilation,
+    };
 
     Some(RecoveredMethod {
         address: address.to_string(),
@@ -574,8 +659,12 @@ pub fn extract(graph: &KnowledgeGraph) -> RecoveredProgram {
         let decompilation = latest_decompilation(graph, &subject)
             .map(|o| o.value.clone())
             .unwrap_or_default();
-        let parsed = parse_signature(&signature, &raw_name);
-        let params = params_from_decompilation(&decompilation).unwrap_or(parsed.params);
+        // A standalone function has no receiver at all -- `is_method:
+        // false` for both, so neither ever strips or aliases anything.
+        let (parsed, _) = parse_signature(&signature, &raw_name, false);
+        let params = params_from_decompilation(&decompilation, false)
+            .map(|(params, _)| params)
+            .unwrap_or(parsed.params);
 
         functions.push(RecoveredFunction {
             address: subject,
