@@ -10,6 +10,7 @@
 
 mod compat;
 mod extract;
+mod frontier;
 mod model;
 mod render;
 mod symbols;
@@ -18,6 +19,7 @@ mod write;
 
 pub use compat::{render_ghidra_compat_header, GHIDRA_COMPAT_HEADER_NAME};
 pub use extract::extract;
+pub use frontier::{classify_frontier, parse_undefined_symbols, reachable_from, FrontierBucket, FrontierEntry, UnresolvedSymbol};
 pub use model::{
     NameSource, RecoveredClass, RecoveredField, RecoveredFunction, RecoveredMethod,
     RecoveredProgram,

@@ -98,6 +98,21 @@ enum Command {
         /// Project id, as printed by `debura new`
         project: String,
     },
+    /// Classify a real linker's undefined-symbol output into the
+    /// concrete recovery frontier (PROJECT.md M18): which unresolved
+    /// addresses are real application dependencies still worth
+    /// recovering, which are library/runtime code that need a different
+    /// fix, and which aren't even reachable from this program's own
+    /// entrypoint yet. Debura doesn't invoke the compiler/linker itself
+    /// (build flags and library paths are project-specific) -- run your
+    /// own build, capture its stderr, and point this at that file.
+    Frontier {
+        /// Project id, as printed by `debura new`
+        project: String,
+        /// Path to a file containing the linker's stderr output (or
+        /// `-` to read stdin)
+        linker_log: PathBuf,
+    },
     /// Run the autonomous loop
     Run {
         /// Project id, as printed by `debura new`
@@ -473,6 +488,67 @@ fn main() -> Result<()> {
             println!("Classes recovered:   {}", summary.classes_written);
             println!("Functions recovered: {}", summary.functions_written);
             println!("Written to: {}", root.join("recovered").display());
+        }
+        Command::Frontier { project, linker_log } => {
+            let root = debura_core::config::projects_dir().join(&project);
+            anyhow::ensure!(root.is_dir(), "no such project: {project}");
+
+            let conn = debura_storage::init_project_db(&root.join("project.sqlite"))?;
+            let graph = debura_storage::knowledge::load(&conn)?;
+
+            let entry = graph
+                .observations()
+                .find(|o| o.predicate == "exports" && o.value == "entry")
+                .map(|o| o.subject.clone())
+                .context("no 'entry' export found -- was this project analyzed?")?;
+
+            let log_text = if linker_log.as_os_str() == "-" {
+                std::io::read_to_string(std::io::stdin()).context("reading linker log from stdin")?
+            } else {
+                std::fs::read_to_string(&linker_log)
+                    .with_context(|| format!("reading linker log at {}", linker_log.display()))?
+            };
+
+            let unresolved = debura_recovery::parse_undefined_symbols(&log_text);
+            let data_count = unresolved.iter().filter(|u| matches!(u, debura_recovery::UnresolvedSymbol::Data { .. })).count();
+            let entries = debura_recovery::classify_frontier(&graph, &unresolved, &entry);
+
+            let mut needs_recovery: Vec<_> = entries
+                .iter()
+                .filter(|e| e.bucket == debura_recovery::FrontierBucket::NeedsRecovery)
+                .collect();
+            needs_recovery.sort_by(|a, b| a.address.cmp(&b.address));
+            let mut library: Vec<_> = entries
+                .iter()
+                .filter(|e| e.bucket == debura_recovery::FrontierBucket::LibraryOrRuntime)
+                .collect();
+            library.sort_by(|a, b| a.address.cmp(&b.address));
+            let mut deferred: Vec<_> = entries
+                .iter()
+                .filter(|e| e.bucket == debura_recovery::FrontierBucket::Deferred)
+                .collect();
+            deferred.sort_by(|a, b| a.address.cmp(&b.address));
+
+            println!("Entry point: {entry}");
+            println!("Unresolved references in linker log: {} function, {data_count} data\n", entries.len());
+
+            println!("Needs recovery ({}) -- reachable, Application provenance:", needs_recovery.len());
+            for e in &needs_recovery {
+                println!("  {} ({})", e.address, e.literal_name);
+            }
+            println!("\nLibrary/runtime ({}) -- reachable, not an application function:", library.len());
+            for e in &library {
+                println!("  {} ({})", e.address, e.literal_name);
+            }
+            let unreachable_count = deferred.iter().filter(|e| !e.reachable).count();
+            println!(
+                "\nDeferred ({}) -- {unreachable_count} unreachable from entry, {} reachable but no provenance signal yet:",
+                deferred.len(),
+                deferred.len() - unreachable_count
+            );
+            for e in &deferred {
+                println!("  {} ({}){}", e.address, e.literal_name, if e.reachable { "" } else { " [unreachable]" });
+            }
         }
         Command::Run {
             project,
