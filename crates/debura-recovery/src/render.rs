@@ -60,6 +60,16 @@ fn patch_known_idioms(text: &str) -> String {
     // real, implicit `this` (never re-declared as a local) is untouched.
     let text = rename_this_local_variable(&text);
 
+    // Ghidra occasionally decompiles a `std::string::c_str()` call with no
+    // argument at all -- a real, observed decompiler artifact (confirmed
+    // against the raw `decompiles_to` fact itself, not something this
+    // codebase's own rendering introduces: the same body's *other*
+    // std::string call, `~basic_string(local_38)`, correctly keeps its
+    // receiver). Must run before the template-argument stripping below,
+    // which would otherwise remove the exact bare-templated type name
+    // this looks for from the paired local declaration.
+    let text = fix_bare_c_str_receiver(&text);
+
     // Ghidra always writes these STL types out with their real,
     // explicit (and in this codebase, always `char`-based) template
     // arguments -- valid against the *real* std:: templates, but not
@@ -112,6 +122,46 @@ fn rename_this_local_variable(text: &str) -> String {
     replace_whole_word(text, "this", "debura_local_this")
 }
 
+/// Ghidra occasionally decompiles a `std::string::c_str()` call with no
+/// argument at all (`std::__cxx11::basic_string<...>::c_str()`) -- a real
+/// decompiler artifact. When the body declares exactly one
+/// `basic_string<...> NAME [N];` local (the shape Ghidra always uses for
+/// a stack-allocated std::string), that's unambiguously the missing
+/// receiver. Left alone when zero or more than one such local exists --
+/// guessing wrong here is worse than leaving a real compile error visible.
+fn fix_bare_c_str_receiver(text: &str) -> String {
+    let needle = "basic_string<char,std::char_traits<char>,std::allocator<char>>::c_str()";
+    if !text.contains(needle) {
+        return text.to_string();
+    }
+
+    let locals = basic_string_local_names(text);
+    let [name] = locals.as_slice() else {
+        return text.to_string();
+    };
+
+    text.replace(needle, &format!("basic_string<char,std::char_traits<char>,std::allocator<char>>::c_str({name})"))
+}
+
+/// Every local variable Ghidra declared as a stack-allocated
+/// `basic_string<char,std::char_traits<char>,std::allocator<char>> NAME
+/// [N];` -- the shape a decompiled `std::string` local always has.
+fn basic_string_local_names(text: &str) -> Vec<String> {
+    let needle = "basic_string<char,std::char_traits<char>,std::allocator<char>> ";
+    let mut names = Vec::new();
+    let mut rest = text;
+    while let Some(pos) = rest.find(needle) {
+        let after = &rest[pos + needle.len()..];
+        if let Some(name) = after.split(|c: char| c == ' ' || c == '[').next() {
+            if !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                names.push(name.to_string());
+            }
+        }
+        rest = after;
+    }
+    names
+}
+
 /// Replaces every whole-word occurrence of `word` with `replacement` --
 /// unlike a plain substring replace, doesn't also match `word` as part of
 /// a longer identifier.
@@ -157,6 +207,30 @@ fn strip_redundant_template_args(text: &str, templated: &str, bare: &str) -> Str
 #[cfg(test)]
 mod idiom_tests {
     use super::*;
+
+    /// PROJECT.md M18: a real recovery run (only exposed once a function
+    /// with no accepted name could be recovered at all -- it was never
+    /// compiled before) hit exactly this shape from Ghidra's own raw
+    /// decompilation: `c_str()` with no argument, while the same body's
+    /// paired `~basic_string(local_38)` destructor call correctly keeps
+    /// its receiver a few statements later.
+    #[test]
+    fn a_bare_c_str_call_is_given_the_bodys_own_basic_string_locals_name() {
+        let text = "void FUN_1(longlong param_1)\n\n{\n  undefined8 uVar1;\n  basic_string<char,std::char_traits<char>,std::allocator<char>> local_38 [40];\n  FUN_2(local_38,param_1);\n  uVar1 = std::__cxx11::basic_string<char,std::char_traits<char>,std::allocator<char>>::c_str();\n  std::__cxx11::basic_string<char,std::char_traits<char>,std::allocator<char>>::~basic_string(local_38);\n  return;\n}";
+        let patched = patch_known_idioms(text);
+        assert!(patched.contains("::c_str(local_38)"), "{patched}");
+        assert!(!patched.contains("::c_str()"), "{patched}");
+    }
+
+    /// Guessing wrong is worse than a visible compile error: with two
+    /// candidate locals, this leaves the bare call alone rather than
+    /// picking one arbitrarily.
+    #[test]
+    fn a_bare_c_str_call_is_left_alone_when_more_than_one_basic_string_local_exists() {
+        let text = "basic_string<char,std::char_traits<char>,std::allocator<char>> local_38 [40]; basic_string<char,std::char_traits<char>,std::allocator<char>> local_58 [40]; uVar1 = std::__cxx11::basic_string<char,std::char_traits<char>,std::allocator<char>>::c_str();";
+        let patched = patch_known_idioms(text);
+        assert!(patched.contains("::c_str();"), "{patched}");
+    }
 
     #[test]
     fn bare_occurrence_loses_its_redundant_template_args() {
