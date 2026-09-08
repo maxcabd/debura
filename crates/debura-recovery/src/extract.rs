@@ -624,13 +624,38 @@ pub fn extract(graph: &KnowledgeGraph) -> RecoveredProgram {
     // recoverable regardless: it renders under its raw `FUN_<addr>` name
     // (`name_source` already falls back to this below) instead of a
     // semantic one.
+    //
+    // PROJECT.md M18's own follow-on `RecoveryDisposition` finding widens
+    // this once more: a real 31-symbol linker frontier resolved to 0
+    // Application, 28 `RequiredUnknown`, 3 library/runtime -- every one of
+    // the 28 was reachable from the real entrypoint with a genuine
+    // recoverable body, just with no provenance signal (M17 correctly
+    // refuses to guess). Recovery necessity and semantic ownership are
+    // different questions (PROJECT.md M18): source completeness must not
+    // wait on M17 ever answering the second one for a function that's
+    // reachable and reconstructable. `reachable` is `None` when this
+    // graph has no `exports`/`"entry"` fact at all (a synthetic fixture,
+    // or a project state predating M7's entry extraction) -- in that
+    // case, nothing new is included here, matching this code's own
+    // pre-existing behavior exactly.
+    let entry = graph
+        .observations()
+        .find(|o| o.predicate == "exports" && o.value == "entry")
+        .map(|o| o.subject.clone());
+    let reachable = entry.as_deref().map(|e| crate::frontier::reachable_from(graph, e));
+    let is_required_unknown = |subject: &str| -> bool {
+        classify_provenance(graph, subject) == Provenance::Unknown
+            && reachable.as_ref().is_some_and(|r| r.contains(subject))
+    };
+
     for o in graph.observations().filter(|o| o.predicate == "has_name") {
         if class_method_addresses.contains(&o.subject) || subjects.contains(&o.subject) {
             continue;
         }
         let has_real_body = latest_decompilation(graph, &o.subject)
             .is_some_and(|d| !is_degenerate_decompilation(&d.value));
-        if has_real_body && classify_provenance(graph, &o.subject) == Provenance::Application {
+        let provenance = classify_provenance(graph, &o.subject);
+        if has_real_body && (provenance == Provenance::Application || is_required_unknown(&o.subject)) {
             subjects.insert(o.subject.clone());
         }
     }
@@ -640,7 +665,7 @@ pub fn extract(graph: &KnowledgeGraph) -> RecoveredProgram {
         if class_method_addresses.contains(&subject) {
             continue; // already represented as a class method
         }
-        if classify_provenance(graph, &subject) != Provenance::Application {
+        if classify_provenance(graph, &subject) != Provenance::Application && !is_required_unknown(&subject) {
             // Same reasoning as the class-name filter above, extended to
             // the harder case: a standalone function whose own name
             // looks like application code, but whose behavior is really
@@ -649,13 +674,11 @@ pub fn extract(graph: &KnowledgeGraph) -> RecoveredProgram {
             // std::string's own private `_M_create`/`_M_data`/
             // `_M_capacity`/`_M_set_length`) doesn't need recovering
             // either -- a real g++ build already supplies whatever
-            // std::string itself does. Excludes `Unknown` too (PROJECT.md
-            // M17): this reevaluate_hypothesis's provenance gate should
-            // already keep an Unknown-provenance subject from reaching
-            // ACCEPTED at all, but a subject accepted before that gate
-            // existed (an older project re-recovered) still shouldn't be
-            // rendered under a name nothing ever confirmed was safe to
-            // apply.
+            // std::string itself does. A subject accepted (or added by
+            // the RequiredUnknown path above) before this specific check
+            // -- an older project re-recovered, or reachability changed
+            // -- still isn't rendered under a name/existence nothing
+            // currently confirms is safe to apply.
             continue;
         }
         let Some(raw_name) = latest(graph, &subject, "has_name").map(|o| o.value.clone()) else {

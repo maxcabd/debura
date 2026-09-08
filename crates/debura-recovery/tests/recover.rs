@@ -437,6 +437,85 @@ fn an_application_function_with_no_accepted_name_is_still_recovered_under_its_ra
     assert!(matches!(f.name_source, NameSource::Raw));
 }
 
+/// PROJECT.md M18's `RecoveryDisposition` finding: a real 31-symbol
+/// linker frontier resolved to 0 Application, 28 `RequiredUnknown`, 3
+/// library/runtime -- every one of the 28 was reachable from the real
+/// entrypoint with a genuine recoverable body, just with no provenance
+/// signal M17 has grounds to call Application. Recovery necessity and
+/// semantic ownership are different questions; this proves `extract()`
+/// answers the first one independently of the second, for a subject
+/// that's reachable from the graph's own `exports`/`"entry"` fact.
+#[test]
+fn a_reachable_unknown_provenance_function_with_a_real_body_is_recovered_as_required_unknown() {
+    let mut graph = KnowledgeGraph::new();
+    graph.add_observation("0x1", "exports", "entry", 0.95, "ghidra:exports", None);
+    graph.add_observation("0x1", "calls", "0x99", 0.95, "ghidra:call_graph", None);
+    graph.add_observation("0x99", "has_name", "FUN_99", 0.95, "ghidra:function", None);
+    graph.add_observation(
+        "0x99",
+        "decompiles_to",
+        "void FUN_99(longlong param_1)\n\n{\n  *(int *)(param_1 + 4) = 0;\n  return;\n}",
+        0.95,
+        "ghidra:decompiler",
+        None,
+    );
+    // No is_method_of, no imports, no own-state+thunk signal, no accepted
+    // (or even proposed) semantic_role at all -- genuinely Unknown, not
+    // merely un-named.
+    assert_eq!(debura_knowledge::classify_provenance(&graph, "0x99"), debura_knowledge::Provenance::Unknown);
+
+    let program = extract(&graph);
+
+    let f = program.functions.iter().find(|f| f.address == "0x99").expect("recovered despite Unknown provenance");
+    assert_eq!(f.display_name, "FUN_99");
+    assert!(matches!(f.name_source, NameSource::Raw));
+}
+
+/// The reachability requirement is real, not decorative: an Unknown-
+/// provenance subject with a genuine body still isn't recovered if
+/// nothing on record ever calls it from the real entrypoint.
+#[test]
+fn an_unreachable_unknown_provenance_function_is_not_recovered() {
+    let mut graph = KnowledgeGraph::new();
+    graph.add_observation("0x1", "exports", "entry", 0.95, "ghidra:exports", None);
+    // "0x99" is never wired into 0x1's own call graph at all.
+    graph.add_observation("0x99", "has_name", "FUN_99", 0.95, "ghidra:function", None);
+    graph.add_observation(
+        "0x99",
+        "decompiles_to",
+        "void FUN_99(longlong param_1)\n\n{\n  *(int *)(param_1 + 4) = 0;\n  return;\n}",
+        0.95,
+        "ghidra:decompiler",
+        None,
+    );
+
+    let program = extract(&graph);
+
+    assert!(program.functions.iter().all(|f| f.address != "0x99"));
+}
+
+/// Confirms the pre-existing behavior with no `exports`/`"entry"` fact at
+/// all (every fixture in this file before this one) is unaffected: an
+/// Unknown-provenance subject is never recovered when reachability can't
+/// even be computed.
+#[test]
+fn unknown_provenance_is_never_recovered_when_the_graph_has_no_entry_fact() {
+    let mut graph = KnowledgeGraph::new();
+    graph.add_observation("0x99", "has_name", "FUN_99", 0.95, "ghidra:function", None);
+    graph.add_observation(
+        "0x99",
+        "decompiles_to",
+        "void FUN_99(longlong param_1)\n\n{\n  *(int *)(param_1 + 4) = 0;\n  return;\n}",
+        0.95,
+        "ghidra:decompiler",
+        None,
+    );
+
+    let program = extract(&graph);
+
+    assert!(program.functions.iter().all(|f| f.address != "0x99"));
+}
+
 /// A real run had `_Guard`, `_Vector_impl`, and `__class_type_info` --
 /// real classes Ghidra's own demangler recognized, but libstdc++
 /// internals, not application code -- getting the exact same recovery
