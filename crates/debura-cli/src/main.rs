@@ -126,6 +126,15 @@ enum Command {
         /// Project id, as printed by `debura new`
         project: String,
     },
+    /// Print `classify_provenance`'s verdict for one address -- a debug
+    /// aid for checking a specific provenance decision (and why it holds)
+    /// against a real project's own graph, without a full `frontier` run.
+    Classify {
+        /// Project id, as printed by `debura new`
+        project: String,
+        /// Subject address to classify, e.g. 0x1400016e4
+        address: String,
+    },
     /// Run the autonomous loop
     Run {
         /// Project id, as printed by `debura new`
@@ -579,6 +588,16 @@ fn main() -> Result<()> {
                 let h = graph.hypothesis(*id).context("hypothesis vanished during reconsideration")?;
                 println!("  {id}: {} {} = {} (now {:?})", h.subject, h.predicate, h.value, h.status);
             }
+        }
+        Command::Classify { project, address } => {
+            let root = debura_core::config::projects_dir().join(&project);
+            anyhow::ensure!(root.is_dir(), "no such project: {project}");
+
+            let conn = debura_storage::init_project_db(&root.join("project.sqlite"))?;
+            let graph = debura_storage::knowledge::load(&conn)?;
+
+            let provenance = debura_knowledge::classify_provenance(&graph, &address);
+            println!("{address}: {provenance:?}");
         }
         Command::Run {
             project,
