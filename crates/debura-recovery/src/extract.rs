@@ -580,7 +580,7 @@ fn disambiguate_method_names(methods: &mut [RecoveredMethod]) {
 /// internals code the real toolchain already supplies for free" -- only
 /// an actual failed link can).
 pub fn extract(graph: &KnowledgeGraph) -> RecoveredProgram {
-    extract_impl(graph, &BTreeSet::new())
+    extract_impl(graph, &BTreeSet::new(), None)
 }
 
 /// Same as `extract`, but additionally recovers any address in
@@ -609,14 +609,28 @@ pub fn extract(graph: &KnowledgeGraph) -> RecoveredProgram {
 /// `recover` command, when given a real linker log) from
 /// `RecoveryDisposition::RequiredRuntimeBody` entries -- never guessed at
 /// project-wide.
+/// `entry_wrapper_symbol`, when given (PROJECT.md M18.3, e.g. `"SDL_main"`),
+/// additionally exposes the binary's own real main-equivalent function
+/// (found structurally -- `crt_boundary::find_main_equivalent` -- never
+/// guessed) under that exact linker-required external name, if that
+/// function is itself among the ones actually recovered. Solved
+/// deterministically, from real evidence already established elsewhere
+/// in this same recovery pass, not delegated to any reasoning model:
+/// this is an ABI/linkage naming requirement, not a semantic-recovery
+/// question.
 pub fn extract_with_required_runtime_bodies(
     graph: &KnowledgeGraph,
     required_runtime_bodies: &BTreeSet<String>,
+    entry_wrapper_symbol: Option<&str>,
 ) -> RecoveredProgram {
-    extract_impl(graph, required_runtime_bodies)
+    extract_impl(graph, required_runtime_bodies, entry_wrapper_symbol)
 }
 
-fn extract_impl(graph: &KnowledgeGraph, required_runtime_bodies: &BTreeSet<String>) -> RecoveredProgram {
+fn extract_impl(
+    graph: &KnowledgeGraph,
+    required_runtime_bodies: &BTreeSet<String>,
+    entry_wrapper_symbol: Option<&str>,
+) -> RecoveredProgram {
     // PROJECT.md M15: a real run found libstdc++/CRT-internal classes
     // (`_Guard`, `_Vector_impl`, `__class_type_info`) getting the exact
     // same recovery treatment as real application classes -- rendered
@@ -884,10 +898,27 @@ fn extract_impl(graph: &KnowledgeGraph, required_runtime_bodies: &BTreeSet<Strin
     let ghidra_data_symbols: Vec<String> = ghidra_data_symbols.into_iter().collect();
     let data_resolutions = crate::data_symbols::classify_data_symbols(graph, &ghidra_data_symbols, &symbol_table);
 
+    // PROJECT.md M18.3: solved deterministically, from the same real
+    // structural evidence `crt_boundary` already establishes -- never
+    // guessed, never delegated to a reasoning model. Only takes effect
+    // when the caller actually asked for this exact symbol (a real
+    // linker log naming it as unresolved, via the CLI) *and* the real
+    // main-equivalent function this binary's own CRT startup calls is
+    // itself among the functions this same pass just recovered --
+    // otherwise there's nothing real to alias the requested symbol to.
+    let entry_wrapper = entry_wrapper_symbol.and_then(|requested| {
+        let entry_addr = entry.as_deref()?;
+        let main_addr = crate::crt_boundary::find_main_equivalent(graph, entry_addr)?;
+        let sym = symbol_table.get(&main_addr)?;
+        (sym.kind == crate::symtab::SymbolKind::FreeFunction)
+            .then(|| (requested.to_string(), sym.display_name.clone()))
+    });
+
     RecoveredProgram {
         classes,
         functions,
         function_references,
+        entry_wrapper,
         ghidra_data_symbols,
         data_resolutions,
         ghidra_intrinsics: ghidra_intrinsics.into_iter().collect(),

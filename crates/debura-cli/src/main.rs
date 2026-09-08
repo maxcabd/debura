@@ -556,18 +556,43 @@ fn main() -> Result<()> {
                         .map(|e| e.address.clone())
                         .collect();
                     let count = required_runtime_bodies.len();
+                    // PROJECT.md M18.3: `SDL_main`-shaped unresolved
+                    // references never match `parse_undefined_symbols`'s
+                    // own `FUN_<addr>` pattern (it's a real, plain-named
+                    // external symbol, not one of Debura's own
+                    // placeholder names), so it always parses as
+                    // `UnresolvedSymbol::Data` regardless of really
+                    // naming a function -- checked directly against the
+                    // raw literal name here rather than only against
+                    // `disposition`'s own function-only view.
+                    let literal_names: Vec<&str> = unresolved
+                        .iter()
+                        .map(|u| match u {
+                            debura_recovery::UnresolvedSymbol::Function { literal_name, .. } => literal_name.as_str(),
+                            debura_recovery::UnresolvedSymbol::Data { literal_name } => literal_name.as_str(),
+                        })
+                        .collect();
+                    let entry_wrapper_symbol = literal_names.contains(&"SDL_main").then_some("SDL_main");
                     (
-                        debura_recovery::extract_with_required_runtime_bodies(&graph, &required_runtime_bodies),
+                        debura_recovery::extract_with_required_runtime_bodies(
+                            &graph,
+                            &required_runtime_bodies,
+                            entry_wrapper_symbol,
+                        ),
                         count,
                     )
                 }
             };
+            let entry_wrapper = program.entry_wrapper.clone();
             let summary = debura_recovery::write_to_disk(&root, &program)?;
 
             println!("Classes recovered:   {}", summary.classes_written);
             println!("Functions recovered: {}", summary.functions_written);
             if runtime_bodies_recovered > 0 {
                 println!("  (including {runtime_bodies_recovered} linker-verified RequiredRuntimeBody)");
+            }
+            if let Some((symbol, target)) = &entry_wrapper {
+                println!("  (exposing {target} as {symbol})");
             }
             println!("Written to: {}", root.join("recovered").display());
         }

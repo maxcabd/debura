@@ -121,4 +121,14 @@ pub struct RecoveredProgram {
     /// calls in the rewritten bodies, needing a permissive fallback
     /// declaration to at least parse.
     pub unresolved_calls: Vec<String>,
+    /// `(exported_symbol_name, target_display_name)` -- an ABI/linkage
+    /// alias to expose an already-recovered function under a specific
+    /// external symbol name the linker expects, most commonly `SDL_main`
+    /// (PROJECT.md M18.3). `target_display_name` must already be a real,
+    /// recovered standalone function's own `display_name`. Never
+    /// invented content: the target is found structurally (the address
+    /// the binary's own CRT startup calls as its one real call into
+    /// `main` -- see `crt_boundary::find_main_equivalent`), only its
+    /// *exposure* under a specific linker-required name is new.
+    pub entry_wrapper: Option<(String, String)>,
 }

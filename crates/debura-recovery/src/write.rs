@@ -57,7 +57,11 @@ pub fn write_to_disk(project_root: &Path, program: &RecoveredProgram) -> Result<
     if !program.functions.is_empty() {
         fs::write(
             src_dir.join("functions.cpp"),
-            render_functions_source(&program.functions, &program.function_references),
+            render_functions_source(
+                &program.functions,
+                &program.function_references,
+                program.entry_wrapper.as_ref(),
+            ),
         )?;
     }
 

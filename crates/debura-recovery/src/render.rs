@@ -874,7 +874,11 @@ pub fn render_source(class: &RecoveredClass) -> String {
     out
 }
 
-pub fn render_functions_source(functions: &[RecoveredFunction], references: &[String]) -> String {
+pub fn render_functions_source(
+    functions: &[RecoveredFunction],
+    references: &[String],
+    entry_wrapper: Option<&(String, String)>,
+) -> String {
     let mut out = String::new();
     out.push_str("// Recovered by Debura: standalone functions with an ACCEPTED semantic\n");
     out.push_str("// name (PROJECT.md M5). Bodies are Ghidra's decompiled output, unmodified\n");
@@ -901,5 +905,84 @@ pub fn render_functions_source(functions: &[RecoveredFunction], references: &[St
         ));
     }
 
+    if let Some((symbol, target)) = entry_wrapper {
+        out.push_str(&render_entry_wrapper(symbol, target));
+    }
+
     out
+}
+
+/// An ABI/linkage alias exposing an already-recovered function under a
+/// specific external symbol name the linker expects (PROJECT.md M18.3,
+/// most commonly `SDL_main`) -- `extern "C"` so the exported name isn't
+/// C++-mangled, matching the plain C symbol libSDL2main.a's own object
+/// code actually calls. `target` must already be one of this same
+/// file's own recovered function names (`RecoveredProgram::entry_wrapper`
+/// is only ever set once `extract()` has confirmed that).
+fn render_entry_wrapper(symbol: &str, target: &str) -> String {
+    format!(
+        "// PROJECT.md M18.3: an ABI/linkage alias, not recovered semantics --\n\
+         // {symbol} is the exact real call this binary's own CRT startup makes\n\
+         // into its application code (found structurally, not guessed; see\n\
+         // debura_recovery::find_main_equivalent), exposed here under the exact\n\
+         // external symbol name the linker expects.\n\
+         extern \"C\" int {symbol}(int argc, char *argv[])\n\
+         {{\n\
+         \x20 return (int){target}();\n\
+         }}\n"
+    )
+}
+
+#[cfg(test)]
+mod entry_wrapper_tests {
+    use super::*;
+
+    fn a_function() -> RecoveredFunction {
+        RecoveredFunction {
+            address: "0x140003940".to_string(),
+            raw_name: "FUN_140003940".to_string(),
+            display_name: "FUN_140003940".to_string(),
+            name_source: NameSource::Raw,
+            return_type: "int".to_string(),
+            params: String::new(),
+            decompilation: "int FUN_140003940(void)\n\n{\n  return 0;\n}".to_string(),
+        }
+    }
+
+    /// PROJECT.md M18.3: with no linker-required alias, the rendered
+    /// output must be unchanged from before `entry_wrapper` existed --
+    /// no wrapper text at all.
+    #[test]
+    fn no_entry_wrapper_emits_nothing_extra() {
+        let out = render_functions_source(&[a_function()], &[], None);
+        assert!(!out.contains("extern \"C\""), "{out}");
+    }
+
+    /// The real SDL_main case: exposing an already-recovered function
+    /// under the exact external symbol name the linker expects, without
+    /// inventing or duplicating its body.
+    #[test]
+    fn an_entry_wrapper_exposes_the_target_under_the_requested_symbol() {
+        let wrapper = ("SDL_main".to_string(), "FUN_140003940".to_string());
+        let out = render_functions_source(&[a_function()], &[], Some(&wrapper));
+        assert!(
+            out.contains("extern \"C\" int SDL_main(int argc, char *argv[])"),
+            "{out}"
+        );
+        assert!(out.contains("return (int)FUN_140003940();"), "{out}");
+        // The wrapper is additive -- the real recovered function's own
+        // body must still be present, unmodified.
+        assert!(out.contains("int FUN_140003940()"), "{out}");
+    }
+
+    /// The wrapper must render even when there are no standalone
+    /// functions to iterate at all (an edge case `write.rs`'s own
+    /// `!program.functions.is_empty()` guard doesn't reach today, but
+    /// this function's own contract shouldn't silently depend on that).
+    #[test]
+    fn an_entry_wrapper_renders_even_with_no_other_functions() {
+        let wrapper = ("SDL_main".to_string(), "FUN_140003940".to_string());
+        let out = render_functions_source(&[], &[], Some(&wrapper));
+        assert!(out.contains("extern \"C\" int SDL_main"), "{out}");
+    }
 }

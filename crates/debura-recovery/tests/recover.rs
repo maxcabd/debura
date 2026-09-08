@@ -643,7 +643,7 @@ fn an_explicitly_required_runtime_body_is_recovered_under_its_raw_name() {
     let mut required = std::collections::BTreeSet::new();
     required.insert("0x1".to_string());
 
-    let program = debura_recovery::extract_with_required_runtime_bodies(&graph, &required);
+    let program = debura_recovery::extract_with_required_runtime_bodies(&graph, &required, None);
 
     let f = program.functions.iter().find(|f| f.address == "0x1").expect("explicitly required runtime body recovered");
     assert_eq!(f.display_name, "FUN_1");
@@ -1133,4 +1133,69 @@ fn standalone_functions_reference_a_class_their_resolved_body_constructs() {
 
     let spawn = program.functions.iter().find(|f| f.display_name == "spawnWall").unwrap();
     assert!(spawn.decompilation.contains("new ((void *)(ptr)) Wall()"), "{}", spawn.decompilation);
+}
+
+/// PROJECT.md M18.3: the real SDL_main case -- once `crt_boundary::find_main_equivalent`
+/// structurally identifies the binary's own real `main()`, an explicitly
+/// requested linker-required alias name (`SDL_main`) must resolve to that
+/// exact, already-recovered function's own display name. Reuses the same
+/// verified `entry -> crt_startup -> siblings incl. a dominant main` shape
+/// `crt_boundary.rs`'s own tests confirm `find_main_equivalent` on.
+#[test]
+fn an_entry_wrapper_symbol_resolves_to_the_structurally_found_main_equivalent() {
+    let mut graph = KnowledgeGraph::new();
+    graph.add_observation("0xentry", "exports", "entry", 0.95, "ghidra:exports", None);
+    graph.add_observation("0xentry", "calls", "0xcrt_startup", 0.95, "ghidra:call_graph", None);
+    graph.add_observation("0xcrt_startup", "calls", "0xargv_dup", 0.95, "ghidra:call_graph", None);
+    graph.add_observation("0xcrt_startup", "calls", "0xmain", 0.95, "ghidra:call_graph", None);
+    // main's own large subtree, dwarfing 0xargv_dup's (a single, leaf
+    // address) well past the real DOMINANCE_MARGIN.
+    graph.add_observation("0xmain", "calls", "0xgame_init", 0.95, "ghidra:call_graph", None);
+    graph.add_observation("0xmain", "calls", "0xgame_loop", 0.95, "ghidra:call_graph", None);
+    graph.add_observation("0xgame_loop", "calls", "0xrender", 0.95, "ghidra:call_graph", None);
+    graph.add_observation("0xgame_loop", "calls", "0xupdate", 0.95, "ghidra:call_graph", None);
+    graph.add_observation("0xupdate", "calls", "0xcollide", 0.95, "ghidra:call_graph", None);
+
+    graph.add_observation("0xmain", "has_name", "FUN_140003940", 0.95, "ghidra:function", None);
+    graph.add_observation(
+        "0xmain",
+        "decompiles_to",
+        "int FUN_140003940(void)\n\n{\n  return 0;\n}",
+        0.95,
+        "ghidra:decompiler",
+        None,
+    );
+
+    let program = debura_recovery::extract_with_required_runtime_bodies(
+        &graph,
+        &std::collections::BTreeSet::new(),
+        Some("SDL_main"),
+    );
+
+    assert_eq!(
+        program.entry_wrapper,
+        Some(("SDL_main".to_string(), "FUN_140003940".to_string()))
+    );
+}
+
+/// No confidently-identified main-equivalent (a shallow graph with no
+/// real CRT-startup fan-out, matching `crt_boundary.rs`'s own
+/// `a_two_hop_chain_with_no_real_siblings_never_identifies_a_main_equivalent`)
+/// must never invent an entry wrapper -- the same "no confident evidence
+/// means no exclusion/alias at all" rule the CRT-boundary detector itself
+/// follows.
+#[test]
+fn no_entry_wrapper_is_produced_when_no_main_equivalent_is_found() {
+    let mut graph = KnowledgeGraph::new();
+    graph.add_observation("0xentry", "exports", "entry", 0.95, "ghidra:exports", None);
+    graph.add_observation("0xentry", "calls", "0x1", 0.95, "ghidra:call_graph", None);
+    graph.add_observation("0x1", "calls", "0x2", 0.95, "ghidra:call_graph", None);
+
+    let program = debura_recovery::extract_with_required_runtime_bodies(
+        &graph,
+        &std::collections::BTreeSet::new(),
+        Some("SDL_main"),
+    );
+
+    assert_eq!(program.entry_wrapper, None);
 }
