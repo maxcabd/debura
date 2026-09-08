@@ -121,7 +121,7 @@ def ensure_function_at(target, mem, fm):
     return fm.getFunctionAt(target)
 
 
-def is_plausible_vtable_start(vfunc0_addr, mem, addr_factory, fm):
+def is_plausible_vtable_start(vfunc0_addr, mem, addr_factory, fm, sym_table):
     """A real function pointer *at this exact address* is the structural
     signature confirming it's genuinely what a constructor's vtable-
     pointer-slot store targets. Per the Itanium ABI, `this->vptr` points
@@ -158,10 +158,11 @@ def is_plausible_vtable_start(vfunc0_addr, mem, addr_factory, fm):
         target = resolve_pointer(mem, addr_factory, value)
         if target is not None and ensure_function_at(target, mem, fm) is not None:
             return True
-    return class_name_from_vtable(vfunc0_addr, mem, addr_factory) is not None
+    real_name, _base_name = class_name_from_vtable(vfunc0_addr, mem, addr_factory, sym_table)
+    return real_name is not None
 
 
-def find_early_vtable_store(func, listing, ref_manager, mem, addr_factory, fm, monitor):
+def find_early_vtable_store(func, listing, ref_manager, mem, addr_factory, fm, sym_table, monitor):
     """The vfunc0 address (see is_plausible_vtable_start's docstring)
     this function's own early instructions reference -- the Itanium ABI
     idiom every constructor/destructor performs to (re-)initialize its
@@ -180,7 +181,7 @@ def find_early_vtable_store(func, listing, ref_manager, mem, addr_factory, fm, m
             if not ref.isMemoryReference():
                 continue
             target = ref.getToAddress()
-            if is_plausible_vtable_start(target, mem, addr_factory, fm):
+            if is_plausible_vtable_start(target, mem, addr_factory, fm, sym_table):
                 return target
     return None
 
@@ -238,48 +239,94 @@ def demangle_itanium_type_name(raw):
     return parts[-1] if parts else None
 
 
-def class_name_from_vtable(vfunc0_addr, mem, addr_factory):
+def class_name_from_vtable(vfunc0_addr, mem, addr_factory, sym_table):
     """`vfunc0_addr` is what `this->vptr` itself points at (see
     is_plausible_vtable_start), so the RTTI pointer -- one slot *before*
     vfunc0 in memory -- is read at `vfunc0_addr - POINTER_SIZE`, and the
     typeinfo record's own name field is the slot right after its own
-    vtable pointer. Entirely structural, no symbol needed at any step."""
+    vtable pointer. Entirely structural, no symbol needed at any step.
+
+    Also resolves the base class name, PROJECT.md M17's prerequisite for
+    vtable-slot role propagation across sibling classes: exactly the
+    same real program data `extract_type_info()` below reads from
+    Ghidra's own "typeinfo" symbol name (a `__si_class_type_info`
+    record's third slot, one pointer past the name, points at the base
+    class's own typeinfo record) -- reached here structurally instead,
+    since M7's structural path otherwise doesn't find inheritance edges
+    at all, only symbol-based extraction did. Doesn't attempt to
+    distinguish a genuine `__class_type_info` (no base) from a
+    `__si_class_type_info` with an unreadable base pointer -- both just
+    come back with `base_name = None`, which is the same "no inheritance
+    edge recovered" outcome for this script's purposes either way.
+    Returns `(class_name, base_name)`; either may be `None`."""
     try:
         rtti_ptr_value = mem.getLong(vfunc0_addr.subtract(POINTER_SIZE))
     except:
-        return None
+        return None, None
     rtti_addr = resolve_pointer(mem, addr_factory, rtti_ptr_value)
     if rtti_addr is None:
-        return None
+        return None, None
     try:
         name_ptr_value = mem.getLong(rtti_addr.add(POINTER_SIZE))
     except:
-        return None
+        return None, None
     name_addr = resolve_pointer(mem, addr_factory, name_ptr_value)
     if name_addr is None:
-        return None
-    return demangle_itanium_type_name(read_cstring(mem, name_addr))
+        return None, None
+    class_name = demangle_itanium_type_name(read_cstring(mem, name_addr))
+
+    # Bounds-checked the same way `extract_type_info` already checks its
+    # own read of this exact field (a __si_class_type_info record is
+    # 0x18 bytes; anything shorter is a plain __class_type_info with no
+    # base to read) -- a real run found *why* this matters structurally,
+    # not just for tidiness: reading past a genuine __class_type_info's
+    # 0x10-byte record without this check landed on whatever data
+    # happens to follow it, and once in a while that garbage still
+    # resolved to *something* address-shaped, cascading into a wave of
+    # false-positive vtable/class detections elsewhere in the binary.
+    base_name = None
+    boundary = next_symbol_boundary(sym_table, rtti_addr)
+    available = boundary.subtract(rtti_addr) if boundary is not None else 3 * POINTER_SIZE
+    if available >= 3 * POINTER_SIZE:
+        try:
+            base_typeinfo_value = mem.getLong(rtti_addr.add(2 * POINTER_SIZE))
+            base_typeinfo_addr = resolve_pointer(mem, addr_factory, base_typeinfo_value)
+            if base_typeinfo_addr is not None:
+                base_name_ptr_value = mem.getLong(base_typeinfo_addr.add(POINTER_SIZE))
+                base_name_addr = resolve_pointer(mem, addr_factory, base_name_ptr_value)
+                if base_name_addr is not None:
+                    base_name = demangle_itanium_type_name(read_cstring(mem, base_name_addr))
+        except:
+            pass
+
+    return class_name, base_name
 
 
 def discover_classes_structurally(fm, listing, ref_manager, sym_table, mem, addr_factory, monitor):
-    """Returns (class_names, ctor_or_dtor_addrs, virtual_methods), all
-    keyed by the *true* vtable start (as an int offset) -- 2 slots
-    before vfunc0 (offset-to-top, then RTTI), matching has_vtable_at's
-    existing convention from the symbol-based path below, even though
-    what's actually found via cross-references is vfunc0's own address.
-    class_names maps to a real recovered name where the RTTI name string
-    parsed, else a synthetic "Class_<hex address>"; ctor_or_dtor maps to
-    the set of function entry-point Addresses that store that vtable
-    early on (constructors and destructors both -- not distinguished,
-    see the module-level comment); virtual_methods maps to the ordered
-    list of function entry-point Addresses found in that vtable's own
-    slots."""
+    """Returns (class_names, ctor_or_dtor_addrs, virtual_methods,
+    inheritance), the first three keyed by the *true* vtable start (as
+    an int offset) -- 2 slots before vfunc0 (offset-to-top, then RTTI),
+    matching has_vtable_at's existing convention from the symbol-based
+    path below, even though what's actually found via cross-references
+    is vfunc0's own address. class_names maps to a real recovered name
+    where the RTTI name string parsed, else a synthetic
+    "Class_<hex address>"; ctor_or_dtor maps to the set of function
+    entry-point Addresses that store that vtable early on (constructors
+    and destructors both -- not distinguished, see the module-level
+    comment); virtual_methods maps to the ordered list of function
+    entry-point Addresses found in that vtable's own slots.
+    `inheritance` (PROJECT.md M17) is a flat list of
+    `{"derived": ..., "base": ...}` dicts -- one entry per class whose
+    RTTI base-type pointer resolved to another class's real (not
+    synthetic) name; a class with no resolvable base, or whose own name
+    didn't parse, contributes nothing here rather than a partial/
+    synthetic edge."""
     ctors_by_vfunc0 = {}
     for func in fm.getFunctions(True):
         monitor.checkCancelled()
         if func.isExternal():
             continue
-        vfunc0_addr = find_early_vtable_store(func, listing, ref_manager, mem, addr_factory, fm, monitor)
+        vfunc0_addr = find_early_vtable_store(func, listing, ref_manager, mem, addr_factory, fm, sym_table, monitor)
         if vfunc0_addr is None:
             continue
         ctors_by_vfunc0.setdefault(vfunc0_addr.getOffset(), set()).add(func.getEntryPoint())
@@ -287,13 +334,16 @@ def discover_classes_structurally(fm, listing, ref_manager, sym_table, mem, addr
     class_names = {}
     ctor_or_dtor = {}
     virtual_methods = {}
+    inheritance = []
     for vfunc0_key, ctor_addrs in ctors_by_vfunc0.items():
         vfunc0_addr = addr_factory.getDefaultAddressSpace().getAddress(vfunc0_key)
         true_key = vfunc0_addr.subtract(2 * POINTER_SIZE).getOffset()
 
-        real_name = class_name_from_vtable(vfunc0_addr, mem, addr_factory)
+        real_name, base_name = class_name_from_vtable(vfunc0_addr, mem, addr_factory, sym_table)
         class_names[true_key] = real_name if real_name else "Class_%x" % true_key
         ctor_or_dtor[true_key] = ctor_addrs
+        if real_name and base_name:
+            inheritance.append({"derived": real_name, "base": base_name})
 
         boundary = next_symbol_boundary(sym_table, vfunc0_addr)
         available = boundary.subtract(vfunc0_addr) if boundary is not None else MAX_VTABLE_SLOTS * POINTER_SIZE
@@ -316,7 +366,7 @@ def discover_classes_structurally(fm, listing, ref_manager, sym_table, mem, addr
             offset += POINTER_SIZE
         virtual_methods[true_key] = methods
 
-    return class_names, ctor_or_dtor, virtual_methods
+    return class_names, ctor_or_dtor, virtual_methods, inheritance
 
 
 def extract_field_accesses(owner_class, decompilation):
@@ -625,6 +675,22 @@ def merge_structural_vtables(vtables, virtual_methods, struct_class_names, struc
     return vtables, virtual_methods
 
 
+def merge_inheritance(inheritance, struct_inheritance):
+    """PROJECT.md M17: adds a structurally-found `(derived, base)` edge
+    only if that exact pair isn't already present from the symbol-based
+    side -- same "symbol-based wins on overlap" reasoning as
+    `merge_structural_vtables`, deduplicated on the full pair rather
+    than just `derived` since (unlike vtables) nothing here should ever
+    produce two different bases for the same derived class."""
+    existing = set((edge["derived"], edge["base"]) for edge in inheritance)
+    for edge in struct_inheritance:
+        pair = (edge["derived"], edge["base"])
+        if pair not in existing:
+            inheritance.append(edge)
+            existing.add(pair)
+    return inheritance
+
+
 def run():
     args = getScriptArgs()
     if len(args) < 1:
@@ -639,8 +705,8 @@ def run():
     listing = currentProgram.getListing()
     ref_manager = currentProgram.getReferenceManager()
 
-    struct_class_names, struct_ctor_or_dtor, struct_virtual_methods = discover_classes_structurally(
-        fm, listing, ref_manager, sym_table, mem, addr_factory, monitor
+    struct_class_names, struct_ctor_or_dtor, struct_virtual_methods, struct_inheritance = (
+        discover_classes_structurally(fm, listing, ref_manager, sym_table, mem, addr_factory, monitor)
     )
 
     structural_owner_of = {}
@@ -673,7 +739,9 @@ def run():
             "xrefs": extract_xrefs(),
             "vtables": vtables,
             "virtual_methods": virtual_methods,
-            "inheritance": extract_type_info(sym_table, mem, addr_factory),
+            "inheritance": merge_inheritance(
+                extract_type_info(sym_table, mem, addr_factory), struct_inheritance
+            ),
             "fields": fields,
         }
     finally:
