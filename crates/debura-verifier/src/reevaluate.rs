@@ -1,5 +1,5 @@
 use debura_agent::commit_contradiction;
-use debura_knowledge::{HypothesisId, HypothesisStatus, KnowledgeGraph};
+use debura_knowledge::{classify_provenance, HypothesisId, HypothesisStatus, KnowledgeGraph, Provenance};
 
 use crate::mechanical_shape::mechanically_shaped_reason;
 use crate::policy::VerificationPolicy;
@@ -28,6 +28,9 @@ pub fn reevaluate_hypothesis(
     }
 
     let old_status = h.status;
+    let predicate = h.predicate.clone();
+    let subject = h.subject.clone();
+    let value = h.value.clone();
     let verified = h.last_verified_at.is_some();
     let confidence = h.confidence;
 
@@ -38,6 +41,37 @@ pub fn reevaluate_hypothesis(
     } else {
         HypothesisStatus::Proposed
     };
+
+    if new_status == HypothesisStatus::Accepted
+        && predicate == "semantic_role"
+        && classify_provenance(graph, &subject) != Provenance::Application
+    {
+        // PROJECT.md M17: a real audit found 10 of 37 ACCEPTED
+        // semantic_role claims were library/CRT internals
+        // (std::vector::_M_erase_at_end, MinGW's own
+        // _pei386_runtime_relocator) that earned application-sounding
+        // names and made it all the way into the recovered .cpp output --
+        // because the old two-state Provenance defaulted "no name-shape
+        // signal" to Application, which on a genuinely stripped binary is
+        // nearly always the case. This is a hard structural exclusion,
+        // not a debatable naming judgment: a subject whose provenance
+        // isn't Application shouldn't carry an application semantic_role
+        // at all, so -- unlike `mechanically_shaped_reason` below, which
+        // flags something ChallengeHypothesis/ResolveContradiction should
+        // actually weigh -- this goes straight to REJECTED rather than
+        // through CONTESTED. The subject can still be recovered/recognized
+        // structurally; it just doesn't get to claim application meaning.
+        let _ = graph.set_status(id, HypothesisStatus::Rejected);
+        graph.add_observation(
+            subject,
+            "provenance_gate_rejected",
+            format!("semantic_role '{value}' rejected: subject's provenance is not Application"),
+            0.5,
+            "debura:provenance_gate",
+            None,
+        );
+        return Some(HypothesisStatus::Rejected);
+    }
 
     if new_status == HypothesisStatus::Accepted {
         if let Some(reason) = mechanically_shaped_reason(graph, id) {

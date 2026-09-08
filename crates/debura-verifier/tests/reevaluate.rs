@@ -19,6 +19,11 @@ fn high_confidence_without_verification_stays_supported() {
 #[test]
 fn high_confidence_with_verification_reaches_accepted() {
     let mut graph = KnowledgeGraph::new();
+    // PROJECT.md M17: a bare subject with no other observations has no
+    // provenance signal at all and is correctly Unknown, not Application
+    // -- give it a real application class so this test exercises the
+    // threshold logic it's actually about, not the provenance gate.
+    graph.add_observation("0x1", "is_method_of", "Wall", 0.95, "ghidra:function", None);
     let h = graph.propose_hypothesis("0x1", "semantic_role", "TakeDamage", 0.95, None);
     graph.mark_verified(h, Utc::now()).unwrap();
 
@@ -62,6 +67,41 @@ fn contested_and_rejected_are_left_alone() {
         reevaluate_hypothesis(&mut graph, rejected, &policy),
         Some(HypothesisStatus::Rejected)
     );
+}
+
+/// PROJECT.md M17: the provenance gate. A semantic_role that would
+/// otherwise clear the acceptance threshold must still be rejected if the
+/// subject's provenance isn't Application -- the exact bug a real audit
+/// found (library/CRT internals earning application-sounding names)
+/// happening because nothing enforced this at the acceptance gate.
+#[test]
+fn a_semantic_role_on_a_non_application_subject_is_rejected_even_at_high_confidence() {
+    let mut graph = KnowledgeGraph::new();
+    // No is_method_of, no calls, no name beyond the implicit raw
+    // placeholder -- exactly the "genuinely stripped, no signal either
+    // way" shape that must resolve Unknown, not Application.
+    let h = graph.propose_hypothesis("0x1", "semantic_role", "invokeAnotherFunction", 0.95, None);
+    graph.mark_verified(h, Utc::now()).unwrap();
+
+    let status = reevaluate_hypothesis(&mut graph, h, &VerificationPolicy::default()).unwrap();
+
+    assert_eq!(status, HypothesisStatus::Rejected);
+    assert_eq!(graph.hypothesis(h).unwrap().status, HypothesisStatus::Rejected);
+}
+
+/// The gate is specific to semantic_role -- a mechanical_behavior claim
+/// about a non-Application subject is still real, useful knowledge (the
+/// user's own point: "you can still recover or recognize the function
+/// structurally") and must not be blocked by this check.
+#[test]
+fn the_provenance_gate_does_not_touch_mechanical_behavior() {
+    let mut graph = KnowledgeGraph::new();
+    let h = graph.propose_hypothesis("0x1", "mechanical_behavior", "callsOneFunction", 0.95, None);
+    graph.mark_verified(h, Utc::now()).unwrap();
+
+    let status = reevaluate_hypothesis(&mut graph, h, &VerificationPolicy::default()).unwrap();
+
+    assert_eq!(status, HypothesisStatus::Accepted);
 }
 
 #[test]

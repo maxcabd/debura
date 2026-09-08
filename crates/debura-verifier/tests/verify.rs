@@ -51,6 +51,7 @@ impl AgentProvider for ScriptedProvider {
 #[test]
 fn challenge_with_no_findings_marks_verified_and_can_reach_accepted() {
     let mut graph = KnowledgeGraph::new();
+    graph.add_observation("0x1", "is_method_of", "Wall", 0.95, "ghidra:function", None);
     let h = graph.propose_hypothesis("0x1", "semantic_role", "TakeDamage", 0.9, None);
 
     let provider = ScriptedProvider::challenge(ChallengeResult {
@@ -140,6 +141,7 @@ fn resolve_contradiction_requires_contested_status() {
 #[test]
 fn resolve_contradiction_survives_clears_contested_and_can_be_reevaluated() {
     let mut graph = KnowledgeGraph::new();
+    graph.add_observation("0x1", "is_method_of", "Wall", 0.95, "ghidra:function", None);
     let h = graph.propose_hypothesis("0x1", "semantic_role", "health", 0.6, None);
     graph.set_status(h, HypothesisStatus::Contested).unwrap();
 
@@ -190,6 +192,7 @@ fn resolve_contradiction_rejected_is_terminal_and_cascades_stale() {
 #[test]
 fn end_to_end_acceptance_requires_a_challenge() {
     let mut graph = KnowledgeGraph::new();
+    graph.add_observation("0x1", "is_method_of", "Wall", 0.95, "ghidra:function", None);
     let policy = VerificationPolicy::default();
     let h = graph.propose_hypothesis("0x1", "semantic_role", "TakeDamage", 0.95, None);
 
