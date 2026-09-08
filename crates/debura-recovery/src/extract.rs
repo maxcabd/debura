@@ -101,6 +101,38 @@ fn name_source(graph: &KnowledgeGraph, subject: &str) -> Option<(String, NameSou
 struct ParsedSignature {
     return_type: String,
     params: String,
+    /// Whether an explicit `this`-named leading parameter was found and
+    /// dropped. Only true for a method Ghidra's own type system
+    /// recognized (`has_signature`/`decompiles_to` then spell the
+    /// receiver out as `Class *this`) -- a method M7's *structural*
+    /// vtable detection found instead, never recognized by Ghidra as a
+    /// method at all, has its receiver sitting in the header as an
+    /// ordinary `param_1`, indistinguishable by name from a real
+    /// argument, so nothing is stripped and this is `false`. Needed by
+    /// `build_symbol_table`: a call site's own leading argument always
+    /// supplies the receiver either way, and it must be added back to
+    /// `expected_args` only when `params` doesn't already include it --
+    /// a real link found this wasn't previously tracked at all, so
+    /// `expected_args` double-counted the receiver for every
+    /// structurally-discovered method and rejected all 3 of their real
+    /// call sites as an arity mismatch, even though the methods
+    /// themselves compiled fine.
+    receiver_stripped: bool,
+}
+
+/// Strips a leading parameter named `this` from `params` -- the receiver
+/// Ghidra's own type system explicitly recognized, as opposed to one
+/// M7's structural detection found that still sits in the list as an
+/// ordinary `param_1`. Returns whether it actually found and stripped
+/// one, shared between `parse_signature` and `params_from_decompilation`
+/// so both sources of a method's params track this the same way.
+fn strip_recognized_this_param(params: &mut Vec<&str>) -> bool {
+    if params.first().is_some_and(|p| p.ends_with("this")) {
+        params.remove(0);
+        true
+    } else {
+        false
+    }
 }
 
 /// Ghidra's own signature strings look like `RETTYPE raw_name(TYPE * this,
@@ -125,9 +157,7 @@ fn parse_signature(signature: &str, raw_name: &str) -> ParsedSignature {
         .map(str::trim)
         .filter(|p| !p.is_empty())
         .collect();
-    if params.first().is_some_and(|p| p.ends_with("this")) {
-        params.remove(0);
-    }
+    let receiver_stripped = strip_recognized_this_param(&mut params);
 
     ParsedSignature {
         return_type: if return_type.is_empty() {
@@ -136,6 +166,7 @@ fn parse_signature(signature: &str, raw_name: &str) -> ParsedSignature {
             return_type.to_string()
         },
         params: params.join(", "),
+        receiver_stripped,
     }
 }
 
@@ -150,8 +181,9 @@ fn parse_signature(signature: &str, raw_name: &str) -> ParsedSignature {
 /// decompiled header's own params whenever a body is available fixes this
 /// at the source instead of patching each symptom; `None` (falling back
 /// to `has_signature`'s own params) only when there's no decompiled body
-/// to check against at all.
-fn params_from_decompilation(decompilation: &str) -> Option<String> {
+/// to check against at all. Returns the same `receiver_stripped` signal
+/// `parse_signature` does, and for the same reason.
+fn params_from_decompilation(decompilation: &str) -> Option<(String, bool)> {
     let header_end = decompilation.find('{')?;
     // Ghidra sometimes emits `/* WARNING: ... (addr, addr) */` comments
     // before the real signature line -- a real case had exactly this,
@@ -169,10 +201,8 @@ fn params_from_decompilation(decompilation: &str) -> Option<String> {
         .map(str::trim)
         .filter(|p| !p.is_empty())
         .collect();
-    if params.first().is_some_and(|p| p.ends_with("this")) {
-        params.remove(0);
-    }
-    Some(params.join(", "))
+    let receiver_stripped = strip_recognized_this_param(&mut params);
+    Some((params.join(", "), receiver_stripped))
 }
 
 /// Removes every `/* ... */` block from `text` -- just enough to keep
@@ -219,7 +249,8 @@ fn build_method(
         parsed.return_type
     };
 
-    let params = params_from_decompilation(&decompilation).unwrap_or(parsed.params);
+    let (params, receiver_stripped) =
+        params_from_decompilation(&decompilation).unwrap_or((parsed.params, parsed.receiver_stripped));
 
     Some(RecoveredMethod {
         address: address.to_string(),
@@ -230,6 +261,7 @@ fn build_method(
         params,
         is_constructor,
         is_destructor,
+        receiver_stripped,
         decompilation,
     })
 }
@@ -575,7 +607,10 @@ pub fn extract(graph: &KnowledgeGraph) -> RecoveredProgram {
             .map(|o| o.value.clone())
             .unwrap_or_default();
         let parsed = parse_signature(&signature, &raw_name);
-        let params = params_from_decompilation(&decompilation).unwrap_or(parsed.params);
+        // A standalone function has no receiver at all -- only the
+        // params text matters here, never the stripped-receiver signal
+        // methods need.
+        let params = params_from_decompilation(&decompilation).map(|(p, _)| p).unwrap_or(parsed.params);
 
         functions.push(RecoveredFunction {
             address: subject,
