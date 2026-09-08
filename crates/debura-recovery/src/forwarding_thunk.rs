@@ -310,18 +310,28 @@ pub fn detect_forwarding_runtime_thunk(decompilation: &str) -> Option<Forwarding
 /// `decompiles_to` fact for the forwarding-thunk shape, and adds a
 /// `SymbolKind::ForwardingThunk` entry for each match -- independent of
 /// provenance or recovery-worthiness (a real forwarding thunk is never
-/// itself recovered, see this module's own doc comment, so it would
-/// otherwise have no entry in `table` at all for a real call site
-/// elsewhere to resolve against). Never overwrites an address `table`
-/// already has an entry for: a real, already-recovered class
-/// method/function always wins over this narrow fallback pattern.
+/// meaningfully recovered as application code, see this module's own
+/// doc comment). *Overrides* an address `table` already has an entry
+/// for, rather than skipping it -- a real run found this matters: M15's
+/// "library-dominated glue" exclusion doesn't catch a thunk with only a
+/// *single* library callee (`operator_new`'s own overflow-check guards
+/// don't count as separate callees for that heuristic), so a real
+/// sized-`operator_new` forwarding thunk got independently recovered as
+/// an ordinary function under a stale, narrow `undefined` return type --
+/// discarding the real pointer `operator_new` returns, corrupting every
+/// caller up the chain. `detect_forwarding_runtime_thunk`'s own match
+/// criteria are strict enough (a fixed canonical-target allowlist, a
+/// fixed non-returning-throw-helper allowlist, only identifier/literal-
+/// scaled arguments) that a real match is always authoritative: nothing
+/// this narrow is ever genuine, hand-written application code worth
+/// preserving under its own name. The overridden entry, if it was ever
+/// independently emitted into `functions.cpp`, is simply left as
+/// unused, orphaned code -- harmless, since every real call site now
+/// resolves through the canonical target instead.
 pub fn add_forwarding_thunks(graph: &KnowledgeGraph, table: &mut SymbolTable) {
     let subjects: BTreeSet<String> =
         graph.observations().filter(|o| o.predicate == "decompiles_to").map(|o| o.subject.clone()).collect();
     for subject in subjects {
-        if table.contains_key(&subject) {
-            continue;
-        }
         let Some(decompilation) = latest_decompilation(graph, &subject) else { continue };
         if is_degenerate_decompilation(&decompilation.value) {
             continue;
@@ -417,5 +427,51 @@ mod tests {
     fn an_argument_shape_this_module_does_not_understand_is_rejected() {
         let decompilation = "void FUN_1(void *param_1,longlong param_2,longlong param_3)\n\n{\n  operator_delete(param_1,param_2 + param_3);\n  return;\n}";
         assert!(detect_forwarding_runtime_thunk(decompilation).is_none());
+    }
+
+    /// PROJECT.md M18.3: the real, confirmed case a real run found --
+    /// `FUN_140006600` (a real sized-`operator_new` forwarding thunk,
+    /// overflow-check guards and all) got independently recovered as an
+    /// ordinary function anyway: M15's "library-dominated glue"
+    /// exclusion only fires for *several* library callees, and this
+    /// thunk's own guards call a fixed, small allowlist of throw
+    /// helpers, not enough of them to trip that heuristic. The stale
+    /// `undefined` (1-byte) return type it was recovered under silently
+    /// truncated the real pointer `operator_new` returns -- corrupting
+    /// every caller. `add_forwarding_thunks` must override that existing
+    /// entry, not skip the address because it already has one.
+    #[test]
+    fn a_thunk_match_overrides_an_already_recovered_ordinary_function() {
+        let mut graph = KnowledgeGraph::new();
+        graph.add_observation(
+            "0x140006600",
+            "decompiles_to",
+            "undefined FUN_140006600(undefined8 param_1,ulonglong param_2)\n\n{\n  if (0xfffffffffffffff < param_2) {\n    if (0x1fffffffffffffff < param_2) {\n      std::__throw_bad_array_new_length();\n    }\n    std::__throw_bad_alloc();\n  }\n  operator_new(param_2 << 3);\n  return;\n}",
+            0.95,
+            "ghidra:decompiler",
+            None,
+        );
+
+        let mut table = SymbolTable::new();
+        table.insert(
+            "0x140006600".to_string(),
+            crate::symtab::RecoveredSymbol {
+                kind: SymbolKind::FreeFunction,
+                owner: String::new(),
+                display_name: "FUN_140006600".to_string(),
+                expected_args: 2,
+                param_types: Vec::new(),
+                canonical_target: String::new(),
+                argument_mapping: Vec::new(),
+                return_type: "undefined".to_string(),
+                raw_params: "ulonglong param_2".to_string(),
+            },
+        );
+
+        add_forwarding_thunks(&graph, &mut table);
+
+        let sym = table.get("0x140006600").expect("entry still present");
+        assert_eq!(sym.kind, SymbolKind::ForwardingThunk, "the stale FreeFunction entry must be overridden");
+        assert_eq!(sym.canonical_target, "operator_new");
     }
 }
