@@ -178,7 +178,14 @@ impl AgentProvider for OpenAiProvider {
             observation, its semantic_role should be \"install<ClassName>Vtable\" (e.g. \
             \"installWallVtable\") -- identifier-style, class-qualified, and specific in exactly \
             this sense, without claiming to know constructor vs destructor, which that \
-            observation deliberately doesn't determine.";
+            observation deliberately doesn't determine. If the subject has a \
+            sibling_vtable_role observation, a sibling class's own method at the same vtable \
+            slot already earned an ACCEPTED semantic_role -- by the Itanium ABI, that slot means \
+            the same logical method across every class sharing that ancestor, just with a \
+            different override, so this is strong, structural evidence for the same or an \
+            analogous role here, not merely another independent guess to weigh equally against \
+            everything else. Prefer it unless this subject's own body, callers, or fields \
+            actively contradict it.";
 
         let user = render_analyze_function_task(task);
         let value = self.complete(
@@ -243,8 +250,14 @@ impl AgentProvider for OpenAiProvider {
             vtable_install_pattern observation, its semantic_role should be \
             \"install<ClassName>Vtable\" (e.g. \"installWallVtable\") -- identifier-style, \
             class-qualified, and specific in exactly this sense, without claiming to know \
-            constructor vs destructor, which that observation deliberately doesn't determine. \
-            Return exactly one result per subject listed below, \
+            constructor vs destructor, which that observation deliberately doesn't determine. If \
+            a subject has a sibling_vtable_role observation, a sibling class's own method at the \
+            same vtable slot already earned an ACCEPTED semantic_role -- by the Itanium ABI, \
+            that slot means the same logical method across every class sharing that ancestor, \
+            just with a different override, so this is strong, structural evidence for the same \
+            or an analogous role here, not merely another independent guess to weigh equally \
+            against everything else. Prefer it unless that subject's own body, callers, or \
+            fields actively contradict it. Return exactly one result per subject listed below, \
             each carrying that subject's own address back so results can be matched up -- order \
             doesn't matter, the subject field is authoritative.";
 
@@ -446,7 +459,14 @@ const CHALLENGE_SYSTEM: &str = "You are Debura's ChallengeHypothesis adversarial
     pointer -- a semantic_role name shaped \"install<ClassName>Vtable\" is already an \
     appropriately conservative, honest name for exactly that fact, not a vague placeholder \
     needing more specificity; don't demand it also specify constructor vs destructor or a \
-    fuller behavioral role the evidence doesn't support. \
+    fuller behavioral role the evidence doesn't support. Likewise, a subject with a \
+    sibling_vtable_role observation is being named by analogy to a sibling class's own ACCEPTED \
+    role at the same vtable slot -- a real, structural signal (the Itanium ABI guarantees that \
+    slot means the same logical method across the hierarchy), not an unsupported guess just \
+    because it wasn't independently re-derived from this subject's own body alone. Judge it the \
+    same way you'd judge any other well-evidenced claim: look for a genuine reason the analogy \
+    doesn't hold here (a body, caller, or field pattern that contradicts it), not for the \
+    analogy's mere existence. \
     \n\n\
     If the hypothesis under review has the predicate \"semantic_role\" (not \
     \"mechanical_behavior\" -- that one is expected to describe the body's own mechanics and \
