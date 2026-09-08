@@ -189,6 +189,20 @@ const MAX_PROPAGATION_DEPTH: u32 = 5;
 /// helpers along the way isn't misclassified.
 const LIBRARY_GLUE_THRESHOLD: f64 = 0.8;
 
+/// Dominance threshold above which a subject's callee composition can call
+/// it Application, by the same reasoning `LIBRARY_GLUE_THRESHOLD` applies
+/// in the other direction -- a real majority, not "any single resolved
+/// callee at all". A real recovery run found the old any-callee rule
+/// mislabeling MinGW CRT startup code (`_initterm`/`_ismbblead`-calling
+/// glue sitting directly on the call path from the real entrypoint) as
+/// Application: CRT startup necessarily calls into `main`, which calls
+/// into real game code, so *one* genuinely-Application callee several
+/// hops down was enough to propagate Application all the way back up
+/// through code that is overwhelmingly CRT-internal by call composition.
+/// Requiring a real majority keeps that one real hit from outweighing
+/// everything else a subject calls.
+const APPLICATION_DOMINANCE_THRESHOLD: f64 = 0.5;
+
 /// The provenance judgment PROJECT.md M17 asks for, computed structurally
 /// rather than assumed from a naming default: `classify_subject`'s
 /// name/import shape first (cheap, and the strongest signal when it
@@ -303,7 +317,8 @@ fn classify_provenance_bounded(
     if library_count as f64 / resolved.len() as f64 >= LIBRARY_GLUE_THRESHOLD {
         return Provenance::LibraryOrRuntime;
     }
-    if resolved.iter().any(|p| *p == Provenance::Application) {
+    let application_count = resolved.iter().filter(|p| **p == Provenance::Application).count();
+    if application_count as f64 / resolved.len() as f64 > APPLICATION_DOMINANCE_THRESHOLD {
         return Provenance::Application;
     }
 
@@ -584,6 +599,56 @@ mod tests {
         graph.add_observation("0x5", "has_name", "formatValue", 0.95, "ghidra:function", None);
 
         assert_eq!(library_callee_ratio(&graph, "0x1"), 0.25);
+        assert_eq!(classify_provenance(&graph, "0x1"), Provenance::Application);
+    }
+
+    /// PROJECT.md M18: a real recovery run found this exact shape --
+    /// MinGW CRT startup code sitting directly on the call path from the
+    /// real entrypoint, mostly calling other CRT-internal helpers with no
+    /// provenance signal of their own, but *one* of its callees
+    /// eventually (several hops down, through `main`) reaches real game
+    /// code. The old "any resolved callee is Application" rule let that
+    /// single genuine hit propagate Application all the way back up
+    /// through code that is overwhelmingly not application code by call
+    /// composition -- a real majority is required now instead.
+    #[test]
+    fn a_lone_application_callee_among_a_majority_of_unknown_callees_does_not_dominate() {
+        let mut graph = KnowledgeGraph::new();
+        graph.add_observation("0x1", "has_name", "FUN_1", 0.95, "ghidra:function", None);
+        for callee in ["0x2", "0x3", "0x4"] {
+            graph.add_observation("0x1", "calls", callee, 0.95, "ghidra:call_graph", None);
+            graph.add_observation(callee, "has_name", callee, 0.95, "ghidra:function", None);
+            // No further signal for these three at all -- genuinely Unknown.
+        }
+        // The fourth callee is a real, unambiguous application method.
+        graph.add_observation("0x1", "calls", "0x5", 0.95, "ghidra:call_graph", None);
+        graph.add_observation("0x5", "has_name", "draw", 0.95, "ghidra:function", None);
+        graph.add_observation("0x5", "is_method_of", "Wall", 0.95, "ghidra:function", None);
+
+        // Sanity: the one Application callee really does classify that way.
+        assert_eq!(classify_provenance(&graph, "0x5"), Provenance::Application);
+        // But it's only 1 of 4 (25%) -- a minority, so it must not
+        // propagate up to the caller.
+        assert_eq!(classify_provenance(&graph, "0x1"), Provenance::Unknown);
+    }
+
+    /// The mirror of the minority case above: once genuinely more than
+    /// half of a subject's own callees are Application, it should still
+    /// propagate -- this isn't a stricter bar than "any", it's "a real
+    /// majority" (PROJECT.md M18).
+    #[test]
+    fn a_real_majority_of_application_callees_still_dominates() {
+        let mut graph = KnowledgeGraph::new();
+        graph.add_observation("0x1", "has_name", "FUN_1", 0.95, "ghidra:function", None);
+        graph.add_observation("0x1", "calls", "0x2", 0.95, "ghidra:call_graph", None);
+        graph.add_observation("0x2", "has_name", "unknownHelper", 0.95, "ghidra:function", None);
+        for (callee, name) in [("0x3", "draw"), ("0x4", "update")] {
+            graph.add_observation("0x1", "calls", callee, 0.95, "ghidra:call_graph", None);
+            graph.add_observation(callee, "has_name", name, 0.95, "ghidra:function", None);
+            graph.add_observation(callee, "is_method_of", "Wall", 0.95, "ghidra:function", None);
+        }
+
+        // 2 of 3 (66.7%) resolved callees are Application -- a real majority.
         assert_eq!(classify_provenance(&graph, "0x1"), Provenance::Application);
     }
 
