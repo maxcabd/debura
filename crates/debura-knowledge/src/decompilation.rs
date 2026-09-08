@@ -32,14 +32,69 @@ pub fn latest_decompilation<'a>(graph: &'a KnowledgeGraph, subject: &str) -> Opt
         .copied()
 }
 
-/// A decompilation whose body is empty or just an elided `{...}`
-/// placeholder -- Ghidra emits this on some re-analysis passes for a
-/// subject it successfully decompiled fully on an earlier pass.
+/// A decompilation whose body is empty, just an elided `{...}`
+/// placeholder (Ghidra emits this on some re-analysis passes for a
+/// subject it successfully decompiled fully on an earlier pass), or --
+/// a real case a real recovery run found -- contains nothing but a
+/// comment (`{\n // body omitted for brevity\n}`, a non-Ghidra shape:
+/// no decompiler ever writes English prose, so this can only be a
+/// model-generated placeholder that got stored as if it were a real
+/// decompilation). The exact-`{...}` check alone let that second shape
+/// silently outrank an earlier, real, complete decompilation for the
+/// same address -- `latest_decompilation`'s whole "prefer substantive
+/// over degenerate" contract only works if every real degenerate shape
+/// is actually recognized as one.
 pub fn is_degenerate_decompilation(text: &str) -> bool {
-    match text.find('{') {
-        Some(idx) => matches!(text[idx..].trim(), "{...}" | "{ ... }"),
+    let Some(idx) = text.find('{') else { return true };
+    let remainder = text[idx..].trim();
+    if matches!(remainder, "{...}" | "{ ... }") {
+        return true;
+    }
+    match remainder.strip_prefix('{').and_then(|s| s.strip_suffix('}')) {
+        Some(body) => body_has_only_comments_or_whitespace(body),
         None => true,
     }
+}
+
+/// Whether `body` (the text strictly between a decompilation's own outer
+/// `{`/`}`) contains any real code at all -- `false` the moment a
+/// non-whitespace character outside a `//`/`/* */` comment is found. A
+/// genuinely empty function body still has at least one real statement
+/// in Ghidra's own output (`return;`, at minimum); only a
+/// model-generated or otherwise fabricated placeholder ever has nothing
+/// but a comment.
+fn body_has_only_comments_or_whitespace(body: &str) -> bool {
+    let mut chars = body.char_indices().peekable();
+    while let Some((i, c)) = chars.next() {
+        if c.is_whitespace() {
+            continue;
+        }
+        if body[i..].starts_with("//") {
+            for (_, c2) in chars.by_ref() {
+                if c2 == '\n' {
+                    break;
+                }
+            }
+            continue;
+        }
+        if body[i..].starts_with("/*") {
+            let Some(end) = body[i + 2..].find("*/") else {
+                // Unterminated block comment -- nothing real can follow
+                // it within this body.
+                return true;
+            };
+            let skip_to = i + 2 + end + 2;
+            while let Some(&(j, _)) = chars.peek() {
+                if j >= skip_to {
+                    break;
+                }
+                chars.next();
+            }
+            continue;
+        }
+        return false;
+    }
+    true
 }
 
 #[cfg(test)]
@@ -77,5 +132,64 @@ mod tests {
     fn returns_none_when_no_decompilation_exists_at_all() {
         let graph = KnowledgeGraph::new();
         assert!(latest_decompilation(&graph, "0x1").is_none());
+    }
+
+    /// The real, confirmed case a real recovery run found: a later
+    /// observation whose body is nothing but an English-prose comment
+    /// (`// body omitted for brevity`) -- no Ghidra decompiler pass ever
+    /// writes that shape, only a model-generated placeholder does.
+    /// Silently outranking the earlier, real, complete decompilation for
+    /// the same address (`FUN_140006870`, a real `std::vector` growth
+    /// helper) corrupted a vector's own "end" pointer at runtime: its
+    /// caller expected the real body's real writes, got an empty
+    /// function instead.
+    #[test]
+    fn a_comment_only_placeholder_is_recognized_as_degenerate() {
+        assert!(is_degenerate_decompilation(
+            "void FUN_140006870(void **param_1,undefined8 param_2)\n\n{\n // body omitted for brevity\n}"
+        ));
+    }
+
+    #[test]
+    fn prefers_an_earlier_real_decompilation_over_a_later_comment_only_placeholder() {
+        let mut graph = KnowledgeGraph::new();
+        graph.add_observation(
+            "0x140006870",
+            "decompiles_to",
+            "void FUN_140006870(void **param_1,undefined8 param_2)\n\n{\n  param_1[1] = param_2;\n  return;\n}",
+            0.95,
+            "ghidra:decompiler",
+            None,
+        );
+        graph.add_observation(
+            "0x140006870",
+            "decompiles_to",
+            "void FUN_140006870(void **param_1,undefined8 param_2)\n\n{\n // body omitted for brevity\n}",
+            0.95,
+            "ghidra:decompiler",
+            None,
+        );
+
+        let latest = latest_decompilation(&graph, "0x140006870").unwrap();
+        assert!(latest.value.contains("param_1[1] = param_2;"), "{}", latest.value);
+    }
+
+    /// A real, trivial body (just `return;`, real Ghidra output for a
+    /// genuinely empty function) must never be mistaken for a
+    /// placeholder -- it has real code, just not much of it.
+    #[test]
+    fn a_trivial_but_real_body_is_not_degenerate() {
+        assert!(!is_degenerate_decompilation("void FUN_1(void)\n\n{\n  return;\n}"));
+    }
+
+    /// A real body that happens to contain a comment (Ghidra's own
+    /// `/* WARNING: ... */` decompiler notes, a real, previously-seen
+    /// shape) alongside real code must not be mistaken for a
+    /// comment-only placeholder either.
+    #[test]
+    fn a_real_body_with_a_leading_comment_is_not_degenerate() {
+        assert!(!is_degenerate_decompilation(
+            "void FUN_1(void)\n\n{\n  /* WARNING: unknown */\n  real_call();\n  return;\n}"
+        ));
     }
 }
