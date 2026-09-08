@@ -40,9 +40,15 @@ fn patch_known_idioms(text: &str) -> String {
     // `std::operator<<`. `compat.rs`'s `debura_stream_manip` takes over
     // from here (and declares the function-pointer typedef this call's
     // own argument cast needs).
+    // No trailing `(` in the needle: Ghidra sometimes wraps a long call
+    // expression across lines, with the open paren on its own line --
+    // a real case had exactly this, which an earlier version of this
+    // replace (requiring an immediately-following `(`) silently missed.
+    // Whitespace/a newline between a function name and its `(` is valid
+    // C++ regardless, so dropping it from the needle is enough.
     let text = text.replace(
-        "std::basic_ostream<char,std::char_traits<char>>::operator<<(",
-        "debura_stream_manip(",
+        "std::basic_ostream<char,std::char_traits<char>>::operator<<",
+        "debura_stream_manip",
     );
     // Ghidra's decompiler occasionally names a local variable holding an
     // intermediate value literally `this` -- unrelated to the enclosing
@@ -184,6 +190,16 @@ mod idiom_tests {
     fn qualified_ostream_operator_shift_becomes_debura_stream_manip() {
         let text = "std::basic_ostream<char,std::char_traits<char>>::operator<<(x, y);";
         assert_eq!(patch_known_idioms(text), "debura_stream_manip(x, y);");
+    }
+
+    /// A real compile hit this: Ghidra wrapped a long call expression
+    /// across lines, with the qualified name on one line and its `(` on
+    /// the next -- an earlier version of this replace required an
+    /// immediately-following `(` and silently missed it.
+    #[test]
+    fn qualified_ostream_operator_shift_is_replaced_even_when_line_wrapped() {
+        let text = "std::basic_ostream<char,std::char_traits<char>>::operator<<\n          (x, y);";
+        assert_eq!(patch_known_idioms(text), "debura_stream_manip\n          (x, y);");
     }
 
     /// The exact real case: a local variable Ghidra's decompiler named

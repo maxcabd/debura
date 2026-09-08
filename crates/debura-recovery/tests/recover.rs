@@ -272,6 +272,38 @@ fn a_leading_ghidra_warning_comment_does_not_corrupt_the_parsed_params() {
     assert_eq!(function.params, "undefined8 *param_1");
 }
 
+/// PROJECT.md M17 (compile-viability pass): a real compile hit this --
+/// a subject with two `decompiles_to` observations, an earlier one
+/// carrying the real, full body and a later one (a second Ghidra pass)
+/// carrying a degenerate `{...}` placeholder. Picking "highest id" blindly
+/// rendered a body that was literally the three characters `...`, which
+/// doesn't compile at all.
+#[test]
+fn a_later_degenerate_decompilation_does_not_override_an_earlier_real_one() {
+    let mut graph = KnowledgeGraph::new();
+    graph.add_observation("0x1", "has_name", "FUN_1", 0.95, "ghidra:function", None);
+    graph.add_observation("0x1", "has_signature", "void FUN_1(void **param_1)", 0.95, "ghidra:function", None);
+    graph.add_observation(
+        "0x1",
+        "decompiles_to",
+        "void FUN_1(void **param_1)\n\n{\n  FUN_2(param_1);\n  return;\n}",
+        0.95,
+        "ghidra:decompiler",
+        None,
+    );
+    // A later re-analysis pass emitted a degenerate placeholder instead.
+    graph.add_observation("0x1", "decompiles_to", "void FUN_1(void **param_1) {...}", 0.95, "ghidra:decompiler", None);
+    anchor_as_application(&mut graph, "0x1", "0xa1");
+    let h = graph.propose_hypothesis("0x1", "semantic_role", "createWalls", 0.9, None);
+    graph.mark_verified(h, Utc::now()).unwrap();
+    graph.set_status(h, HypothesisStatus::Accepted).unwrap();
+
+    let program = extract(&graph);
+    let function = program.functions.iter().find(|f| f.address == "0x1").unwrap();
+
+    assert!(function.decompilation.contains("FUN_2(param_1);"), "{}", function.decompilation);
+}
+
 #[test]
 fn functions_without_an_accepted_hypothesis_are_not_recovered() {
     let mut graph = KnowledgeGraph::new();

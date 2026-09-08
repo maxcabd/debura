@@ -19,6 +19,39 @@ fn latest<'a>(graph: &'a KnowledgeGraph, subject: &str, predicate: &str) -> Opti
         .max_by_key(|o| o.id.0)
 }
 
+/// `decompiles_to` specifically needs a different tiebreak than `latest`'s
+/// general "highest id wins": a real case had a subject with two
+/// observations, an earlier one carrying the real, full decompiled body
+/// and a later one (a second Ghidra pass, M8's `reextract`) carrying a
+/// degenerate `{...}` placeholder -- `latest` silently threw the real
+/// body away in favor of the newer-but-worse one, rendering a body that
+/// was literally the three characters `...`. Prefers the most recent
+/// *substantive* decompilation over the most recent of any kind, falling
+/// back to the latest overall only if every one on record is degenerate.
+fn latest_decompilation<'a>(graph: &'a KnowledgeGraph, subject: &str) -> Option<&'a Observation> {
+    let mut candidates: Vec<&Observation> = graph
+        .observations()
+        .filter(|o| o.subject == subject && o.predicate == "decompiles_to")
+        .collect();
+    candidates.sort_by_key(|o| o.id.0);
+    candidates
+        .iter()
+        .rev()
+        .find(|o| !is_degenerate_decompilation(&o.value))
+        .or_else(|| candidates.last())
+        .copied()
+}
+
+/// A decompilation whose body is empty or just an elided `{...}`
+/// placeholder -- Ghidra emits this on some re-analysis passes for a
+/// subject it successfully decompiled fully on an earlier pass.
+fn is_degenerate_decompilation(text: &str) -> bool {
+    match text.find('{') {
+        Some(idx) => matches!(text[idx..].trim(), "{...}" | "{ ... }"),
+        None => true,
+    }
+}
+
 /// The model is told to give `semantic_role` an identifier-style value,
 /// but nothing enforces that at the schema level -- a value like "perform
 /// graphical operations including drawing..." has been seen ACCEPTED in
@@ -168,7 +201,7 @@ fn build_method(
 ) -> Option<RecoveredMethod> {
     let raw_name = latest(graph, address, "has_name")?.value.clone();
     let signature = latest(graph, address, "has_signature").map(|o| o.value.clone()).unwrap_or_default();
-    let decompilation = latest(graph, address, "decompiles_to").map(|o| o.value.clone()).unwrap_or_default();
+    let decompilation = latest_decompilation(graph, address).map(|o| o.value.clone()).unwrap_or_default();
     let (display_name, name_source) = name_source(graph, address).unwrap_or_else(|| (raw_name.clone(), NameSource::Raw));
     let parsed = parse_signature(&signature, &raw_name);
 
@@ -538,7 +571,7 @@ pub fn extract(graph: &KnowledgeGraph) -> RecoveredProgram {
         let signature = latest(graph, &subject, "has_signature")
             .map(|o| o.value.clone())
             .unwrap_or_default();
-        let decompilation = latest(graph, &subject, "decompiles_to")
+        let decompilation = latest_decompilation(graph, &subject)
             .map(|o| o.value.clone())
             .unwrap_or_default();
         let parsed = parse_signature(&signature, &raw_name);
