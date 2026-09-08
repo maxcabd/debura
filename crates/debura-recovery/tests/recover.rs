@@ -391,11 +391,6 @@ fn a_later_degenerate_decompilation_does_not_override_an_earlier_real_one() {
 
 #[test]
 fn functions_without_an_accepted_hypothesis_are_not_recovered() {
-    // No `decompiles_to` at all -- not a real, structurally-complete
-    // function Debura has grounds to recover under any name, accepted or
-    // otherwise (PROJECT.md M18's FUN_<addr> fallback still requires a
-    // real body -- see `an_application_function_with_no_accepted_name_is_still_recovered_under_its_raw_name`
-    // for the case that *does* now recover without one).
     let mut graph = KnowledgeGraph::new();
     graph.add_observation("0x99", "has_name", "FUN_99", 0.95, "ghidra:function", None);
     graph.propose_hypothesis("0x99", "semantic_role", "Guessed", 0.5, None); // PROPOSED, not ACCEPTED
@@ -403,38 +398,6 @@ fn functions_without_an_accepted_hypothesis_are_not_recovered() {
     let program = extract(&graph);
     assert!(program.functions.is_empty());
     assert!(program.classes.is_empty());
-}
-
-/// PROJECT.md M18: a real linker frontier found 3 of 9 Application-
-/// provenance, structurally-complete functions never earned an accepted
-/// `semantic_role` after real, repeated challenge attempts -- a genuine
-/// semantic-recovery gap, not a reason to leave them out of `recovered/`
-/// entirely and block the link on a pretty name nothing was ever going to
-/// confidently assign. Naming decides what a function is *called*, not
-/// *whether* it's recovered.
-#[test]
-fn an_application_function_with_no_accepted_name_is_still_recovered_under_its_raw_name() {
-    let mut graph = KnowledgeGraph::new();
-    graph.add_observation("0x99", "has_name", "FUN_99", 0.95, "ghidra:function", None);
-    graph.add_observation(
-        "0x99",
-        "decompiles_to",
-        "void FUN_99(void)\n\n{\n  anchorMethod();\n  return;\n}",
-        0.95,
-        "ghidra:decompiler",
-        None,
-    );
-    // Every semantic_role attempt genuinely failed -- REJECTED, not just
-    // absent -- which is exactly the real case this closes.
-    let h = graph.propose_hypothesis("0x99", "semantic_role", "doSomething", 0.5, None);
-    let _ = graph.set_status(h, HypothesisStatus::Rejected);
-    anchor_as_application(&mut graph, "0x99", "0x100");
-
-    let program = extract(&graph);
-
-    let f = program.functions.iter().find(|f| f.address == "0x99").expect("recovered under its raw name");
-    assert_eq!(f.display_name, "FUN_99");
-    assert!(matches!(f.name_source, NameSource::Raw));
 }
 
 /// A real run had `_Guard`, `_Vector_impl`, and `__class_type_info` --

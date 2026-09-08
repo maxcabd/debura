@@ -582,11 +582,8 @@ fn disambiguate_method_names(methods: &mut [RecoveredMethod]) {
 /// this: a real run had non-polymorphic classes referenced by name in an
 /// already-recovered class's method signatures, e.g. `Food::draw(Screen
 /// *)`, with `Screen` itself never declared anywhere in the output), and
-/// every standalone function with Application provenance and a real
-/// decompiled body -- an ACCEPTED semantic name (M5) decides what it's
-/// *called* (a pretty name, or else its raw `FUN_<addr>`), not *whether*
-/// it's recovered at all (PROJECT.md M18: source completeness must not
-/// depend on M17's semantic-naming success).
+/// every standalone function that has actually earned an ACCEPTED
+/// semantic name (M5) -- nothing else counts as "recovered".
 pub fn extract(graph: &KnowledgeGraph) -> RecoveredProgram {
     // PROJECT.md M15: a real run found libstdc++/CRT-internal classes
     // (`_Guard`, `_Vector_impl`, `__class_type_info`) getting the exact
@@ -633,30 +630,6 @@ pub fn extract(graph: &KnowledgeGraph) -> RecoveredProgram {
         .filter(|h| h.predicate == "semantic_role" && h.status == HypothesisStatus::Accepted)
     {
         subjects.insert(h.subject.clone());
-    }
-
-    // PROJECT.md M18: semantic naming is a readability improvement, not a
-    // precondition for source completeness. A real linker frontier found
-    // 3 of 9 Application-provenance, structurally-complete functions
-    // never earned an accepted `semantic_role` even after real, repeated
-    // challenge attempts (isolated, not a provenance or truth-maintenance
-    // bug -- a genuine semantic-recovery gap) -- and were silently left
-    // out of `recovered/` entirely under the old ACCEPTED-name-only
-    // filter, blocking the link on a pretty name nothing was ever going
-    // to confidently assign. Any subject with a real (non-degenerate)
-    // decompiled body whose provenance genuinely is Application is
-    // recoverable regardless: it renders under its raw `FUN_<addr>` name
-    // (`name_source` already falls back to this below) instead of a
-    // semantic one.
-    for o in graph.observations().filter(|o| o.predicate == "has_name") {
-        if class_method_addresses.contains(&o.subject) || subjects.contains(&o.subject) {
-            continue;
-        }
-        let has_real_body = latest_decompilation(graph, &o.subject)
-            .is_some_and(|d| !is_degenerate_decompilation(&d.value));
-        if has_real_body && classify_provenance(graph, &o.subject) == Provenance::Application {
-            subjects.insert(o.subject.clone());
-        }
     }
 
     let mut functions = Vec::new();

@@ -85,14 +85,9 @@ pub struct RecoveredFunction {
 }
 
 /// Everything Debura currently has enough grounds to recover (PROJECT.md
-/// M9). A standalone function is included once it has Application
-/// provenance and a real decompiled body -- an ACCEPTED semantic name (M5)
-/// only decides whether it renders under a pretty name or its raw
-/// `FUN_<addr>` (PROJECT.md M18: naming is a readability improvement, not
-/// a precondition for source completeness). Dumping every unnamed
-/// `FUN_xxx` in the binary regardless of provenance still wouldn't be
-/// "recovered" anything -- the Application-provenance and real-body
-/// requirements are what keep this from doing that.
+/// M9). Only functions with a real recovered (ACCEPTED) name are included
+/// as standalone recovered functions -- dumping every unnamed `FUN_xxx` in
+/// the binary wouldn't be "recovered" anything.
 #[derive(Debug, Clone, Default)]
 pub struct RecoveredProgram {
     pub classes: Vec<RecoveredClass>,
