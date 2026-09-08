@@ -148,6 +148,23 @@ inline ::basic_ostream *debura_stream_endl(::basic_ostream *os) {
     return os;
 }
 
+// The *other* half of the same chained-manipulator idiom
+// (`std::cout << msg << std::endl;`): the outer `operator<<` -- the
+// overload that accepts a manipulator function pointer, which really is
+// a *member* of basic_ostream in the real ABI, unlike the free-function
+// overloads for ordinary values -- decompiles as a qualified call to
+// `std::basic_ostream<char,std::char_traits<char>>::operator<<`, not
+// `std::operator<<`. `render.rs`'s `patch_known_idioms` rewrites that
+// call to this instead, so it isn't limited to `std::endl` specifically.
+using StreamManip = ::basic_ostream *(*)(::basic_ostream *);
+inline ::basic_ostream *debura_stream_manip(::basic_ostream *os, StreamManip manip) {
+    return manip(os);
+}
+// Ghidra's own auto-generated name for a function-pointer type shaped
+// `basic_ostream *(*)(basic_ostream *)` -- the exact cast target a real
+// compile showed at a manipulator call site, never otherwise declared.
+using _func_basic_ostream_ptr_basic_ostream_ptr = StreamManip;
+
 // Calling-convention keyword from Ghidra's x86-32 heritage; x86-64 has
 // exactly one calling convention, so this is a no-op here.
 #define __thiscall

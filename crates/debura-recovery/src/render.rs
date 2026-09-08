@@ -31,6 +31,28 @@ fn patch_known_idioms(text: &str) -> String {
     // never legally exist.
     let text = text.replace("std::operator<<(", "debura_stream_output(");
     let text = text.replace("std::endl<char,std::char_traits<char>>(", "debura_stream_endl(");
+    // The *other* half of the chained-manipulator idiom
+    // (`std::cout << msg << std::endl;`): the outer `operator<<` --
+    // the overload that accepts a manipulator function pointer, which
+    // really is a *member* of basic_ostream in the real ABI, unlike the
+    // free-function overloads for ordinary values -- decompiles as a
+    // qualified call to this exact class-scoped name, not
+    // `std::operator<<`. `compat.rs`'s `debura_stream_manip` takes over
+    // from here (and declares the function-pointer typedef this call's
+    // own argument cast needs).
+    let text = text.replace(
+        "std::basic_ostream<char,std::char_traits<char>>::operator<<(",
+        "debura_stream_manip(",
+    );
+    // Ghidra's decompiler occasionally names a local variable holding an
+    // intermediate value literally `this` -- unrelated to the enclosing
+    // function's own implicit `this`, but a hard conflict regardless,
+    // since `this` is a reserved keyword. A real case had a
+    // `basic_ostream *this;` local holding a chained `operator<<`
+    // call's return value. Detected narrowly, only when an actual
+    // declaration line names it, so a body that legitimately uses the
+    // real, implicit `this` (never re-declared as a local) is untouched.
+    let text = rename_this_local_variable(&text);
 
     // Ghidra always writes these STL types out with their real,
     // explicit (and in this codebase, always `char`-based) template
@@ -60,6 +82,52 @@ fn patch_known_idioms(text: &str) -> String {
         "basic_string",
     );
     strip_redundant_template_args(&text, "basic_ostream<char,std::char_traits<char>>", "basic_ostream")
+}
+
+/// Renames a local variable literally declared `this` (e.g.
+/// `basic_ostream *this;`) to `debura_local_this`, throughout the body --
+/// but only when such a declaration line actually exists. A genuine,
+/// implicit `this` is never re-declared this way, so its absence is a
+/// reliable signal this body doesn't have the bug at all.
+fn rename_this_local_variable(text: &str) -> String {
+    let has_this_declaration = text.lines().any(|line| {
+        let trimmed = line.trim();
+        // A real declaration is bare (`TYPE *this;`, no `=`) and never a
+        // `return`/assignment statement that merely *uses* a genuine,
+        // implicit `this` and happens to also end the same way (`return
+        // this;`, `pbVar1 = this;`).
+        !trimmed.starts_with("return")
+            && !trimmed.contains('=')
+            && (trimmed.ends_with("*this;") || trimmed.ends_with(" this;"))
+    });
+    if !has_this_declaration {
+        return text.to_string();
+    }
+    replace_whole_word(text, "this", "debura_local_this")
+}
+
+/// Replaces every whole-word occurrence of `word` with `replacement` --
+/// unlike a plain substring replace, doesn't also match `word` as part of
+/// a longer identifier.
+fn replace_whole_word(text: &str, word: &str, replacement: &str) -> String {
+    fn is_word_byte(b: u8) -> bool {
+        b.is_ascii_alphanumeric() || b == b'_'
+    }
+
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while let Some(rel) = text[i..].find(word) {
+        let start = i + rel;
+        let end = start + word.len();
+        let before_ok = start == 0 || !is_word_byte(bytes[start - 1]);
+        let after_ok = end == bytes.len() || !is_word_byte(bytes[end]);
+        out.push_str(&text[i..start]);
+        out.push_str(if before_ok && after_ok { replacement } else { word });
+        i = end;
+    }
+    out.push_str(&text[i..]);
+    out
 }
 
 /// Replaces `templated` with `bare` everywhere it appears *without* a
@@ -93,15 +161,61 @@ mod idiom_tests {
     /// A real compile hit this as a regression: the first version of
     /// this fix stripped template arguments unconditionally, breaking a
     /// fully `std::`-qualified reference to the real template (which
-    /// still needs them) into `std::basic_ostream::operator<<` -- "used
-    /// without template arguments".
+    /// still needs them) into `std::basic_ostream::flush` -- "used
+    /// without template arguments". `operator<<` specifically is no
+    /// longer a case this could even happen to (see the manipulator test
+    /// below), so this uses a different qualified member reference to
+    /// keep covering the general rule.
     #[test]
     fn std_qualified_occurrence_keeps_its_template_args() {
-        let text = "std::basic_ostream<char,std::char_traits<char>>::operator<<(x, y);";
+        let text = "std::basic_ostream<char,std::char_traits<char>>::flush(x);";
         assert_eq!(
             patch_known_idioms(text),
-            "std::basic_ostream<char,std::char_traits<char>>::operator<<(x, y);"
+            "std::basic_ostream<char,std::char_traits<char>>::flush(x);"
         );
+    }
+
+    /// The chained-manipulator idiom (`std::cout << msg << std::endl;`):
+    /// the outer `operator<<` decompiles as a qualified call to
+    /// basic_ostream's own `operator<<`, not `std::operator<<` -- a real
+    /// compile found this call form entirely unhandled ("not declared in
+    /// this scope" for the argument's own function-pointer cast target).
+    #[test]
+    fn qualified_ostream_operator_shift_becomes_debura_stream_manip() {
+        let text = "std::basic_ostream<char,std::char_traits<char>>::operator<<(x, y);";
+        assert_eq!(patch_known_idioms(text), "debura_stream_manip(x, y);");
+    }
+
+    /// The exact real case: a local variable Ghidra's decompiler named
+    /// literally `this`, holding a chained `operator<<` call's return
+    /// value -- a hard conflict with the reserved keyword regardless of
+    /// what it means, caught by a real compile ("expected unqualified-id
+    /// before 'this'").
+    #[test]
+    fn a_this_named_local_variable_is_renamed() {
+        let text = "basic_ostream *this;\nthis = f(x);\ng(this);\n";
+        assert_eq!(
+            patch_known_idioms(text),
+            "basic_ostream *debura_local_this;\ndebura_local_this = f(x);\ng(debura_local_this);\n"
+        );
+    }
+
+    /// The real, implicit `this` parameter -- never re-declared as a
+    /// local variable -- must be left completely untouched, including
+    /// when a `return this;` statement (not a declaration) happens to
+    /// end the same way a declaration line would.
+    #[test]
+    fn a_genuine_implicit_this_is_not_renamed() {
+        let text = "undefined *Drawable::operator=(Drawable *this,Drawable *param_1)\n\n{\n  return this;\n}";
+        assert_eq!(patch_known_idioms(text), text);
+    }
+
+    /// Same false-positive risk, the assignment-statement shape: `pbVar1
+    /// = this;` also ends with `" this;"` without being a declaration.
+    #[test]
+    fn an_assignment_from_a_genuine_this_is_not_mistaken_for_a_declaration() {
+        let text = "basic_ostream *pbVar1;\npbVar1 = this;\n";
+        assert_eq!(patch_known_idioms(text), text);
     }
 }
 
