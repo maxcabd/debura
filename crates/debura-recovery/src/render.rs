@@ -101,6 +101,7 @@ fn patch_known_idioms(text: &str) -> String {
     // bytes `va_list` (a bare `char *` on this target) already is, just
     // the wrong C++ type for an implicit conversion.
     let text = cast_last_call_argument(&text, "__stdio_common_vfprintf", "(va_list)");
+    let text = fix_bare_ostream_array_locals(&text);
 
     // Ghidra always writes these STL types out with their real,
     // explicit (and in this codebase, always `char`-based) template
@@ -325,9 +326,65 @@ fn find_matching_close_paren(text: &str) -> Option<usize> {
     None
 }
 
-/// Every local variable Ghidra declared as a stack-allocated
-/// `basic_string<char,std::char_traits<char>,std::allocator<char>> NAME
-/// [N];` -- the shape a decompiled `std::string` local always has.
+/// `std::basic_ostream`'s own default constructor is `protected` (by
+/// design -- it's meant to be constructed only by a derived stream type
+/// that supplies a streambuf), so Ghidra's usual "bare local array" idiom
+/// for a stack-allocated object (`Type NAME [N];`) can never actually
+/// default-construct one there: a real compile confirmed this with
+/// "protected within this context". A real case had this because
+/// Ghidra's own stack-frame analysis split a single `basic_stringstream`
+/// object's raw bytes into two separately-named locals -- one correctly
+/// typed `basic_stringstream` (handled above), the rest of the same
+/// object's storage separately guessed to be its own `basic_ostream`,
+/// which was never actually true; it's just more of the same object's
+/// raw bytes. Declaring it as plain, always-constructible bytes instead,
+/// and casting its own use site(s) to the pointer type they actually
+/// need, preserves the exact address value Ghidra's own code already
+/// relies on without ever trying to construct a type that can't be.
+/// Handles one such local per body -- the only shape a real compile has
+/// shown so far; a second one in the same body would need a second pass,
+/// not attempted here since nothing yet demonstrates it happens.
+fn fix_bare_ostream_array_locals(text: &str) -> String {
+    let needle = "basic_ostream ";
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    loop {
+        let Some(pos) = rest.find(needle) else { break };
+        let after = &rest[pos + needle.len()..];
+        let Some(name) = after
+            .split(|c: char| c == ' ' || c == '[')
+            .next()
+            .filter(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
+        else {
+            out.push_str(&rest[..pos + needle.len()]);
+            rest = after;
+            continue;
+        };
+        let after_name = after[name.len()..].trim_start();
+        let Some(close_bracket) = after_name.strip_prefix('[').and_then(|s| s.find(']')) else {
+            out.push_str(&rest[..pos + needle.len()]);
+            rest = after;
+            continue;
+        };
+        let size = after_name[1..close_bracket + 1].trim();
+        let after_bracket = &after_name[close_bracket + 2..];
+        let Some(semi) = after_bracket.find(';') else {
+            out.push_str(&rest[..pos + needle.len()]);
+            rest = after;
+            continue;
+        };
+
+        out.push_str(&rest[..pos]);
+        out.push_str(&format!("unsigned char {name} [{size}];"));
+        let name = name.to_string();
+        let after_decl = &after_bracket[semi + 1..];
+        out.push_str(&replace_whole_word(after_decl, &name, &format!("(basic_ostream *){name}")));
+        return out;
+    }
+    out.push_str(rest);
+    out
+}
+
 /// Every local variable declared `{decl_needle}NAME [N];` -- the shape
 /// Ghidra always uses for a stack-allocated instance of a std:: type it
 /// otherwise renders with real template arguments (`decl_needle` already
@@ -454,6 +511,20 @@ mod idiom_tests {
         let text = "std::__cxx11::basic_stringstream<char,std::char_traits<char>,std::allocator<char>>::\n  ~basic_stringstream(local_1a8);";
         let patched = patch_known_idioms(text);
         assert_eq!(patched, "local_1a8->~basic_stringstream();");
+    }
+
+    /// PROJECT.md M18: `std::basic_ostream`'s own default constructor is
+    /// protected, so Ghidra's usual bare-local-array idiom for a
+    /// stack-allocated object can never actually default-construct one
+    /// -- a real compile confirmed "protected within this context" for
+    /// exactly this declaration shape.
+    #[test]
+    fn a_bare_ostream_array_local_is_declared_as_bytes_and_its_use_is_cast() {
+        let text = "basic_ostream abStack_198 [392];\n  pbVar1 = debura_stream_output(abStack_198,x);";
+        let patched = patch_known_idioms(text);
+        assert!(patched.contains("unsigned char abStack_198 [392];"), "{patched}");
+        assert!(patched.contains("debura_stream_output((basic_ostream *)abStack_198,x)"), "{patched}");
+        assert!(!patched.contains("basic_ostream abStack_198"), "{patched}");
     }
 
     /// PROJECT.md M18: `TTF_RenderText_Solid`'s real third parameter is
