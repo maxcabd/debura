@@ -6,6 +6,7 @@
 //! answers one bounded question at a time; the harness decides what of
 //! that answer is trustworthy enough to commit.
 
+mod call_context;
 mod challenge;
 mod evidence_view;
 mod harness;
@@ -18,6 +19,7 @@ pub mod mock;
 #[cfg(feature = "openai")]
 pub mod openai;
 
+pub use call_context::{call_sequence_neighbors, CallSequenceNeighbor, SequencedCall};
 pub use challenge::{ChallengeHypothesisTask, ChallengeResult};
 pub use harness::{
     analyze_function, commit_contradiction, commit_hypothesis, commit_investigation, investigate,

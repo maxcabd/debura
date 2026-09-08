@@ -185,7 +185,24 @@ impl AgentProvider for OpenAiProvider {
             different override, so this is strong, structural evidence for the same or an \
             analogous role here, not merely another independent guess to weigh equally against \
             everything else. Prefer it unless this subject's own body, callers, or fields \
-            actively contradict it.";
+            actively contradict it. \
+            \n\n\
+            The \"Call-sequence context\" section shows the nearest labeled call before and after \
+            this subject's own call site, inside each caller's own call sequence -- \"nearest\" \
+            meaning the search walks outward past unlabeled calls to find one, so it may be more \
+            than one call away; the reported distance tells you how far. This is real evidence \
+            about the subject's PURPOSE, not just its mechanics, even when nothing dispatches to \
+            it polymorphically: a subject called between something a few calls before labeled \
+            \"semantic_role: clearsScreen\" and something a few calls after labeled \
+            \"semantic_role: updatesScreen\", every frame, is doing the render step regardless of \
+            what its own body's loop and arithmetic look like in isolation -- propose a \
+            semantic_role at that level (e.g. \"draw\"), not a restatement of the loop itself \
+            (e.g. \"populateCells\", \"iteratesGrid\"), when the surrounding calls support it. \
+            Weigh distance: immediately-adjacent evidence is stronger than evidence several calls \
+            away, and several unrelated intervening calls should make you more cautious, not less. \
+            The reverse also holds: don't manufacture this kind of role if the neighbors are \
+            unlabeled or unrelated -- an empty or uninformative call-sequence section is not \
+            itself evidence of anything.";
 
         let user = render_analyze_function_task(task);
         let value = self.complete(
@@ -257,7 +274,26 @@ impl AgentProvider for OpenAiProvider {
             just with a different override, so this is strong, structural evidence for the same \
             or an analogous role here, not merely another independent guess to weigh equally \
             against everything else. Prefer it unless that subject's own body, callers, or \
-            fields actively contradict it. Return exactly one result per subject listed below, \
+            fields actively contradict it. \
+            \n\n\
+            Each subject's \"Call-sequence context\" section shows the nearest labeled call before \
+            and after its own call site, inside each caller's own call sequence -- \"nearest\" \
+            meaning the search walks outward past unlabeled calls to find one, so it may be more \
+            than one call away; the reported distance tells you how far. This is real evidence \
+            about that subject's PURPOSE, not just its mechanics, even when nothing dispatches to \
+            it polymorphically: a subject called between something a few calls before labeled \
+            \"semantic_role: clearsScreen\" and something a few calls after labeled \
+            \"semantic_role: updatesScreen\", every frame, is doing the render step regardless of \
+            what its own body's loop and arithmetic look like in isolation -- propose a \
+            semantic_role at that level (e.g. \"draw\"), not a restatement of the loop itself \
+            (e.g. \"populateCells\", \"iteratesGrid\"), when the surrounding calls support it. \
+            Weigh distance: immediately-adjacent evidence is stronger than evidence several calls \
+            away, and several unrelated intervening calls should make you more cautious, not less. \
+            The reverse also holds: don't manufacture this kind of role if a subject's neighbors \
+            are unlabeled or unrelated -- an empty or uninformative call-sequence section is not \
+            itself evidence of anything. \
+            \n\n\
+            Return exactly one result per subject listed below, \
             each carrying that subject's own address back so results can be matched up -- order \
             doesn't matter, the subject field is authoritative.";
 
@@ -571,6 +607,30 @@ fn render_analyze_function_task(task: &AnalyzeFunctionTask) -> String {
                 out.push_str(&format!("    this was contested/rejected because: {reason}\n"));
             }
         }
+    }
+
+    out.push_str("\nCall-sequence context:\n");
+    if task.call_sequence.is_empty() {
+        out.push_str("(no recorded caller, or no decompiled body for its caller)\n");
+    }
+    for neighbor in &task.call_sequence {
+        let describe = |c: &crate::call_context::SequencedCall| {
+            let position = if c.distance == 1 {
+                "immediately".to_string()
+            } else {
+                format!("{} calls", c.distance)
+            };
+            match &c.best_known_label {
+                Some(label) => format!("{position} away: {} ({label})", c.address),
+                None => format!("{position} away: {} (unlabeled)", c.address),
+            }
+        };
+        out.push_str(&format!(
+            "- inside caller {}: before it, {}; after it, {}\n",
+            neighbor.caller,
+            neighbor.before.as_ref().map(describe).unwrap_or_else(|| "nothing -- first call in this caller".to_string()),
+            neighbor.after.as_ref().map(describe).unwrap_or_else(|| "nothing -- last call in this caller".to_string()),
+        ));
     }
 
     out

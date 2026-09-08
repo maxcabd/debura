@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use debura_knowledge::{Hypothesis, HypothesisId, HypothesisStatus, KnowledgeGraph, Observation};
 
+use crate::call_context::{self, CallSequenceNeighbor};
 use crate::evidence_view;
 
 /// Debura's first bounded investigation task (PROJECT.md M4, S23):
@@ -22,6 +23,16 @@ pub struct AnalyzeFunctionTask {
     /// doesn't just repeat the same mistake blindly. Keyed by hypothesis id;
     /// only hypotheses with recorded contradicting evidence appear here.
     pub rejection_reasons: HashMap<HypothesisId, Vec<String>>,
+    /// PROJECT.md M17: this subject's place in each caller's own call
+    /// sequence -- the one piece of "following relationships to pull in
+    /// related subjects" this module's own doc comment used to defer to
+    /// the scheduler. Grounded against the real Snake source: `SDL_main`
+    /// calls `Snake::draw`/`Food::draw`/`drawWalls` directly (no
+    /// polymorphic dispatch site exists to read context from), bracketed
+    /// by `Screen::clear`/`Screen::update` every frame -- exactly the
+    /// context a human would use to place these calls in the render step
+    /// rather than naming only their own internal mechanism.
+    pub call_sequence: Vec<CallSequenceNeighbor>,
 }
 
 impl AnalyzeFunctionTask {
@@ -65,6 +76,7 @@ impl AnalyzeFunctionTask {
                 .collect(),
             existing_hypotheses,
             rejection_reasons,
+            call_sequence: call_context::call_sequence_neighbors(graph, subject),
         }
     }
 }
