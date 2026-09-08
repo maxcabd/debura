@@ -101,6 +101,12 @@ fn patch_known_idioms(text: &str) -> String {
     // bytes `va_list` (a bare `char *` on this target) already is, just
     // the wrong C++ type for an implicit conversion.
     let text = cast_last_call_argument(&text, "__stdio_common_vfprintf", "(va_list)");
+    // `SDL_PollEvent`'s real parameter is `SDL_Event *` (a tagged union),
+    // but Ghidra decompiles the caller's own stack storage for it as a
+    // plain `int [N]` array -- Ghidra's own byte-layout guess for the
+    // union, not the real type. Same reasoning as the `SDL_Color`/
+    // `SDL_Rect` casts above.
+    let text = cast_last_call_argument(&text, "SDL_PollEvent", "(SDL_Event*)");
     let text = fix_bare_ostream_array_locals(&text);
 
     // Ghidra always writes these STL types out with their real,
@@ -297,7 +303,17 @@ fn cast_last_call_argument(text: &str, function: &str, cast: &str) -> String {
                 out.push_str(cast);
                 out.push_str(args[comma + 1..].trim());
             }
-            None => out.push_str(args),
+            // A single-argument call (`SDL_PollEvent(local_48)`) has no
+            // comma at all -- its one argument IS the last argument, and
+            // still needs the cast. A real regression: an earlier version
+            // of this function silently dropped the cast for exactly
+            // this shape (only ever tested against multi-argument calls
+            // until `SDL_PollEvent` -- single-argument -- exposed it).
+            None if !args.trim().is_empty() => {
+                out.push_str(cast);
+                out.push_str(args.trim());
+            }
+            None => {}
         }
         out.push(')');
         rest = &after[close + 1..];
@@ -540,6 +556,17 @@ mod idiom_tests {
             patched.contains("TTF_RenderText_Solid(*(undefined8 *)(param_1 + 0x28),uVar1,*(SDL_Color*)&local_3c);"),
             "{patched}"
         );
+    }
+
+    /// PROJECT.md M18: only exposed once `RequiredRuntimeBody` recovered
+    /// this real function for the first time -- `SDL_PollEvent`'s real
+    /// parameter is `SDL_Event *`, but Ghidra decompiles the caller's own
+    /// stack storage for it as a plain `int [N]` array.
+    #[test]
+    fn sdl_pollevents_event_argument_is_cast_from_a_plain_int_array() {
+        let text = "iVar1 = SDL_PollEvent(local_48);";
+        let patched = patch_known_idioms(text);
+        assert_eq!(patched, "iVar1 = SDL_PollEvent((SDL_Event*)local_48);");
     }
 
     /// Same idea for `SDL_RenderCopy`'s `const SDL_Rect*` parameter, where
