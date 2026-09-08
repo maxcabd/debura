@@ -220,13 +220,83 @@ fn classify_provenance_bounded(
         return Provenance::Unknown;
     }
 
-    if classify_subject(graph, subject) == ClaimClass::LibraryOrCompiler {
+    if let Some(p) = classify_shallow(graph, subject, visited, depth) {
+        return p;
+    }
+
+    if depth == 0 {
+        return Provenance::Unknown;
+    }
+
+    let callees: Vec<String> = graph
+        .observations()
+        .filter(|o| o.subject == subject && o.predicate == "calls")
+        .map(|o| o.value.clone())
+        .collect();
+    if callees.is_empty() {
+        return Provenance::Unknown;
+    }
+
+    // Library dominance is unaffected by the direct/transitive distinction
+    // below: it's still asking "is this subject's callee composition
+    // overwhelmingly library-shaped", which is safe to answer with each
+    // callee's own full (possibly dominance-derived) verdict.
+    let resolved: Vec<Provenance> = callees
+        .iter()
+        .map(|c| classify_provenance_bounded(graph, c, visited, depth - 1))
+        .collect();
+    let library_count = resolved.iter().filter(|p| **p == Provenance::LibraryOrRuntime).count();
+    if library_count as f64 / resolved.len() as f64 >= LIBRARY_GLUE_THRESHOLD {
         return Provenance::LibraryOrRuntime;
+    }
+
+    // PROJECT.md M18: a direct call to a confirmed Application function is
+    // strong evidence (`setupGame` directly calling `Snake::Snake`); an
+    // Application hit reached only *transitively*, through intermediate
+    // nodes with no Application signal of their own, is not -- a real
+    // recovery run found MinGW's CRT startup routine inheriting Application
+    // this way purely because it eventually calls `main`, which calls real
+    // game code several hops down. Checking each direct callee with
+    // `classify_shallow` (not the `resolved` verdicts above, which can
+    // themselves be dominance-derived, i.e. exactly as transitive as the
+    // bug this closes) is what enforces "direct", not just "any depth".
+    let has_direct_application_callee = callees
+        .iter()
+        .any(|c| classify_shallow(graph, c, visited, depth.saturating_sub(1)) == Some(Provenance::Application));
+    if has_direct_application_callee {
+        return Provenance::Application;
+    }
+
+    Provenance::Unknown
+}
+
+/// The provenance signals that don't depend on a subject's own callees'
+/// *composition* -- name/import shape, class ownership (`method_owner`),
+/// own-state field access plus a thunked import call, and thunk
+/// resolution (a thunk IS its target, not evidence *about* it, so this
+/// still recurses through the target's own full classification). `None`
+/// when none of these fire, meaning only callee-composition dominance (in
+/// `classify_provenance_bounded`) is left to try.
+///
+/// Split out specifically so a subject's *direct* callees can be checked
+/// for Application evidence this way, without recursing into *their*
+/// callees' own composition -- see `classify_provenance_bounded`'s own
+/// comment on why conflating the two let a multi-hop Application hit
+/// propagate all the way back up through code with no Application signal
+/// of its own.
+fn classify_shallow(
+    graph: &KnowledgeGraph,
+    subject: &str,
+    visited: &mut HashSet<String>,
+    depth: u32,
+) -> Option<Provenance> {
+    if classify_subject(graph, subject) == ClaimClass::LibraryOrCompiler {
+        return Some(Provenance::LibraryOrRuntime);
     }
 
     if let Some(owner) = method_owner(graph, subject) {
         if !is_reserved_identifier(&owner) {
-            return Provenance::Application;
+            return Some(Provenance::Application);
         }
     }
 
@@ -272,42 +342,21 @@ fn classify_provenance_bounded(
                 if distinct_param_slots_accessed(body, &param) >= MIN_OWN_STATE_SLOTS
                     && calls_something_that_thunks_to_an_import(graph, subject)
                 {
-                    return Provenance::Application;
+                    return Some(Provenance::Application);
                 }
             }
         }
     }
 
     if depth == 0 {
-        return Provenance::Unknown;
+        return None;
     }
 
     if let Some(target) = thunk_target(graph, subject) {
-        return classify_provenance_bounded(graph, &target, visited, depth - 1);
+        return Some(classify_provenance_bounded(graph, &target, visited, depth - 1));
     }
 
-    let callees: Vec<String> = graph
-        .observations()
-        .filter(|o| o.subject == subject && o.predicate == "calls")
-        .map(|o| o.value.clone())
-        .collect();
-    if callees.is_empty() {
-        return Provenance::Unknown;
-    }
-
-    let resolved: Vec<Provenance> = callees
-        .iter()
-        .map(|c| classify_provenance_bounded(graph, c, visited, depth - 1))
-        .collect();
-    let library_count = resolved.iter().filter(|p| **p == Provenance::LibraryOrRuntime).count();
-    if library_count as f64 / resolved.len() as f64 >= LIBRARY_GLUE_THRESHOLD {
-        return Provenance::LibraryOrRuntime;
-    }
-    if resolved.iter().any(|p| *p == Provenance::Application) {
-        return Provenance::Application;
-    }
-
-    Provenance::Unknown
+    None
 }
 
 /// How many distinct fields of its own receiver a function must touch
@@ -585,6 +634,41 @@ mod tests {
 
         assert_eq!(library_callee_ratio(&graph, "0x1"), 0.25);
         assert_eq!(classify_provenance(&graph, "0x1"), Provenance::Application);
+    }
+
+    /// PROJECT.md M18: a real recovery run found MinGW CRT startup code
+    /// (sitting directly on the call path from the real entrypoint)
+    /// inheriting Application purely because it eventually calls `main`,
+    /// which calls real game code several hops down -- while a genuine
+    /// setup/orchestration function's *direct* call into an Application
+    /// method is exactly the same kind of evidence, just one hop away
+    /// instead of several. A flat "any reachable Application callee"
+    /// rule can't distinguish these; this test reproduces both shapes at
+    /// once, in the corpus form the M18 discussion asked for.
+    #[test]
+    fn a_direct_application_call_dominates_but_a_transitive_one_through_unknown_nodes_does_not() {
+        let mut graph = KnowledgeGraph::new();
+
+        // setupGame -> Snake::Snake: one hop, direct evidence.
+        graph.add_observation("0xsetup", "has_name", "setupGame", 0.95, "ghidra:function", None);
+        graph.add_observation("0xsetup", "calls", "0xctor", 0.95, "ghidra:call_graph", None);
+        graph.add_observation("0xctor", "has_name", "Snake", 0.95, "ghidra:function", None);
+        graph.add_observation("0xctor", "is_constructor_of", "Snake", 0.95, "ghidra:function", None);
+
+        // CRT startup -> runtime_helper -> ... -> main -> Snake::Snake:
+        // the same real Application target, but several hops down through
+        // nodes with no Application signal of their own.
+        graph.add_observation("0xcrt", "has_name", "FUN_crt", 0.95, "ghidra:function", None);
+        graph.add_observation("0xcrt", "calls", "0xhelper1", 0.95, "ghidra:call_graph", None);
+        graph.add_observation("0xhelper1", "has_name", "FUN_helper1", 0.95, "ghidra:function", None);
+        graph.add_observation("0xhelper1", "calls", "0xhelper2", 0.95, "ghidra:call_graph", None);
+        graph.add_observation("0xhelper2", "has_name", "FUN_helper2", 0.95, "ghidra:function", None);
+        graph.add_observation("0xhelper2", "calls", "0xmain", 0.95, "ghidra:call_graph", None);
+        graph.add_observation("0xmain", "has_name", "main", 0.95, "ghidra:function", None);
+        graph.add_observation("0xmain", "calls", "0xctor", 0.95, "ghidra:call_graph", None);
+
+        assert_eq!(classify_provenance(&graph, "0xsetup"), Provenance::Application);
+        assert_eq!(classify_provenance(&graph, "0xcrt"), Provenance::Unknown);
     }
 
     #[test]
