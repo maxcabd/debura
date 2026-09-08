@@ -98,6 +98,23 @@ pub fn render_ghidra_symbols_header_resolved(
         out.push_str(function_declarations);
         out.push('\n');
     }
+    // Three passes, not one: a pointer-alias line (`DataPointerAlias`,
+    // `VtableData`'s own pointer form, `FunctionPointerAlias`) takes the
+    // address of *another* symbol in this same list -- a real dependency
+    // between two lines in this generated file, not just two independent
+    // facts -- and a real run found that dependency isn't always one hop:
+    // `PTR_PTR_cout_1400096e0` (a `DataPointerAlias`) points at
+    // `PTR_cout_14000f688` (an `ExternalGlobalAlias`, so only ever a bare
+    // `extern` declaration, never a value definition). `symbols` has no
+    // guaranteed relationship between a pointer's own position and its
+    // target's (collection order, not dependency order), so every real
+    // value definition is emitted first, then every bare `extern`
+    // placeholder (a pure declaration -- no initializer, so it can never
+    // itself depend on anything emitted after it), and only then anything
+    // that takes an address: by that point every possible target -- a
+    // real value, a bare-declared placeholder, or (via
+    // `function_declarations` above) a recovered function -- is already
+    // visible.
     for symbol in symbols {
         let resolution = resolutions.iter().find(|r| &r.symbol_name == symbol);
         match resolution.map(|r| &r.kind) {
@@ -107,26 +124,62 @@ pub fn render_ghidra_symbols_header_resolved(
             Some(DataSymbolKind::MutableStaticData { size, bytes }) => {
                 out.push_str(&render_scalar_or_byte_array_definition(symbol, *size, bytes, false));
             }
+            _ => {}
+        }
+    }
+    for symbol in symbols {
+        let resolution = resolutions.iter().find(|r| &r.symbol_name == symbol);
+        let is_definition = matches!(
+            resolution.map(|r| &r.kind),
+            Some(DataSymbolKind::ConstantData { .. } | DataSymbolKind::MutableStaticData { .. })
+        );
+        let is_pointer_alias = matches!(
+            resolution.map(|r| &r.kind),
+            Some(
+                DataSymbolKind::FunctionPointerAlias { .. }
+                    | DataSymbolKind::VtableData { slot0_target: Some(_), .. }
+                    | DataSymbolKind::DataPointerAlias { .. }
+            )
+        );
+        if is_definition || is_pointer_alias {
+            continue;
+        }
+        // `VtableData` with no safe function-pointer representation (a
+        // Method/Constructor/Destructor target -- see
+        // `classify_data_symbol`'s own doc comment), and every other kind
+        // this pass doesn't fabricate a definition for
+        // (`ExternalGlobalAlias`, `RuntimeData`, `CodeAddressAlias`,
+        // `UnknownData`), or no resolution at all: the same bare `extern`
+        // placeholder as before M18.2 existed.
+        if symbol.starts_with("_refptr_") || symbol.starts_with("PTR_") {
+            out.push_str(&format!("extern unsigned char *{symbol};\n"));
+        } else {
+            out.push_str(&format!("extern unsigned char {symbol};\n"));
+        }
+    }
+    for symbol in symbols {
+        let resolution = resolutions.iter().find(|r| &r.symbol_name == symbol);
+        match resolution.map(|r| &r.kind) {
             Some(DataSymbolKind::FunctionPointerAlias { target_function }) => {
                 out.push_str(&format!("void *{symbol} = (void *)&{target_function};\n"));
             }
             Some(DataSymbolKind::VtableData { slot0_target: Some(target), .. }) => {
                 out.push_str(&format!("void *{symbol} = (void *)&{target};\n"));
             }
-            // `VtableData` with no safe function-pointer representation
-            // (a Method/Constructor/Destructor target -- see
-            // `classify_data_symbol`'s own doc comment), and every other
-            // kind this pass doesn't fabricate a definition for
-            // (`ExternalGlobalAlias`, `RuntimeData`, `CodeAddressAlias`,
-            // `UnknownData`), or no resolution at all: the same bare
-            // `extern` placeholder as before M18.2 existed.
-            _ => {
-                if symbol.starts_with("_refptr_") || symbol.starts_with("PTR_") {
-                    out.push_str(&format!("extern unsigned char *{symbol};\n"));
-                } else {
-                    out.push_str(&format!("extern unsigned char {symbol};\n"));
-                }
+            Some(DataSymbolKind::DataPointerAlias { target_symbol }) => {
+                // `unsigned char *`, not `void *` -- unlike
+                // `FunctionPointerAlias`/`VtableData` (whose call sites
+                // already cast explicitly through a concrete type before
+                // using the result), a real run found `PTR_*` targets
+                // dereferenced directly (`*PTR_DAT_x`), which a `void *`
+                // can't be (`'void*' is not a pointer-to-object type`).
+                // Matches the exact type the bare-`extern` fallback above
+                // already declares every other `PTR_*`/`_refptr_*` symbol
+                // as, so a use site behaves identically whether this
+                // symbol ended up defined or left as a placeholder.
+                out.push_str(&format!("unsigned char *{symbol} = (unsigned char *)&{target_symbol};\n"));
             }
+            _ => {}
         }
     }
     if !unresolved_calls.is_empty() {
@@ -238,5 +291,83 @@ mod tests {
     fn a_non_eight_byte_constant_is_always_a_byte_array() {
         let rendered = render_scalar_or_byte_array_definition("DAT_1400099e0", 1, &[0x00], true);
         assert_eq!(rendered, "const unsigned char DAT_1400099e0[1] = {0x00};\n");
+    }
+
+    /// PROJECT.md M18.3: `symbols` carries no guaranteed relationship
+    /// between a `DataPointerAlias`'s own position and its target's --
+    /// deliberately adversarial here (the pointer, "AAA_PTR", sorts
+    /// *before* its target, "ZZZ_DAT", the opposite of what a real
+    /// `BTreeSet` collection would ever happen to produce). The target's
+    /// real definition must still appear before the pointer takes its
+    /// address, or a real compiler would reject this as a use of an
+    /// undeclared identifier.
+    #[test]
+    fn a_data_pointer_alias_is_rendered_after_its_target_regardless_of_input_order() {
+        let symbols = vec!["AAA_PTR".to_string(), "ZZZ_DAT".to_string()];
+        let resolutions = vec![
+            DataResolution {
+                address: "0x1".to_string(),
+                symbol_name: "AAA_PTR".to_string(),
+                kind: DataSymbolKind::DataPointerAlias { target_symbol: "ZZZ_DAT".to_string() },
+                source_facts: vec![],
+                confidence: 1.0,
+            },
+            DataResolution {
+                address: "0x2".to_string(),
+                symbol_name: "ZZZ_DAT".to_string(),
+                kind: DataSymbolKind::ConstantData { size: 1, bytes: vec![0x42] },
+                source_facts: vec![],
+                confidence: 1.0,
+            },
+        ];
+
+        let header = render_ghidra_symbols_header_resolved(&symbols, &resolutions, &[], "");
+
+        let target_pos = header.find("ZZZ_DAT[1]").expect("target definition present");
+        let pointer_pos = header.find("AAA_PTR = ").expect("pointer alias present");
+        assert!(target_pos < pointer_pos, "target must be defined before its address is taken:\n{header}");
+    }
+
+    /// PROJECT.md M18.3: the real, confirmed case a first version of the
+    /// three-pass split still got wrong -- `PTR_PTR_cout_1400096e0`
+    /// (`DataPointerAlias`) targets `PTR_cout_14000f688`, which isn't a
+    /// value definition at all (it's an `ExternalGlobalAlias`, so only
+    /// ever a bare `extern` *declaration*). Alphabetically,
+    /// "PTR_PTR_cout..." sorts *before* "PTR_cout..." (uppercase `P` <
+    /// lowercase `c`), so the two-pass split (value defs, then pointer
+    /// aliases) put the alias before its target's own declaration --
+    /// "not declared in this scope" against a real g++. The bare-`extern`
+    /// pass must run before the pointer-alias pass, not just the
+    /// value-definition pass.
+    #[test]
+    fn a_data_pointer_alias_targeting_a_bare_extern_symbol_is_rendered_after_its_declaration() {
+        let symbols = vec!["PTR_PTR_cout_1400096e0".to_string(), "PTR_cout_14000f688".to_string()];
+        let resolutions = vec![
+            DataResolution {
+                address: "0x1400096e0".to_string(),
+                symbol_name: "PTR_PTR_cout_1400096e0".to_string(),
+                kind: DataSymbolKind::DataPointerAlias { target_symbol: "PTR_cout_14000f688".to_string() },
+                source_facts: vec![],
+                confidence: 1.0,
+            },
+            DataResolution {
+                address: "0x14000f688".to_string(),
+                symbol_name: "PTR_cout_14000f688".to_string(),
+                kind: DataSymbolKind::ExternalGlobalAlias { pointee: "0x16".to_string() },
+                source_facts: vec![],
+                confidence: 0.8,
+            },
+        ];
+
+        let header = render_ghidra_symbols_header_resolved(&symbols, &resolutions, &[], "");
+
+        let decl_pos = header.find("extern unsigned char *PTR_cout_14000f688;").expect("bare extern declaration present");
+        let alias_pos = header.find("PTR_PTR_cout_1400096e0 = ").expect("pointer alias present");
+        assert!(decl_pos < alias_pos, "the target must be declared before its address is taken:\n{header}");
+        // A real compile also hit this: dereferenced directly
+        // (`*PTR_DAT_x`), a `DataPointerAlias` must never render as
+        // `void *` -- `'void*' is not a pointer-to-object type`.
+        assert!(!header.contains("void *PTR_PTR_cout_1400096e0"), "{header}");
+        assert!(header.contains("unsigned char *PTR_PTR_cout_1400096e0 = (unsigned char *)&PTR_cout_14000f688;"), "{header}");
     }
 }

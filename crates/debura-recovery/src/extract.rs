@@ -895,8 +895,36 @@ fn extract_impl(
         ghidra_intrinsics.extend(ghidra_intrinsic_tokens(&f.decompilation).map(str::to_string));
     }
 
+    // PROJECT.md M18.3: a `DataPointerAlias` names another real,
+    // Ghidra-recognized symbol that was never independently collected
+    // above -- nothing in any recovered body's own decompiled *text*
+    // ever names it, only the pointer wrapping it does. Pulling it in
+    // here (and re-classifying) is what lets that pointee get its own
+    // real definition instead of staying an unresolved `extern` the
+    // pointer alias would otherwise dangle off of. Loops until nothing
+    // new is discovered rather than a fixed iteration cap, so a pointer
+    // chain of any real depth still terminates -- and can never loop
+    // forever, since a `BTreeSet` never re-adds a name already present,
+    // so `discovered` is empty (and the loop exits) once every reachable
+    // pointee has been added.
+    let mut data_resolutions;
+    loop {
+        let current: Vec<String> = ghidra_data_symbols.iter().cloned().collect();
+        data_resolutions = crate::data_symbols::classify_data_symbols(graph, &current, &symbol_table);
+        let discovered: Vec<String> = data_resolutions
+            .iter()
+            .filter_map(|r| match &r.kind {
+                crate::data_symbols::DataSymbolKind::DataPointerAlias { target_symbol } => Some(target_symbol.clone()),
+                _ => None,
+            })
+            .filter(|name| !ghidra_data_symbols.contains(name))
+            .collect();
+        if discovered.is_empty() {
+            break;
+        }
+        ghidra_data_symbols.extend(discovered);
+    }
     let ghidra_data_symbols: Vec<String> = ghidra_data_symbols.into_iter().collect();
-    let data_resolutions = crate::data_symbols::classify_data_symbols(graph, &ghidra_data_symbols, &symbol_table);
 
     // PROJECT.md M18.3: solved deterministically, from the same real
     // structural evidence `crt_boundary` already establishes -- never

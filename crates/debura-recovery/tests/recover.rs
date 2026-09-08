@@ -878,6 +878,54 @@ fn a_base_constructor_call_after_local_declarations_is_still_found() {
     );
 }
 
+/// PROJECT.md M18.3: the real, confirmed shape a link run found --
+/// `PTR_DAT_140009660` is the only name a recovered body's own decompiled
+/// *text* mentions, but its real pointee (`DAT_140009068`) has its own
+/// full evidence (a real sized type, real bytes) that never gets
+/// collected by text-scanning alone. `extract()` must pull that pointee
+/// in on its own, and classify it too -- not just leave the pointer
+/// dangling off an `ExternalGlobalAlias` a real link can never resolve.
+#[test]
+fn a_data_pointer_aliases_own_target_is_transitively_collected_and_classified() {
+    let mut graph = KnowledgeGraph::new();
+    graph.add_observation("0x1", "has_name", "FUN_1", 0.95, "ghidra:function", None);
+    graph.add_observation(
+        "0x1",
+        "decompiles_to",
+        "void FUN_1(void)\n\n{\n  int local = *(int *)PTR_DAT_140009660;\n  (void)local;\n  return;\n}",
+        0.95,
+        "ghidra:decompiler",
+        None,
+    );
+    anchor_as_application(&mut graph, "0x1", "0xa1");
+
+    graph.add_observation("0x140009660", "data_pointee", "0x140009068 (reference)", 0.95, "ghidra:data", None);
+    graph.add_observation("0x140009068", "data_symbol_name", "DAT_140009068", 0.95, "ghidra:data", None);
+    graph.add_observation("0x140009068", "data_type_name", "undefined4", 0.95, "ghidra:data", None);
+    graph.add_observation("0x140009068", "data_size_bytes", "4", 0.95, "ghidra:data", None);
+    graph.add_observation("0x140009068", "data_bytes_hex", "32000000", 0.95, "ghidra:data", None);
+
+    let program = extract(&graph);
+
+    assert!(program.ghidra_data_symbols.contains(&"PTR_DAT_140009660".to_string()), "{:?}", program.ghidra_data_symbols);
+    assert!(
+        program.ghidra_data_symbols.contains(&"DAT_140009068".to_string()),
+        "the pointee must be transitively collected even though no body ever names it directly: {:?}",
+        program.ghidra_data_symbols
+    );
+
+    let pointer_resolution = program.data_resolutions.iter().find(|r| r.symbol_name == "PTR_DAT_140009660").unwrap();
+    assert_eq!(
+        pointer_resolution.kind,
+        debura_recovery::DataSymbolKind::DataPointerAlias { target_symbol: "DAT_140009068".to_string() }
+    );
+    let target_resolution = program.data_resolutions.iter().find(|r| r.symbol_name == "DAT_140009068").unwrap();
+    assert_eq!(
+        target_resolution.kind,
+        debura_recovery::DataSymbolKind::ConstantData { size: 4, bytes: vec![0x32, 0x00, 0x00, 0x00] }
+    );
+}
+
 /// A real compile hit `*_refptr_...` (dereferencing the symbol directly)
 /// failing with "invalid type argument of unary '*'" against a plain
 /// byte declaration -- `_refptr_*` specifically means a synthesized

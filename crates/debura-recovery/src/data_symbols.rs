@@ -25,6 +25,21 @@ pub enum DataSymbolKind {
     /// Belongs to a real runtime/linkage resolver, not AI source
     /// recovery.
     ExternalGlobalAlias { pointee: String },
+    /// This address's own value is a pointer to *another* address Ghidra
+    /// gave its own real symbol name and Debura has full, confident
+    /// evidence for (a real size, real captured bytes, a real sized
+    /// type) -- just never independently collected, because nothing in
+    /// any recovered body's own decompiled *text* ever named that
+    /// pointee directly (only this pointer's own name appears there). A
+    /// real run found this for every "PTR_DAT_*" wrapper around an
+    /// otherwise-ordinary `.rdata` constant: not an external/runtime
+    /// symbol at all, just one more hop of the same evidence this module
+    /// already trusts for `ConstantData`/`MutableStaticData`. Unlike
+    /// `ExternalGlobalAlias`, this always gets a real definition: both
+    /// `target_symbol`'s own value (rendered from the same evidence
+    /// `ConstantData`/`MutableStaticData` would be) and this pointer,
+    /// bound to its address.
+    DataPointerAlias { target_symbol: String },
     /// A real, bounded-size, initialized, non-pointer object with known
     /// content -- typically `.rdata` (read-only). Safe to emit its exact
     /// captured bytes: unlike an address-shaped value, raw content bytes
@@ -163,6 +178,33 @@ fn is_known_import(graph: &KnowledgeGraph, address: &str) -> bool {
     graph.observations().any(|o| o.subject == address && o.predicate == "imports")
 }
 
+/// The same "is this address's own size real evidence, not a next-symbol
+/// estimate or Ghidra's bare `undefined` placeholder" check `ConstantData`/
+/// `MutableStaticData` trust, factored out so `DataPointerAlias` can ask
+/// the identical question about a *pointee* address without recursing
+/// into `classify_data_symbol` itself (a pointer chain must never be able
+/// to loop this function). Also applies the same `CodeAddressAlias` veto
+/// `classify_data_symbol` checks first: a real run found a pointee that
+/// passed the size+bytes check on its own (`data_size_bytes`/
+/// `data_bytes_hex` are both real, unconditional facts for executable
+/// bytes too) but sat in `.text` -- independently classifying *that*
+/// address always resolves it as `CodeAddressAlias`, never `ConstantData`,
+/// so binding to it here would have left `DataPointerAlias` pointing at a
+/// symbol that's only ever `extern`-declared, never actually defined.
+fn confident_size_and_bytes(graph: &KnowledgeGraph, address: &str) -> Option<(u64, Vec<u8>)> {
+    let executable = bool_value(graph, address, "data_executable");
+    let section = single_value(graph, address, "data_section");
+    if executable == Some(true) && section.as_deref() == Some(".text") {
+        return None;
+    }
+    let data_type = single_value(graph, address, "data_type_name");
+    let size = single_value(graph, address, "data_size_bytes")
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|_| data_type.as_deref() != Some("undefined"))?;
+    let bytes = single_value(graph, address, "data_bytes_hex").as_deref().and_then(parse_hex_bytes)?;
+    Some((size, bytes))
+}
+
 /// Classifies one already-collected `DAT_*`/`PTR_*`/`LAB_*`/`_refptr_*`
 /// symbol name (PROJECT.md M18.2). `table` is the same whole-program
 /// symbol table `extract()` already builds for call-site resolution
@@ -277,6 +319,26 @@ pub fn classify_data_symbol(graph: &KnowledgeGraph, symbol_name: &str, table: &S
             }
         } else if is_known_import(graph, target) {
             facts.push(format!("{target} is a known import"));
+        } else if let Some(pointee_symbol) = single_value(graph, target, "data_symbol_name") {
+            // Not a known function or import, but Ghidra still gave this
+            // address its own real name -- if it also has the same
+            // confident size+bytes evidence `ConstantData`/
+            // `MutableStaticData` trusts below, this is one more hop of
+            // the same real evidence, not an unmodeled external. Checked
+            // directly (not by recursing into `classify_data_symbol`) so
+            // a pointer chain can never loop.
+            if confident_size_and_bytes(graph, target).is_some() {
+                facts.push(format!(
+                    "{target} ({pointee_symbol}) has its own confident size+bytes -- binding directly rather than treating it as an unmodeled external"
+                ));
+                return DataResolution {
+                    address,
+                    symbol_name: symbol_name.to_string(),
+                    kind: DataSymbolKind::DataPointerAlias { target_symbol: pointee_symbol },
+                    source_facts: facts,
+                    confidence: 1.0,
+                };
+            }
         }
         // Real memory, but outside anything Debura has a model of --
         // exactly what `ExternalGlobalAlias` means (never guessed from
@@ -310,20 +372,18 @@ pub fn classify_data_symbol(graph: &KnowledgeGraph, symbol_name: &str, table: &S
     // before M18.2 existed -- a real regression-safety net, not a loss
     // of information (every rejected size estimate is still in
     // `source_facts` for a human to look at).
-    if let (Some(size), Some(hex)) = (size_confident, bytes_hex) {
-        if let Some(bytes) = parse_hex_bytes(&hex) {
-            facts.push(format!("data_bytes_hex = {hex} (size {size}, confident)"));
-            if let Some(init) = initialized {
-                facts.push(format!("data_initialized = {init}"));
-            }
-            let is_writable = writable.unwrap_or(false);
-            let kind = if is_writable {
-                DataSymbolKind::MutableStaticData { size, bytes }
-            } else {
-                DataSymbolKind::ConstantData { size, bytes }
-            };
-            return DataResolution { address, symbol_name: symbol_name.to_string(), kind, source_facts: facts, confidence: 1.0 };
+    if let (Some(size), Some(bytes)) = (size_confident, bytes_hex.as_deref().and_then(parse_hex_bytes)) {
+        facts.push(format!("data_bytes_hex = {} (size {size}, confident)", bytes_hex.as_deref().unwrap()));
+        if let Some(init) = initialized {
+            facts.push(format!("data_initialized = {init}"));
         }
+        let is_writable = writable.unwrap_or(false);
+        let kind = if is_writable {
+            DataSymbolKind::MutableStaticData { size, bytes }
+        } else {
+            DataSymbolKind::ConstantData { size, bytes }
+        };
+        return DataResolution { address, symbol_name: symbol_name.to_string(), kind, source_facts: facts, confidence: 1.0 };
     } else {
         if let Some(size) = size_estimated {
             facts.push(format!("data_size_bytes_estimated = {size} (not confident enough to emit a definition from)"));
@@ -523,6 +583,79 @@ mod tests {
             resolution.kind,
             DataSymbolKind::FunctionPointerAlias { target_function: "calculateOffset".to_string() }
         );
+    }
+
+    /// PROJECT.md M18.3: the real, confirmed case a link run found --
+    /// `PTR_DAT_140009660`'s pointee (`0x140009068`) matches no known
+    /// function or import, but it isn't an unmodeled external either:
+    /// Ghidra gave it its own real name (`DAT_140009068`) and Debura has
+    /// the exact same confident size+bytes evidence for it that
+    /// `ConstantData` alone would already trust. Must bind directly, not
+    /// fall through to `ExternalGlobalAlias` (which a real link left
+    /// permanently unresolved -- nothing ever defines an `extern`).
+    #[test]
+    fn a_pointee_with_its_own_confident_data_is_a_data_pointer_alias() {
+        let mut graph = KnowledgeGraph::new();
+        graph.add_observation("0x140009660", "data_pointee", "0x140009068 (reference)", 0.95, "ghidra:data", None);
+        graph.add_observation("0x140009068", "data_symbol_name", "DAT_140009068", 0.95, "ghidra:data", None);
+        graph.add_observation("0x140009068", "data_type_name", "undefined4", 0.95, "ghidra:data", None);
+        graph.add_observation("0x140009068", "data_size_bytes", "4", 0.95, "ghidra:data", None);
+        graph.add_observation("0x140009068", "data_bytes_hex", "32000000", 0.95, "ghidra:data", None);
+
+        let table = SymbolTable::new();
+        let resolution = classify_data_symbol(&graph, "PTR_DAT_140009660", &table);
+
+        assert_eq!(
+            resolution.kind,
+            DataSymbolKind::DataPointerAlias { target_symbol: "DAT_140009068".to_string() }
+        );
+    }
+
+    /// A pointee with its own real name, but *not* the same confident
+    /// size+bytes evidence (Ghidra's bare `undefined` placeholder, the
+    /// same "not a real commitment" case `ConstantData` itself already
+    /// distrusts) -- must not be bound to, the same "Unknown is better
+    /// than confidently wrong" rule as everywhere else in this module.
+    #[test]
+    fn a_pointee_with_only_a_bare_undefined_type_stays_an_external_global_alias() {
+        let mut graph = KnowledgeGraph::new();
+        graph.add_observation("0x140009660", "data_pointee", "0x140009068 (reference)", 0.95, "ghidra:data", None);
+        graph.add_observation("0x140009068", "data_symbol_name", "DAT_140009068", 0.95, "ghidra:data", None);
+        graph.add_observation("0x140009068", "data_type_name", "undefined", 0.95, "ghidra:data", None);
+        graph.add_observation("0x140009068", "data_size_bytes", "1", 0.95, "ghidra:data", None);
+        graph.add_observation("0x140009068", "data_bytes_hex", "32", 0.95, "ghidra:data", None);
+
+        let table = SymbolTable::new();
+        let resolution = classify_data_symbol(&graph, "PTR_DAT_140009660", &table);
+
+        assert_eq!(resolution.kind, DataSymbolKind::ExternalGlobalAlias { pointee: "0x140009068".to_string() });
+    }
+
+    /// PROJECT.md M18.3: the real, confirmed case a first version of the
+    /// `DataPointerAlias` fix got wrong -- `PTR_DAT_140009700`'s pointee
+    /// (`DAT_140007ad0`) genuinely has a confident size and real bytes,
+    /// but also sits in `.text` and is executable. Independently
+    /// classifying that address (once it's transitively collected)
+    /// always resolves it as `CodeAddressAlias`, never `ConstantData` --
+    /// binding to it as a `DataPointerAlias` would leave the pointer
+    /// pointing at a symbol that's only ever `extern`-declared, never
+    /// defined, the same unresolved-at-link-time failure this whole fix
+    /// exists to close.
+    #[test]
+    fn a_pointee_that_would_itself_classify_as_a_code_address_alias_stays_external() {
+        let mut graph = KnowledgeGraph::new();
+        graph.add_observation("0x140009700", "data_pointee", "0x140007ad0 (reference)", 0.95, "ghidra:data", None);
+        graph.add_observation("0x140007ad0", "data_symbol_name", "DAT_140007ad0", 0.95, "ghidra:data", None);
+        graph.add_observation("0x140007ad0", "data_type_name", "undefined8", 0.95, "ghidra:data", None);
+        graph.add_observation("0x140007ad0", "data_size_bytes", "8", 0.95, "ghidra:data", None);
+        graph.add_observation("0x140007ad0", "data_bytes_hex", "ffffffffffffffff", 0.95, "ghidra:data", None);
+        graph.add_observation("0x140007ad0", "data_section", ".text", 0.95, "ghidra:data", None);
+        graph.add_observation("0x140007ad0", "data_executable", "true", 0.95, "ghidra:data", None);
+
+        let table = SymbolTable::new();
+        let resolution = classify_data_symbol(&graph, "PTR_DAT_140009700", &table);
+
+        assert_eq!(resolution.kind, DataSymbolKind::ExternalGlobalAlias { pointee: "0x140007ad0".to_string() });
     }
 
     /// The real, confirmed case: `LAB_140001000`/`LAB_140003a80` are
