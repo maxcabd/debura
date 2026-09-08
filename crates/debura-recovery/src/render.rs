@@ -60,15 +60,29 @@ fn patch_known_idioms(text: &str) -> String {
     // real, implicit `this` (never re-declared as a local) is untouched.
     let text = rename_this_local_variable(&text);
 
-    // Ghidra occasionally decompiles a `std::string::c_str()` call with no
-    // argument at all -- a real, observed decompiler artifact (confirmed
-    // against the raw `decompiles_to` fact itself, not something this
-    // codebase's own rendering introduces: the same body's *other*
-    // std::string call, `~basic_string(local_38)`, correctly keeps its
-    // receiver). Must run before the template-argument stripping below,
-    // which would otherwise remove the exact bare-templated type name
-    // this looks for from the paired local declaration.
-    let text = fix_bare_c_str_receiver(&text);
+    // Ghidra decompiles non-static `std::string` member calls
+    // (`c_str`/`~basic_string`) as `Type::method(receiver, ...)` -- not
+    // real, compilable C++ syntax for a non-static member, regardless of
+    // whether the receiver argument is present. Must run before the
+    // template-argument stripping below, which would otherwise remove the
+    // exact bare-templated type name this looks for from the paired local
+    // declaration.
+    let text = fix_std_string_member_calls(&text);
+
+    // Two specific SDL API calls decompile with an `undefined`-typed
+    // local where the real signature needs a struct value/pointer --
+    // `local_3c = 0xffffff;` (a packed color, wrong type: `undefined4`
+    // instead of `SDL_Color`) and four separate `undefined4` locals used
+    // as an `SDL_Rect`'s x/y/w/h fields via `&local_58` (wrong type:
+    // `undefined4*` instead of `const SDL_Rect*`). Both are exactly
+    // Ghidra's own byte-for-byte layout of the real struct, so
+    // reinterpreting through a pointer/reference cast is safe and
+    // preserves exactly the value Ghidra computed -- the same "insert the
+    // cast the call site already implies" approach as this function's own
+    // vtable-pointer-slot fix above, scoped to these two well-known,
+    // fixed SDL function names rather than a generic pattern.
+    let text = cast_last_call_argument(&text, "TTF_RenderText_Solid", "*(SDL_Color*)&");
+    let text = cast_last_call_argument(&text, "SDL_RenderCopy", "(const SDL_Rect*)");
 
     // Ghidra always writes these STL types out with their real,
     // explicit (and in this codebase, always `char`-based) template
@@ -122,25 +136,117 @@ fn rename_this_local_variable(text: &str) -> String {
     replace_whole_word(text, "this", "debura_local_this")
 }
 
-/// Ghidra occasionally decompiles a `std::string::c_str()` call with no
-/// argument at all (`std::__cxx11::basic_string<...>::c_str()`) -- a real
-/// decompiler artifact. When the body declares exactly one
-/// `basic_string<...> NAME [N];` local (the shape Ghidra always uses for
-/// a stack-allocated std::string), that's unambiguously the missing
-/// receiver. Left alone when zero or more than one such local exists --
-/// guessing wrong here is worse than leaving a real compile error visible.
-fn fix_bare_c_str_receiver(text: &str) -> String {
-    let needle = "basic_string<char,std::char_traits<char>,std::allocator<char>>::c_str()";
-    if !text.contains(needle) {
+/// Ghidra decompiles a non-static `std::string` member call as
+/// `Type::method(receiver, args...)` -- valid-looking C-shaped text, but
+/// not real, compilable C++ for a non-static member (needs
+/// `receiver->method(args...)` instead), and for `c_str()` specifically,
+/// a real case had the receiver argument missing from Ghidra's own raw
+/// decompilation entirely. Rewrites both known shapes -- `~basic_string`
+/// (always has its receiver argument, just the wrong call syntax) and
+/// `c_str` (sometimes missing the argument too, recovered from the
+/// body's own single `basic_string<...> NAME [N];` local when there is
+/// exactly one -- guessing wrong here is worse than a visible compile
+/// error).
+fn fix_std_string_member_calls(text: &str) -> String {
+    const QUALIFIED_TYPE: &str = "std::__cxx11::basic_string<char,std::char_traits<char>,std::allocator<char>>";
+
+    let mut text = text.to_string();
+
+    let dtor_prefix = format!("{QUALIFIED_TYPE}::~basic_string(");
+    loop {
+        let Some(pos) = text.find(&dtor_prefix) else { break };
+        let after = pos + dtor_prefix.len();
+        let Some(close) = text[after..].find(')') else { break };
+        let receiver = text[after..after + close].trim().to_string();
+        if receiver.is_empty() {
+            break;
+        }
+        let whole = format!("{dtor_prefix}{receiver})");
+        let replacement = format!("{receiver}->~basic_string()");
+        text = text.replacen(&whole, &replacement, 1);
+    }
+
+    let c_str_empty = format!("{QUALIFIED_TYPE}::c_str()");
+    if text.contains(&c_str_empty) {
+        if let [name] = basic_string_local_names(&text).as_slice() {
+            text = text.replace(&c_str_empty, &format!("{name}->c_str()"));
+        }
+    }
+    let c_str_prefix = format!("{QUALIFIED_TYPE}::c_str(");
+    loop {
+        let Some(pos) = text.find(&c_str_prefix) else { break };
+        let after = pos + c_str_prefix.len();
+        let Some(close) = text[after..].find(')') else { break };
+        let receiver = text[after..after + close].trim().to_string();
+        if receiver.is_empty() {
+            break;
+        }
+        let whole = format!("{c_str_prefix}{receiver})");
+        let replacement = format!("{receiver}->c_str()");
+        text = text.replacen(&whole, &replacement, 1);
+    }
+
+    text
+}
+
+/// Wraps a call site's own last (comma-separated, top-level) argument in
+/// `cast`, for every call to `function` in `text`. Finds the argument
+/// list with a balanced-parenthesis scan (an argument can itself contain
+/// parenthesized casts/expressions, e.g. `*(undefined8 *)(param_1 +
+/// 0x28)`, which a plain search for the next `)` would stop at
+/// prematurely) but splits on the *last* comma without itself tracking
+/// nesting -- correct for every call this is actually used against (a
+/// bare identifier or `&identifier` as the final argument), not a
+/// general-purpose argument parser.
+fn cast_last_call_argument(text: &str, function: &str, cast: &str) -> String {
+    let needle = format!("{function}(");
+    if !text.contains(&needle) {
         return text.to_string();
     }
 
-    let locals = basic_string_local_names(text);
-    let [name] = locals.as_slice() else {
-        return text.to_string();
-    };
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(pos) = rest.find(&needle) {
+        out.push_str(&rest[..pos + needle.len()]);
+        let after = &rest[pos + needle.len()..];
+        let Some(close) = find_matching_close_paren(after) else {
+            out.push_str(after);
+            return out;
+        };
+        let args = &after[..close];
+        match args.rfind(',') {
+            Some(comma) => {
+                out.push_str(&args[..=comma]);
+                out.push_str(cast);
+                out.push_str(args[comma + 1..].trim());
+            }
+            None => out.push_str(args),
+        }
+        out.push(')');
+        rest = &after[close + 1..];
+    }
+    out.push_str(rest);
+    out
+}
 
-    text.replace(needle, &format!("basic_string<char,std::char_traits<char>,std::allocator<char>>::c_str({name})"))
+/// The index of the `)` that closes the `(` immediately preceding
+/// `text[0..]` (already consumed by the caller), accounting for nested
+/// parentheses.
+fn find_matching_close_paren(text: &str) -> Option<usize> {
+    let mut depth = 1;
+    for (i, c) in text.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Every local variable Ghidra declared as a stack-allocated
@@ -211,25 +317,57 @@ mod idiom_tests {
     /// PROJECT.md M18: a real recovery run (only exposed once a function
     /// with no accepted name could be recovered at all -- it was never
     /// compiled before) hit exactly this shape from Ghidra's own raw
-    /// decompilation: `c_str()` with no argument, while the same body's
-    /// paired `~basic_string(local_38)` destructor call correctly keeps
-    /// its receiver a few statements later.
+    /// decompilation: `Type::c_str()` with no argument at all, and
+    /// `Type::~basic_string(local_38)` -- syntactically has its receiver,
+    /// but `Type::method(receiver)` is not real, callable C++ for a
+    /// non-static member either way. Both need rewriting to
+    /// `receiver->method()`.
     #[test]
-    fn a_bare_c_str_call_is_given_the_bodys_own_basic_string_locals_name() {
+    fn bare_std_string_member_calls_are_rewritten_to_real_member_call_syntax() {
         let text = "void FUN_1(longlong param_1)\n\n{\n  undefined8 uVar1;\n  basic_string<char,std::char_traits<char>,std::allocator<char>> local_38 [40];\n  FUN_2(local_38,param_1);\n  uVar1 = std::__cxx11::basic_string<char,std::char_traits<char>,std::allocator<char>>::c_str();\n  std::__cxx11::basic_string<char,std::char_traits<char>,std::allocator<char>>::~basic_string(local_38);\n  return;\n}";
         let patched = patch_known_idioms(text);
-        assert!(patched.contains("::c_str(local_38)"), "{patched}");
-        assert!(!patched.contains("::c_str()"), "{patched}");
+        assert!(patched.contains("local_38->c_str()"), "{patched}");
+        assert!(patched.contains("local_38->~basic_string()"), "{patched}");
+        assert!(!patched.contains("::c_str("), "{patched}");
+        assert!(!patched.contains("::~basic_string("), "{patched}");
     }
 
     /// Guessing wrong is worse than a visible compile error: with two
-    /// candidate locals, this leaves the bare call alone rather than
-    /// picking one arbitrarily.
+    /// candidate locals, a missing `c_str()` receiver is left alone
+    /// rather than picking one arbitrarily.
     #[test]
     fn a_bare_c_str_call_is_left_alone_when_more_than_one_basic_string_local_exists() {
         let text = "basic_string<char,std::char_traits<char>,std::allocator<char>> local_38 [40]; basic_string<char,std::char_traits<char>,std::allocator<char>> local_58 [40]; uVar1 = std::__cxx11::basic_string<char,std::char_traits<char>,std::allocator<char>>::c_str();";
         let patched = patch_known_idioms(text);
         assert!(patched.contains("::c_str();"), "{patched}");
+    }
+
+    /// PROJECT.md M18: `TTF_RenderText_Solid`'s real third parameter is
+    /// an `SDL_Color` *value*, but Ghidra decompiles the packed color as
+    /// a plain `undefined4` local -- the exact same 4 bytes, just the
+    /// wrong C++ type. Reinterpreting through a pointer cast preserves
+    /// the value Ghidra computed.
+    #[test]
+    fn ttf_rendertext_solids_color_argument_is_cast_from_a_packed_undefined4() {
+        let text = "TTF_RenderText_Solid(*(undefined8 *)(param_1 + 0x28),uVar1,local_3c);";
+        let patched = patch_known_idioms(text);
+        assert!(
+            patched.contains("TTF_RenderText_Solid(*(undefined8 *)(param_1 + 0x28),uVar1,*(SDL_Color*)&local_3c);"),
+            "{patched}"
+        );
+    }
+
+    /// Same idea for `SDL_RenderCopy`'s `const SDL_Rect*` parameter, where
+    /// Ghidra passes the address of four separate `undefined4` locals
+    /// laid out as the rect's own x/y/w/h fields.
+    #[test]
+    fn sdl_rendercopys_rect_argument_is_cast_from_an_undefined4_pointer() {
+        let text = "SDL_RenderCopy(*(undefined8 *)(param_1 + 8),*(undefined8 *)(param_1 + 0x20),0,&local_58);";
+        let patched = patch_known_idioms(text);
+        assert!(
+            patched.contains("SDL_RenderCopy(*(undefined8 *)(param_1 + 8),*(undefined8 *)(param_1 + 0x20),0,(const SDL_Rect*)&local_58);"),
+            "{patched}"
+        );
     }
 
     #[test]
