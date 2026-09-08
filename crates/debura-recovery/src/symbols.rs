@@ -265,12 +265,24 @@ fn is_pointer_alias_kind(resolution: Option<&DataResolution>) -> bool {
 /// `render_ghidra_symbols_header_resolved`) is what actually guarantees
 /// that.
 fn render_pointer_alias_line(symbol: &str, resolution: Option<&DataSymbolKind>) -> String {
+    // PROJECT.md M18.3: a real link found every one of these initialized,
+    // non-`const` pointer variables is a full *definition* with external
+    // linkage -- and this header (unlike a plain `extern` placeholder) is
+    // `#include`d into every generated `.cpp` file, so the *same*
+    // definition landed in seven different translation units at once:
+    // "multiple definition of `PTR_FUN_140009a20`", a real ODR violation
+    // that would have broken *any* project with more than one of these
+    // once compiled together, not just this one. `inline` (a real C++17
+    // feature, not a hint) is exactly what a header-defined global needs:
+    // the linker merges identical definitions across translation units
+    // instead of rejecting them, the same guarantee an inline function
+    // already has.
     match resolution {
         Some(DataSymbolKind::FunctionPointerAlias { target_function }) => {
-            format!("void *{symbol} = (void *)&{target_function};\n")
+            format!("inline void *{symbol} = (void *)&{target_function};\n")
         }
         Some(DataSymbolKind::VtableData { slot0_target: Some(VtableSlotTarget::FreeFunction(target)), .. }) => {
-            format!("void *{symbol} = (void *)&{target};\n")
+            format!("inline void *{symbol} = (void *)&{target};\n")
         }
         Some(DataSymbolKind::VtableData { slot0_target: Some(VtableSlotTarget::Method { trampoline_name, .. }), .. }) => {
             // `functions.cpp` already emits `trampoline_name` as a real,
@@ -278,7 +290,7 @@ fn render_pointer_alias_line(symbol: &str, resolution: Option<&DataSymbolKind>) 
             // `VtableSlotTarget::Method`'s own doc comment -- so this
             // binds exactly like a `FreeFunction` target once that
             // trampoline exists.
-            format!("void *{symbol} = (void *)&{trampoline_name};\n")
+            format!("inline void *{symbol} = (void *)&{trampoline_name};\n")
         }
         Some(DataSymbolKind::DataPointerAlias { target_symbol }) => {
             // `unsigned char *`, not `void *` -- unlike
@@ -291,7 +303,7 @@ fn render_pointer_alias_line(symbol: &str, resolution: Option<&DataSymbolKind>) 
             // declares every other `PTR_*`/`_refptr_*` symbol as, so a
             // use site behaves identically whether this symbol ended up
             // defined or left as a placeholder.
-            format!("unsigned char *{symbol} = (unsigned char *)&{target_symbol};\n")
+            format!("inline unsigned char *{symbol} = (unsigned char *)&{target_symbol};\n")
         }
         Some(DataSymbolKind::RuntimeAlias { runtime_symbol, runtime_type }) => {
             // `runtime_symbol` is never one of `symbols` -- it's a
@@ -301,8 +313,12 @@ fn render_pointer_alias_line(symbol: &str, resolution: Option<&DataSymbolKind>) 
             // declaration is emitted directly here rather than threaded
             // through the bare-`extern` pass. `extern "C"` so C++
             // name-mangling never hides the real, unmangled symbol the
-            // linker actually provides.
-            format!("extern \"C\" {runtime_type} {runtime_symbol};\nunsigned char *{symbol} = (unsigned char *)&{runtime_symbol};\n")
+            // linker actually provides -- a plain `extern` *declaration*
+            // (no initializer), so it doesn't need `inline` itself; the
+            // pointer binding on the next line does.
+            format!(
+                "extern \"C\" {runtime_type} {runtime_symbol};\ninline unsigned char *{symbol} = (unsigned char *)&{runtime_symbol};\n"
+            )
         }
         Some(DataSymbolKind::KnownImportAlias { qualified_name }) => {
             // No extra declaration needed, unlike `RuntimeAlias` --
@@ -310,7 +326,7 @@ fn render_pointer_alias_line(symbol: &str, resolution: Option<&DataSymbolKind>) 
             // declared by whatever standard header the recovered code
             // already includes (`ghidra_compat.hpp` pulls in
             // `<iostream>`).
-            format!("unsigned char *{symbol} = (unsigned char *)&{qualified_name};\n")
+            format!("inline unsigned char *{symbol} = (unsigned char *)&{qualified_name};\n")
         }
         _ => String::new(),
     }
@@ -346,7 +362,17 @@ fn render_pointer_alias_line(symbol: &str, resolution: Option<&DataSymbolKind>) 
 /// decodes to an implausibly *tiny* denormal when its high bytes happen
 /// to be zero (ruled out by the lower bound).
 fn render_scalar_or_byte_array_definition(symbol: &str, size: u64, bytes: &[u8], readonly: bool) -> String {
-    let qualifier = if readonly { "const " } else { "" };
+    // PROJECT.md M18.3: `inline`, always -- a real link found a
+    // `MutableStaticData` definition (no `const`, so external linkage by
+    // default) landed in every translation unit this header is
+    // `#include`d into, a real multiple-definition ODR violation (the
+    // same one `render_pointer_alias_line`'s own doc comment explains in
+    // more detail). `ConstantData`'s own `const` already implies
+    // internal linkage, so it was never broken this way, but `inline` is
+    // harmless there too (C++17 explicitly allows combining them) and
+    // keeps both cases consistent rather than depending on which branch
+    // happened to dodge the bug.
+    let qualifier = if readonly { "inline const " } else { "inline " };
     if size == 8 {
         if let Some(value) = decode_as_clean_f64(bytes) {
             return format!("{qualifier}double {symbol} = {value:?};\n");
@@ -393,7 +419,7 @@ mod tests {
     #[test]
     fn an_eight_byte_constant_decoding_cleanly_renders_as_a_scalar_double() {
         let rendered = render_scalar_or_byte_array_definition("DAT_140009070", 8, &[0, 0, 0, 0, 0, 0, 0, 0x40], true);
-        assert_eq!(rendered, "const double DAT_140009070 = 2.0;\n");
+        assert_eq!(rendered, "inline const double DAT_140009070 = 2.0;\n");
     }
 
     /// A real 64-bit address value (always large in this program) must
@@ -405,14 +431,14 @@ mod tests {
         // fixture data, little-endian.
         let bytes = [0xca, 0x18, 0x00, 0x40, 0x01, 0x00, 0x00, 0x00];
         let rendered = render_scalar_or_byte_array_definition("PTR_DAT_140009050", 8, &bytes, true);
-        assert!(rendered.starts_with("const unsigned char PTR_DAT_140009050[8] = {"), "{rendered}");
+        assert!(rendered.starts_with("inline const unsigned char PTR_DAT_140009050[8] = {"), "{rendered}");
         assert!(!rendered.contains("double"), "{rendered}");
     }
 
     #[test]
     fn a_non_eight_byte_constant_is_always_a_byte_array() {
         let rendered = render_scalar_or_byte_array_definition("DAT_1400099e0", 1, &[0x00], true);
-        assert_eq!(rendered, "const unsigned char DAT_1400099e0[1] = {0x00};\n");
+        assert_eq!(rendered, "inline const unsigned char DAT_1400099e0[1] = {0x00};\n");
     }
 
     /// PROJECT.md M18.3: `symbols` carries no guaranteed relationship
@@ -629,5 +655,47 @@ mod tests {
         let decl_pos = header.find("extern \"C\" undefined Wall__vtable_trampoline_FUN_140002f4e").unwrap();
         let use_pos = header.find("PTR_FUN_140009a20 = ").expect("pointer alias present");
         assert!(decl_pos < use_pos, "the trampoline must be declared before its address is taken:\n{header}");
+    }
+
+    /// PROJECT.md M18.3: the real, confirmed bug a real link found --
+    /// this header is `#include`d into every generated `.cpp` file, so
+    /// a non-`const`, initialized global (a pointer-alias line, or a
+    /// `MutableStaticData` definition) without `inline` is a full
+    /// definition with external linkage repeated in every one of them:
+    /// "multiple definition of `PTR_FUN_140009a20`", a real link
+    /// failure across a 7-file project, not a hypothetical. Every real
+    /// definition this module ever emits must be `inline`.
+    #[test]
+    fn every_real_definition_is_inline_so_multiple_translation_units_can_include_it() {
+        let symbols = vec!["DAT_CONST".to_string(), "DAT_MUTABLE".to_string(), "PTR_ALIAS".to_string()];
+        let resolutions = vec![
+            DataResolution {
+                address: "0x1".to_string(),
+                symbol_name: "DAT_CONST".to_string(),
+                kind: DataSymbolKind::ConstantData { size: 1, bytes: vec![0x01] },
+                source_facts: vec![],
+                confidence: 1.0,
+            },
+            DataResolution {
+                address: "0x2".to_string(),
+                symbol_name: "DAT_MUTABLE".to_string(),
+                kind: DataSymbolKind::MutableStaticData { size: 1, bytes: vec![0x00] },
+                source_facts: vec![],
+                confidence: 1.0,
+            },
+            DataResolution {
+                address: "0x3".to_string(),
+                symbol_name: "PTR_ALIAS".to_string(),
+                kind: DataSymbolKind::DataPointerAlias { target_symbol: "DAT_CONST".to_string() },
+                source_facts: vec![],
+                confidence: 1.0,
+            },
+        ];
+
+        let header = render_ghidra_symbols_header_resolved(&symbols, &resolutions, &[], "");
+
+        assert!(header.contains("inline const unsigned char DAT_CONST[1]"), "{header}");
+        assert!(header.contains("inline unsigned char DAT_MUTABLE[1]"), "{header}");
+        assert!(header.contains("inline unsigned char *PTR_ALIAS ="), "{header}");
     }
 }
