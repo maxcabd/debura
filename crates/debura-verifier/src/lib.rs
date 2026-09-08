@@ -10,12 +10,14 @@
 mod mechanical_shape;
 mod policy;
 mod reevaluate;
+mod stale_premises;
 mod verify;
 mod vtable_propagation;
 
 pub use mechanical_shape::mechanically_shaped_reason;
 pub use policy::VerificationPolicy;
 pub use reevaluate::reevaluate_hypothesis;
+pub use stale_premises::reconsider_stale_provenance_rejections;
 pub use verify::{
     build_challenge_task, build_resolve_task, challenge, challenge_hypothesis, commit_challenge,
     commit_resolution, resolve, resolve_contradiction,

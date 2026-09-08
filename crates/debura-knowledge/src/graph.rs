@@ -5,7 +5,7 @@ use chrono::{DateTime, Utc};
 use crate::dependency::{Dependency, DependencyKind};
 use crate::error::KnowledgeError;
 use crate::evidence::Evidence;
-use crate::hypothesis::{Hypothesis, HypothesisStatus};
+use crate::hypothesis::{Hypothesis, HypothesisStatus, RejectionReason};
 use crate::ids::{EvidenceId, HypothesisId, InvestigationId, ObservationId};
 use crate::investigation::Investigation;
 use crate::observation::Observation;
@@ -133,6 +133,7 @@ impl KnowledgeGraph {
                 created_at: now,
                 updated_at: now,
                 last_verified_at: None,
+                rejection_reason: None,
             },
         );
         id
@@ -211,6 +212,45 @@ impl KnowledgeGraph {
         h.status = status;
         h.updated_at = Utc::now();
         Ok(self.mark_stale_dependents(hypothesis))
+    }
+
+    /// Rejects `hypothesis` and records *why* as a machine-checkable
+    /// `RejectionReason`, not just whatever free-text observation the
+    /// caller may also record. REJECTED stays terminal against the
+    /// generic dependency cascade (`mark_stale_dependents` never touches
+    /// it) -- this reason is what `reconsider_rejected` keys off of for a
+    /// deliberate, targeted recheck later, not an automatic one.
+    pub fn reject_with_reason(
+        &mut self,
+        hypothesis: HypothesisId,
+        reason: RejectionReason,
+    ) -> Result<Vec<HypothesisId>> {
+        let h = self.hypothesis_mut(hypothesis)?;
+        h.rejection_reason = Some(reason);
+        self.set_status(hypothesis, HypothesisStatus::Rejected)
+    }
+
+    /// A deliberate, narrow exception to REJECTED's terminal status
+    /// (PROJECT.md S4): moves `hypothesis` to STALE -- eligible for
+    /// normal reevaluation, not silently resurrected straight to
+    /// ACCEPTED -- if and only if it is currently REJECTED for exactly
+    /// `reason`. Returns `false` (no-op) otherwise. Never call this from
+    /// a generic cascade; only after independently confirming the
+    /// specific premise `reason` recorded no longer holds (PROJECT.md
+    /// M18: e.g. `classify_provenance` now says Application for a subject
+    /// once rejected as `ProvenanceNotApplication`).
+    pub fn reconsider_rejected(&mut self, hypothesis: HypothesisId, reason: &RejectionReason) -> bool {
+        match self.hypotheses.get(&hypothesis) {
+            Some(h) if h.status == HypothesisStatus::Rejected && h.rejection_reason.as_ref() == Some(reason) => {}
+            _ => return false,
+        }
+        if let Some(h) = self.hypotheses.get_mut(&hypothesis) {
+            h.status = HypothesisStatus::Stale;
+            h.rejection_reason = None;
+            h.last_verified_at = None;
+            h.updated_at = Utc::now();
+        }
+        true
     }
 
     /// Records that a real verification attempt (ChallengeHypothesis, M5)

@@ -1,5 +1,8 @@
 use debura_agent::commit_contradiction;
-use debura_knowledge::{classify_provenance, HypothesisId, HypothesisStatus, KnowledgeGraph, Provenance};
+use debura_knowledge::{
+    classify_provenance, HypothesisId, HypothesisStatus, KnowledgeGraph, Provenance,
+    RejectionReason,
+};
 
 use crate::mechanical_shape::mechanically_shaped_reason;
 use crate::policy::VerificationPolicy;
@@ -61,7 +64,7 @@ pub fn reevaluate_hypothesis(
         // actually weigh -- this goes straight to REJECTED rather than
         // through CONTESTED. The subject can still be recovered/recognized
         // structurally; it just doesn't get to claim application meaning.
-        let _ = graph.set_status(id, HypothesisStatus::Rejected);
+        let _ = graph.reject_with_reason(id, RejectionReason::ProvenanceNotApplication);
         graph.add_observation(
             subject,
             "provenance_gate_rejected",

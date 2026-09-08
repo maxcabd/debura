@@ -95,6 +95,12 @@ const MIGRATIONS: &[(&str, &str)] = &[
         );
         "#,
     ),
+    (
+        "0005_rejection_reason",
+        r#"
+        ALTER TABLE hypotheses ADD COLUMN rejection_reason TEXT;
+        "#,
+    ),
 ];
 
 pub fn run(conn: &Connection) -> Result<()> {

@@ -12,7 +12,7 @@ use anyhow::{bail, Result};
 use chrono::{DateTime, Utc};
 use debura_knowledge::{
     Dependency, DependencyKind, Evidence, EvidenceId, Hypothesis, HypothesisId, HypothesisStatus,
-    Investigation, InvestigationId, KnowledgeGraph, Observation, ObservationId,
+    Investigation, InvestigationId, KnowledgeGraph, Observation, ObservationId, RejectionReason,
 };
 use rusqlite::{params, Connection};
 
@@ -64,8 +64,9 @@ pub fn save(conn: &Connection, graph: &KnowledgeGraph) -> Result<()> {
             "INSERT INTO hypotheses
                 (id, subject, predicate, value, confidence, status,
                  supporting_evidence, contradicting_evidence,
-                 created_by, created_at, updated_at, last_verified_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                 created_by, created_at, updated_at, last_verified_at,
+                 rejection_reason)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
                 h.id.0,
                 h.subject,
@@ -79,6 +80,7 @@ pub fn save(conn: &Connection, graph: &KnowledgeGraph) -> Result<()> {
                 h.created_at.to_rfc3339(),
                 h.updated_at.to_rfc3339(),
                 h.last_verified_at.map(|t| t.to_rfc3339()),
+                rejection_reason_to_json(h.rejection_reason.as_ref()),
             ],
         )?;
     }
@@ -182,7 +184,8 @@ pub fn load(conn: &Connection) -> Result<KnowledgeGraph> {
     let mut stmt = conn.prepare(
         "SELECT id, subject, predicate, value, confidence, status,
                 supporting_evidence, contradicting_evidence,
-                created_by, created_at, updated_at, last_verified_at
+                created_by, created_at, updated_at, last_verified_at,
+                rejection_reason
          FROM hypotheses",
     )?;
     let rows = stmt
@@ -200,6 +203,7 @@ pub fn load(conn: &Connection) -> Result<KnowledgeGraph> {
                 row.get::<_, String>(9)?,
                 row.get::<_, String>(10)?,
                 row.get::<_, Option<String>>(11)?,
+                row.get::<_, Option<String>>(12)?,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -216,6 +220,7 @@ pub fn load(conn: &Connection) -> Result<KnowledgeGraph> {
         created_at,
         updated_at,
         last_verified_at,
+        rejection_reason,
     ) in rows
     {
         graph.insert_hypothesis(Hypothesis {
@@ -232,6 +237,7 @@ pub fn load(conn: &Connection) -> Result<KnowledgeGraph> {
             created_at: parse_dt(&created_at)?,
             updated_at: parse_dt(&updated_at)?,
             last_verified_at: last_verified_at.as_deref().map(parse_dt).transpose()?,
+            rejection_reason: rejection_reason_from_json(rejection_reason.as_deref())?,
         });
     }
 
@@ -376,6 +382,17 @@ fn status_from_str(s: &str) -> Result<HypothesisStatus> {
         "STALE" => HypothesisStatus::Stale,
         "REJECTED" => HypothesisStatus::Rejected,
         other => bail!("unknown hypothesis status in database: {other}"),
+    })
+}
+
+fn rejection_reason_to_json(reason: Option<&RejectionReason>) -> Option<String> {
+    reason.map(|r| serde_json::to_string(r).expect("RejectionReason always serializes"))
+}
+
+fn rejection_reason_from_json(json: Option<&str>) -> Result<Option<RejectionReason>> {
+    Ok(match json {
+        Some(s) => Some(serde_json::from_str(s)?),
+        None => None,
     })
 }
 
