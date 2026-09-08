@@ -217,7 +217,23 @@ pub fn classify_data_symbol(graph: &KnowledgeGraph, symbol_name: &str, table: &S
     let executable = bool_value(graph, &address, "data_executable");
     let initialized = bool_value(graph, &address, "data_initialized");
     let pointee = single_value(graph, &address, "data_pointee").and_then(|v| v.split(' ').next().map(str::to_string));
-    let size_confident = single_value(graph, &address, "data_size_bytes").and_then(|v| v.parse::<u64>().ok());
+    let data_type = single_value(graph, &address, "data_type_name");
+    // PROJECT.md M18.2: a real compile found `data_size_bytes` alone
+    // isn't always the real, committed size it looks like. Ghidra's own
+    // bare `undefined` type (as opposed to a real sized variant --
+    // `undefined1`/`undefined4`/`undefined8`/`pointer`/... -- which really
+    // is a genuine size commitment) is its least-committal placeholder:
+    // a real, defined 1-byte Data object existed at `DAT_140009121`, but
+    // it was genuinely just Ghidra's own "I don't know what's here"
+    // marker, not evidence the real object is only 1 byte -- the actual
+    // use site (`SDL_Log(&DAT_140009121, ...)`) treats it as the start of
+    // a longer C string. A `data_size_bytes` fact backed only by the bare
+    // `undefined` type is treated the same as an *estimated* one below:
+    // real enough to keep in `source_facts`, not confident enough to
+    // emit a fixed-size definition from.
+    let size_confident = single_value(graph, &address, "data_size_bytes")
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|_| data_type.as_deref() != Some("undefined"));
     let size_estimated = single_value(graph, &address, "data_size_bytes_estimated").and_then(|v| v.parse::<u64>().ok());
     let bytes_hex = single_value(graph, &address, "data_bytes_hex");
 
@@ -285,20 +301,15 @@ pub fn classify_data_symbol(graph: &KnowledgeGraph, symbol_name: &str, table: &S
         };
     }
 
-    // PROJECT.md M18.2: a real compile found `DAT_140009121`'s own real
-    // extent was badly undersold by the next-symbol-distance estimate
-    // (1 byte -- an immediately adjacent symbol -- when the real use
-    // site, `SDL_Log(&DAT_140009121, ...)`, treats it as the start of a
-    // longer C string). Emitting a fixed-size array/scalar from an
-    // *estimated* size is exactly the kind of confidently-wrong guess
-    // this project's whole discipline exists to avoid -- only a real,
-    // Ghidra-defined Data object's own length (`size_confident`, never
-    // the next-symbol fallback) is trusted enough to emit a real
-    // definition from. An estimated size falls through to `UnknownData`
-    // below, which renders as the exact same bare-`extern` scalar
-    // declaration this address had before M18.2 existed -- a real
-    // regression-safety net, not a loss of information (the estimate is
-    // still in `source_facts` for a human to look at).
+    // PROJECT.md M18.2: real evidence -- never a next-symbol-distance
+    // estimate, and never a bare Ghidra `undefined` marker's own size
+    // (see `size_confident`'s own construction above) -- is what's
+    // trusted enough to emit a real fixed-size definition from. Anything
+    // less falls through to `UnknownData` below, which renders as the
+    // exact same bare-`extern` scalar declaration this address had
+    // before M18.2 existed -- a real regression-safety net, not a loss
+    // of information (every rejected size estimate is still in
+    // `source_facts` for a human to look at).
     if let (Some(size), Some(hex)) = (size_confident, bytes_hex) {
         if let Some(bytes) = parse_hex_bytes(&hex) {
             facts.push(format!("data_bytes_hex = {hex} (size {size}, confident)"));
@@ -313,8 +324,13 @@ pub fn classify_data_symbol(graph: &KnowledgeGraph, symbol_name: &str, table: &S
             };
             return DataResolution { address, symbol_name: symbol_name.to_string(), kind, source_facts: facts, confidence: 1.0 };
         }
-    } else if let Some(size) = size_estimated {
-        facts.push(format!("data_size_bytes_estimated = {size} (not confident enough to emit a definition from)"));
+    } else {
+        if let Some(size) = size_estimated {
+            facts.push(format!("data_size_bytes_estimated = {size} (not confident enough to emit a definition from)"));
+        }
+        if data_type.as_deref() == Some("undefined") {
+            facts.push("data_type_name = undefined (Ghidra's own least-committal placeholder -- not treated as a real size commitment)".to_string());
+        }
     }
 
     DataResolution {
@@ -562,5 +578,50 @@ mod tests {
             "the estimate should still be on record for a human to inspect: {:?}",
             resolution.source_facts
         );
+    }
+
+    /// The real, confirmed bug: `DAT_140009121` actually had a
+    /// *confident* `data_size_bytes = 1` (a real, defined Ghidra Data
+    /// object, not an estimate) -- but its own `data_type_name` was the
+    /// bare `undefined` marker, Ghidra's own least-committal placeholder,
+    /// not a real size commitment. A real compile found emitting a
+    /// 1-byte array from this broke the real use site
+    /// (`SDL_Log(&DAT_140009121, ...)`, which treats it as the start of
+    /// a longer C string) -- so a bare `undefined` type must be treated
+    /// the same as an unconfident/estimated size, even when
+    /// `data_size_bytes` itself is technically present.
+    #[test]
+    fn a_confident_size_backed_only_by_the_bare_undefined_type_is_not_trusted() {
+        let mut graph = KnowledgeGraph::new();
+        graph.add_observation("0x140009121", "data_section", ".rdata", 0.95, "ghidra:data", None);
+        graph.add_observation("0x140009121", "data_readable", "true", 0.95, "ghidra:data", None);
+        graph.add_observation("0x140009121", "data_writable", "false", 0.95, "ghidra:data", None);
+        graph.add_observation("0x140009121", "data_initialized", "true", 0.95, "ghidra:data", None);
+        graph.add_observation("0x140009121", "data_type_name", "undefined", 0.95, "ghidra:data", None);
+        graph.add_observation("0x140009121", "data_size_bytes", "1", 0.95, "ghidra:data", None);
+        graph.add_observation("0x140009121", "data_bytes_hex", "25", 0.95, "ghidra:data", None);
+
+        let table = SymbolTable::new();
+        let resolution = classify_data_symbol(&graph, "DAT_140009121", &table);
+
+        assert_eq!(resolution.kind, DataSymbolKind::UnknownData);
+    }
+
+    /// The mirror case: a real sized variant (`undefined8`, exactly what
+    /// the real, correctly-handled `DAT_140009070` constant has) is a
+    /// genuine size commitment and must still be trusted.
+    #[test]
+    fn a_confident_size_backed_by_a_real_sized_type_is_still_trusted() {
+        let mut graph = KnowledgeGraph::new();
+        graph.add_observation("0x140009070", "data_section", ".rdata", 0.95, "ghidra:data", None);
+        graph.add_observation("0x140009070", "data_writable", "false", 0.95, "ghidra:data", None);
+        graph.add_observation("0x140009070", "data_type_name", "undefined8", 0.95, "ghidra:data", None);
+        graph.add_observation("0x140009070", "data_size_bytes", "8", 0.95, "ghidra:data", None);
+        graph.add_observation("0x140009070", "data_bytes_hex", "0000000000000040", 0.95, "ghidra:data", None);
+
+        let table = SymbolTable::new();
+        let resolution = classify_data_symbol(&graph, "DAT_140009070", &table);
+
+        assert!(matches!(resolution.kind, DataSymbolKind::ConstantData { size: 8, .. }), "{:?}", resolution.kind);
     }
 }
