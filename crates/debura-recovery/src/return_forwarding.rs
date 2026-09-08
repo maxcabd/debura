@@ -18,49 +18,57 @@
 /// propagated from real evidence, the same "trust the body over a stale
 /// signature" principle this crate already applies to stale parameter
 /// counts.
-use crate::forwarding_thunk::matching_close;
+use crate::forwarding_thunk::{call_name_and_args, matching_close, split_top_level_statements, Stmt};
 
-/// Whether `decompilation`'s own body is *exactly* one call statement
-/// followed by a bare `return;` (no value) -- `None` for anything else
-/// (multiple statements, a call whose own result is actually used, a
-/// guard branch, a non-`FUN_<addr>` callee, ...). Deliberately narrow:
-/// every real case this was built from has this exact shape, and a
-/// broader match risks rewriting a body this module has no real grounds
-/// to understand.
+/// Whether `decompilation`'s own body ends with a plain call statement
+/// immediately followed by a bare `return;` (no value) -- `None` for
+/// anything else (the call's own result assigned to a variable, a
+/// non-`FUN_<addr>` callee, an `if` block as the final statement, a body
+/// `split_top_level_statements` can't parse at all, ...). Deliberately
+/// narrow: every real case this was built from has this exact shape
+/// (any amount of real work *before* the final call is fine -- only the
+/// last two statements matter), and a broader match risks rewriting a
+/// body this module has no real grounds to understand. Unlike
+/// `forwarding_thunk.rs`'s own detector, earlier statements are never
+/// required to be guard-shaped -- this only cares that the call's own
+/// result is genuinely discarded, not why.
 pub fn detect_return_forwarding_wrapper(decompilation: &str) -> Option<String> {
     let brace_open = decompilation.find('{')?;
     let brace_close = matching_close(decompilation, brace_open, b'{', b'}')?;
-    let body = decompilation[brace_open + 1..brace_close].trim();
+    let body = &decompilation[brace_open + 1..brace_close];
+    let stmts = split_top_level_statements(body)?;
 
-    let semi = body.find(';')?;
-    let call_stmt = body[..semi].trim();
-    let rest = body[semi + 1..].trim();
-    if rest != "return;" {
+    let [.., Stmt::Call { text: call_stmt }, Stmt::Call { text: "return" }] = stmts.as_slice() else {
         return None;
-    }
-
-    let open = call_stmt.find('(')?;
-    if !call_stmt.ends_with(')') {
-        return None;
-    }
-    let name = call_stmt[..open].trim();
+    };
+    let (name, _args) = call_name_and_args(call_stmt)?;
     if !name.starts_with("FUN_") || !name["FUN_".len()..].chars().all(|c| c.is_ascii_hexdigit()) {
         return None;
     }
     Some(name.to_string())
 }
 
-/// `decompilation`, rewritten so its one real statement forwards its own
-/// return value (`CALL(...); return;` -> `return CALL(...);`) --
-/// assumes `detect_return_forwarding_wrapper` already matched this exact
-/// text.
+/// `decompilation`, rewritten so its final statement forwards its own
+/// return value (`...; CALL(...); return;` -> `...; return CALL(...);`)
+/// -- assumes `detect_return_forwarding_wrapper` already matched this
+/// exact text (so the body's own last statement is exactly `return;`,
+/// preceded by exactly one real call statement).
 fn rewrite_to_forward_return_value(decompilation: &str) -> String {
     let brace_open = decompilation.find('{').expect("caller already confirmed a body exists");
-    let brace_close = matching_close(decompilation, brace_open, b'{', b'}').expect("caller already confirmed a matching close brace");
+    let brace_close =
+        matching_close(decompilation, brace_open, b'{', b'}').expect("caller already confirmed a matching close brace");
     let body = &decompilation[brace_open + 1..brace_close];
-    let semi = body.find(';').expect("caller already confirmed a call statement");
-    let call_stmt = body[..semi].trim();
-    format!("{}{{\n  return {};\n}}", &decompilation[..brace_open], call_stmt)
+    // The call statement's own text is exactly what
+    // `detect_return_forwarding_wrapper` matched as the second-to-last
+    // top-level statement -- found the same way here (rather than
+    // threading it through as a parameter) so this function stays a
+    // pure function of the same text its caller already validated.
+    let stmts = split_top_level_statements(body).expect("caller already confirmed this parses");
+    let Some(Stmt::Call { text: call_stmt }) = stmts.iter().rev().nth(1) else {
+        panic!("caller already confirmed the second-to-last statement is a plain call");
+    };
+    let before_call = body.rfind(call_stmt).expect("the call statement's own text must appear verbatim in body");
+    format!("{}{{{}return {};\n}}", &decompilation[..brace_open], &body[..before_call], call_stmt)
 }
 
 /// The bare, uncommitted Ghidra placeholder -- see `data_symbols.rs`'s
@@ -144,9 +152,25 @@ mod tests {
         assert!(detect_return_forwarding_wrapper(decompilation).is_none());
     }
 
+    /// PROJECT.md M18.3: the real, confirmed case `FUN_140007570` needed
+    /// -- real work (several local declarations and calls) before the
+    /// final forwarding call is exactly what a real wrapper does; only
+    /// the *last two* statements (a plain call, then a bare `return;`)
+    /// need to match. Only the earlier, narrower version of this
+    /// detector required the whole body to be a single statement.
     #[test]
-    fn a_body_with_more_than_one_statement_is_not_a_forwarding_wrapper() {
-        let decompilation = "undefined FUN_1(undefined8 param_1)\n\n{\n  FUN_2(param_1);\n  FUN_3(param_1);\n  return;\n}";
+    fn real_work_before_the_final_forwarding_call_still_matches() {
+        let decompilation = "undefined FUN_1(undefined8 param_1)\n\n{\n  void *pvVar1;\n  pvVar1 = FUN_2(param_1);\n  FUN_3(pvVar1);\n  return;\n}";
+        assert_eq!(detect_return_forwarding_wrapper(decompilation).as_deref(), Some("FUN_3"));
+    }
+
+    /// The second-to-last statement's own call result being assigned to
+    /// a variable (even if that variable then goes unused) is not the
+    /// same as the *final* call's result being genuinely discarded --
+    /// only the call immediately before the bare `return;` matters.
+    #[test]
+    fn an_assignment_immediately_before_the_final_return_is_not_a_forwarding_wrapper() {
+        let decompilation = "undefined FUN_1(undefined8 param_1)\n\n{\n  void *pvVar1;\n  pvVar1 = FUN_2(param_1);\n  return;\n}";
         assert!(detect_return_forwarding_wrapper(decompilation).is_none());
     }
 
@@ -198,6 +222,31 @@ mod tests {
         assert!(functions[0].decompilation.contains("return FUN_2(param_1);"), "{}", functions[0].decompilation);
         assert_eq!(functions[1].return_type, "void *");
         assert!(functions[1].decompilation.contains("return FUN_3(param_1);"), "{}", functions[1].decompilation);
+    }
+
+    /// PROJECT.md M18.3: the real, confirmed shape `FUN_140007570` had --
+    /// real local declarations and calls before the final, discarded
+    /// call -- must resolve exactly like the trivial single-statement
+    /// case, with every earlier statement preserved verbatim.
+    #[test]
+    fn preceding_real_statements_survive_the_rewrite_unchanged() {
+        let mut functions = vec![
+            function(
+                "0x1",
+                "undefined",
+                "undefined FUN_1(undefined8 param_1,undefined8 param_2,undefined8 param_3)\n\n{\n  void *pvVar1;\n  longlong lVar2;\n  \n  pvVar1 = (void *)FUN_480((undefined8)(param_3));\n  lVar2 = FUN_480((undefined8)(param_2));\n  FUN_2((void *)(pvVar1),(longlong)(lVar2));\n  return;\n}",
+            ),
+            function("0x2", "void *", "void * FUN_2(void *param_1, longlong param_2)\n\n{\n  return param_1;\n}"),
+        ];
+
+        propagate_forwarded_return_types(&mut functions);
+
+        assert_eq!(functions[0].return_type, "void *");
+        let body = &functions[0].decompilation;
+        assert!(body.contains("pvVar1 = (void *)FUN_480((undefined8)(param_3));"), "{body}");
+        assert!(body.contains("lVar2 = FUN_480((undefined8)(param_2));"), "{body}");
+        assert!(body.contains("return FUN_2((void *)(pvVar1),(longlong)(lVar2));"), "{body}");
+        assert!(!body.contains("  return;\n}"), "the bare trailing return must be replaced, not just followed: {body}");
     }
 
     /// A wrapper whose callee is never resolved to a concrete type (an

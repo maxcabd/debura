@@ -52,8 +52,11 @@ const CANONICAL_TARGETS: &[&str] = &["operator_new", "operator_delete"];
 /// forwarding thunk (`operator_new`'s own overflow checks).
 const NONRETURNING_THROW_HELPERS: &[&str] = &["std::__throw_bad_alloc", "std::__throw_bad_array_new_length"];
 
+/// `pub(crate)`: `return_forwarding.rs` reuses this same statement
+/// splitting for its own, differently-scoped detection (no guard-block
+/// allowlist there, just "is the last real statement a plain call").
 #[derive(Debug, Clone)]
-enum Stmt<'a> {
+pub(crate) enum Stmt<'a> {
     Call { text: &'a str },
     IfBlock { inner: &'a str },
 }
@@ -113,7 +116,8 @@ fn split_top_level_comma(s: &str) -> Vec<&str> {
 /// trailing `else`. Any other shape -- a bare assignment, a loop, an
 /// `else` branch -- returns `None`, the same "bail rather than guess"
 /// discipline as everywhere else in this crate's classification code.
-fn split_top_level_statements(body: &str) -> Option<Vec<Stmt<'_>>> {
+/// `pub(crate)`: see `Stmt`'s own doc comment.
+pub(crate) fn split_top_level_statements(body: &str) -> Option<Vec<Stmt<'_>>> {
     let mut stmts = Vec::new();
     let bytes = body.as_bytes();
     let mut i = 0usize;
@@ -180,7 +184,8 @@ fn split_top_level_statements(body: &str) -> Option<Vec<Stmt<'_>>> {
 /// `None` for a bare `return` (no parens at all): callers that need to
 /// tell "a real call" from "the terminal `return`" check for that
 /// exact text themselves, since a real call is never spelled that way.
-fn call_name_and_args(text: &str) -> Option<(&str, &str)> {
+/// `pub(crate)`: see `Stmt`'s own doc comment.
+pub(crate) fn call_name_and_args(text: &str) -> Option<(&str, &str)> {
     if text == "return" {
         return None;
     }
