@@ -865,11 +865,15 @@ fn extract_impl(graph: &KnowledgeGraph, required_runtime_bodies: &BTreeSet<Strin
         ghidra_intrinsics.extend(ghidra_intrinsic_tokens(&f.decompilation).map(str::to_string));
     }
 
+    let ghidra_data_symbols: Vec<String> = ghidra_data_symbols.into_iter().collect();
+    let data_resolutions = crate::data_symbols::classify_data_symbols(graph, &ghidra_data_symbols, &symbol_table);
+
     RecoveredProgram {
         classes,
         functions,
         function_references,
-        ghidra_data_symbols: ghidra_data_symbols.into_iter().collect(),
+        ghidra_data_symbols,
+        data_resolutions,
         ghidra_intrinsics: ghidra_intrinsics.into_iter().collect(),
         unresolved_calls: unresolved_calls.into_iter().collect(),
     }

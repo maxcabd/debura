@@ -1,5 +1,7 @@
 use debura_knowledge::HypothesisId;
 
+use crate::data_symbols::DataResolution;
+
 /// Where a recovered name came from -- so generated source can say so
 /// (PROJECT.md S31: recovered source retains a link back to the
 /// hypothesis/evidence that produced it).
@@ -105,6 +107,11 @@ pub struct RecoveredProgram {
     /// `PTR_...`, `_refptr_...`) referenced somewhere in a recovered
     /// body but never declared anywhere else in the output.
     pub ghidra_data_symbols: Vec<String>,
+    /// Each `ghidra_data_symbols` name's own classification (PROJECT.md
+    /// M18.2) -- what `render_ghidra_symbols_header_resolved` uses to
+    /// emit a real definition instead of a bare `extern` placeholder,
+    /// wherever real evidence supports one.
+    pub data_resolutions: Vec<DataResolution>,
     /// Ghidra's own `CONCATxy`/`SUBxy`/`ZEXTxy`/`SEXTxy` intrinsic names
     /// referenced somewhere in a recovered body -- exactly the set
     /// `render_ghidra_compat_header` needs to generate definitions for.

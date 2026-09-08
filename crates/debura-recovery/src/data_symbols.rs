@@ -1,0 +1,522 @@
+use debura_knowledge::KnowledgeGraph;
+
+use crate::symtab::{SymbolKind, SymbolTable};
+
+/// What a `DAT_*`/`PTR_*`/`LAB_*`/`_refptr_*` linker placeholder actually
+/// is, derived from real Ghidra-extracted facts (PROJECT.md M18.2) --
+/// never from its own name shape. `DAT_`/`PTR_` are Ghidra's own
+/// renderings, not evidence of anything; the deciding signal is always a
+/// `debura_knowledge` observation (section, permissions, a resolved
+/// pointee, ...).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DataSymbolKind {
+    /// This address's own value is a pointer to a real, recovered
+    /// standalone (free) function -- safe to bind symbolically
+    /// (`&recovered_name`), never to a raw address baked into the new
+    /// binary (a real run's own design correction: the *original*
+    /// binary's address means nothing in a freshly compiled one).
+    FunctionPointerAlias { target_function: String },
+    /// This address's own value points to real memory Debura has no
+    /// model of at all -- not a known function, not a known import, not
+    /// inside any recovered class's vtable range. Still real, resolved
+    /// evidence (unlike `UnknownData`, which has no pointee at all) --
+    /// just evidence that the target is genuinely outside anything
+    /// Debura currently recovers (a CRT/runtime/libstdc++ global).
+    /// Belongs to a real runtime/linkage resolver, not AI source
+    /// recovery.
+    ExternalGlobalAlias { pointee: String },
+    /// A real, bounded-size, initialized, non-pointer object with known
+    /// content -- typically `.rdata` (read-only). Safe to emit its exact
+    /// captured bytes: unlike an address-shaped value, raw content bytes
+    /// mean the same thing regardless of where the new binary places
+    /// anything.
+    ConstantData { size: u64, bytes: Vec<u8> },
+    /// Same as `ConstantData` but writable (`.data`/`.bss`-shaped) --
+    /// real mutable global storage, not a compile-time constant.
+    MutableStaticData { size: u64, bytes: Vec<u8> },
+    /// Sits in the real `.CRT` section -- MinGW's own static-initializer/
+    /// pseudo-relocation bookkeeping, not application data. Belongs to
+    /// the runtime/linkage layer, same reasoning as `ExternalGlobalAlias`.
+    RuntimeData,
+    /// This address is exactly a known class's own vtable's first virtual
+    /// slot (`has_vtable_at` + 0x10, the Itanium ABI's `vfunc0`) --
+    /// reuses M7's own already-verified vtable model rather than
+    /// re-deriving anything from this address's own raw bytes (which a
+    /// real run found badly undersized here: the generic size heuristic
+    /// bounds on the *next* symbol, which for a vtable slot is often the
+    /// very next slot, 8 bytes later -- nowhere near this record's real
+    /// significance).
+    VtableData { class_name: String, slot0_target: Option<String> },
+    /// This address's own section/permissions say it's real, executable
+    /// code (`.text`, `executable=true`) -- a label taken as a value
+    /// (a real, documented MinGW CRT idiom: registering a handler
+    /// callback by address), not data at all. Correctly classified, not
+    /// emitted as anything here -- see this module's own top-level doc
+    /// comment on why fabricating a stub isn't attempted in this pass.
+    CodeAddressAlias,
+    /// No real evidence supports any of the above -- either no confident
+    /// size/content is known at all, or nothing else matched. Left
+    /// unresolved (a plain `extern` declaration, same as before this
+    /// module existed): "Unknown is better than confidently wrong"
+    /// applies to global data exactly the way it already does to
+    /// semantic naming.
+    UnknownData,
+}
+
+/// One data symbol's classification, together with what real observation
+/// predicates justified it -- so a caller can always answer "why did
+/// Debura emit this" (PROJECT.md M18.2), not just "what". `confidence` is
+/// currently a coarse "how many independent real facts agreed" measure,
+/// not yet a calibrated probability -- source_facts is what actually
+/// matters and is kept even at confidence 1.0, since a later type/alias
+/// revision needs the same trail.
+#[derive(Debug, Clone)]
+pub struct DataResolution {
+    pub address: String,
+    pub symbol_name: String,
+    pub kind: DataSymbolKind,
+    pub source_facts: Vec<String>,
+    pub confidence: f64,
+}
+
+/// The address a Ghidra-generated placeholder name embeds in its own
+/// trailing hex digits -- true for every shape this project has seen
+/// (`DAT_140009070`, `PTR_FUN_140009a00`, `PTR_IMAGE_DOS_HEADER_140009710`,
+/// `PTR_PTR_cout_1400096e0`, `_refptr__ZN...E` is the one exception, see
+/// below). Ghidra always places the address as the *last* underscore-
+/// delimited run of hex digits, regardless of how many named components
+/// (`IMAGE_DOS_HEADER`, `PTR_cout`, ...) come before it.
+fn address_from_symbol_name(name: &str) -> Option<String> {
+    let hex = name.rsplit('_').find(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_hexdigit()))?;
+    if hex.chars().all(|c| c.is_ascii_digit()) {
+        // All-decimal-digit runs (rare, but a real class name or a purely
+        // numeric-looking component could match `is_ascii_hexdigit`)
+        // aren't a real address in this codebase's own convention --
+        // every real one seen has at least one a-f digit or is
+        // unambiguously long enough to be a real 64-bit offset. Requiring
+        // at least 6 hex digits (matching this project's own addresses,
+        // all `0x14000....`-shaped) avoids misreading a short numeric
+        // suffix as an address.
+        if hex.len() < 6 {
+            return None;
+        }
+    }
+    Some(format!("0x{}", hex.to_lowercase()))
+}
+
+fn single_value(graph: &KnowledgeGraph, subject: &str, predicate: &str) -> Option<String> {
+    graph.observations().filter(|o| o.subject == subject && o.predicate == predicate).max_by_key(|o| o.id.0).map(|o| o.value.clone())
+}
+
+fn bool_value(graph: &KnowledgeGraph, subject: &str, predicate: &str) -> Option<bool> {
+    single_value(graph, subject, predicate).and_then(|v| v.parse().ok())
+}
+
+fn parse_hex_bytes(hex: &str) -> Option<Vec<u8>> {
+    if hex.len() % 2 != 0 {
+        return None;
+    }
+    (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).ok())
+        .collect()
+}
+
+/// Every known class's own vtable's `vfunc0` address (`has_vtable_at` +
+/// 0x10, the Itanium ABI convention M7's own extraction already
+/// documents) mapped back to the class name -- confirmed against the
+/// real Snake binary: `Collideable`'s `has_vtable_at` (0x1400099d0) + 0x10
+/// exactly equals `DAT_1400099e0`'s own address, and the same holds for
+/// every other recovered class with a vtable.
+fn vfunc0_addresses(graph: &KnowledgeGraph) -> Vec<(String, String)> {
+    graph
+        .observations()
+        .filter(|o| o.predicate == "has_vtable_at")
+        .filter_map(|o| {
+            let base = u64::from_str_radix(o.value.trim_start_matches("0x"), 16).ok()?;
+            Some((o.subject.clone(), format!("0x{:x}", base + 0x10)))
+        })
+        .collect()
+}
+
+/// Slot 0's own recovered function address for `class_name`, from
+/// `has_virtual_method`'s own `"slot {n}: {address}"` value shape
+/// (`debura-analysis`'s ingest of M7's `virtual_methods` fact).
+fn vtable_slot0_function(graph: &KnowledgeGraph, class_name: &str) -> Option<String> {
+    graph
+        .observations()
+        .filter(|o| o.subject == class_name && o.predicate == "has_virtual_method")
+        .find_map(|o| {
+            let rest = o.value.strip_prefix("slot 0: ")?;
+            Some(rest.to_string())
+        })
+}
+
+/// Whether `address` is a real, Ghidra-recognized function -- present via
+/// `calling_convention`, a fact `ExtractFacts.py` only ever emits for a
+/// genuine `Function` object, never for data.
+fn is_known_function(graph: &KnowledgeGraph, address: &str) -> bool {
+    graph.observations().any(|o| o.subject == address && o.predicate == "calling_convention")
+}
+
+fn is_known_import(graph: &KnowledgeGraph, address: &str) -> bool {
+    graph.observations().any(|o| o.subject == address && o.predicate == "imports")
+}
+
+/// Classifies one already-collected `DAT_*`/`PTR_*`/`LAB_*`/`_refptr_*`
+/// symbol name (PROJECT.md M18.2). `table` is the same whole-program
+/// symbol table `extract()` already builds for call-site resolution
+/// (`symtab::build_symbol_table`) -- reused here so `FunctionPointerAlias`
+/// binds to the exact same recovered name a real call site would.
+pub fn classify_data_symbol(graph: &KnowledgeGraph, symbol_name: &str, table: &SymbolTable) -> DataResolution {
+    let Some(address) = address_from_symbol_name(symbol_name) else {
+        return DataResolution {
+            address: String::new(),
+            symbol_name: symbol_name.to_string(),
+            kind: DataSymbolKind::UnknownData,
+            source_facts: vec!["no address could be parsed from this symbol's own name".to_string()],
+            confidence: 0.0,
+        };
+    };
+
+    let mut facts = Vec::new();
+
+    // VtableData: checked first, since a vfunc0 address's own generic
+    // size/content facts (a real run found them badly undersized -- see
+    // this type's own doc comment) would otherwise misroute it into
+    // ConstantData/UnknownData before the much stronger, already-verified
+    // M7 vtable model gets a chance.
+    for (class_name, vfunc0) in vfunc0_addresses(graph) {
+        if vfunc0 == address {
+            facts.push(format!("has_vtable_at({class_name}) + 0x10 == {address}"));
+            let slot0 = vtable_slot0_function(graph, &class_name);
+            let target = slot0.as_deref().and_then(|addr| table.get(addr)).and_then(|sym| match sym.kind {
+                SymbolKind::FreeFunction => Some(sym.display_name.clone()),
+                // A Method/Constructor/Destructor's address can't be
+                // stored as a plain function pointer the way this vtable
+                // slot idiom needs (Itanium member-function pointers are
+                // a different, larger representation) -- null is the
+                // honest choice here, not a wrong-shaped reference.
+                _ => None,
+            });
+            if let Some(addr) = &slot0 {
+                facts.push(format!("has_virtual_method({class_name}) slot 0 = {addr}"));
+            }
+            return DataResolution {
+                address,
+                symbol_name: symbol_name.to_string(),
+                kind: DataSymbolKind::VtableData { class_name, slot0_target: target },
+                source_facts: facts,
+                confidence: 1.0,
+            };
+        }
+    }
+
+    let section = single_value(graph, &address, "data_section");
+    let writable = bool_value(graph, &address, "data_writable");
+    let executable = bool_value(graph, &address, "data_executable");
+    let initialized = bool_value(graph, &address, "data_initialized");
+    let pointee = single_value(graph, &address, "data_pointee").and_then(|v| v.split(' ').next().map(str::to_string));
+    let size_confident = single_value(graph, &address, "data_size_bytes").and_then(|v| v.parse::<u64>().ok());
+    let size_estimated = single_value(graph, &address, "data_size_bytes_estimated").and_then(|v| v.parse::<u64>().ok());
+    let bytes_hex = single_value(graph, &address, "data_bytes_hex");
+
+    if let Some(s) = &section {
+        facts.push(format!("data_section = {s}"));
+    }
+    if let Some(e) = executable {
+        facts.push(format!("data_executable = {e}"));
+    }
+
+    // CodeAddressAlias: real code, not data at all -- checked before any
+    // pointee/size reasoning, since a code byte's own "content" isn't a
+    // data value in any of the senses below.
+    if executable == Some(true) && section.as_deref() == Some(".text") {
+        return DataResolution {
+            address,
+            symbol_name: symbol_name.to_string(),
+            kind: DataSymbolKind::CodeAddressAlias,
+            source_facts: facts,
+            confidence: 1.0,
+        };
+    }
+
+    if let Some(target) = &pointee {
+        facts.push(format!("data_pointee = {target}"));
+        if is_known_function(graph, target) {
+            if let Some(sym) = table.get(target) {
+                if sym.kind == SymbolKind::FreeFunction {
+                    facts.push(format!("{target} resolves to recovered free function {}", sym.display_name));
+                    return DataResolution {
+                        address,
+                        symbol_name: symbol_name.to_string(),
+                        kind: DataSymbolKind::FunctionPointerAlias { target_function: sym.display_name.clone() },
+                        source_facts: facts,
+                        confidence: 1.0,
+                    };
+                }
+                facts.push(format!("{target} resolves to a recovered method/ctor/dtor, not a plain function -- no safe function-pointer representation"));
+            } else {
+                facts.push(format!("{target} is a known function but not itself recovered"));
+            }
+        } else if is_known_import(graph, target) {
+            facts.push(format!("{target} is a known import"));
+        }
+        // Real memory, but outside anything Debura has a model of --
+        // exactly what `ExternalGlobalAlias` means (never guessed from
+        // this symbol's own name, only from the pointee's own resolved
+        // identity above).
+        return DataResolution {
+            address,
+            symbol_name: symbol_name.to_string(),
+            kind: DataSymbolKind::ExternalGlobalAlias { pointee: target.clone() },
+            source_facts: facts,
+            confidence: 0.8,
+        };
+    }
+
+    if section.as_deref() == Some(".CRT") {
+        return DataResolution {
+            address,
+            symbol_name: symbol_name.to_string(),
+            kind: DataSymbolKind::RuntimeData,
+            source_facts: facts,
+            confidence: 1.0,
+        };
+    }
+
+    if let (Some(size), Some(hex)) = (size_confident.or(size_estimated), bytes_hex) {
+        if let Some(bytes) = parse_hex_bytes(&hex) {
+            facts.push(format!("data_bytes_hex = {hex} (size {size})"));
+            if let Some(init) = initialized {
+                facts.push(format!("data_initialized = {init}"));
+            }
+            let confidence = if size_confident.is_some() { 1.0 } else { 0.6 };
+            let is_writable = writable.unwrap_or(false);
+            let kind = if is_writable {
+                DataSymbolKind::MutableStaticData { size, bytes }
+            } else {
+                DataSymbolKind::ConstantData { size, bytes }
+            };
+            return DataResolution { address, symbol_name: symbol_name.to_string(), kind, source_facts: facts, confidence };
+        }
+    }
+
+    DataResolution {
+        address,
+        symbol_name: symbol_name.to_string(),
+        kind: DataSymbolKind::UnknownData,
+        source_facts: facts,
+        confidence: 0.0,
+    }
+}
+
+/// Classifies every symbol in `symbol_names` (PROJECT.md M18.2) --
+/// `extract()`'s own convenience entry point, called once per recovery
+/// pass with the same symbol set `ghidra_data_symbols` already collects.
+pub fn classify_data_symbols(graph: &KnowledgeGraph, symbol_names: &[String], table: &SymbolTable) -> Vec<DataResolution> {
+    symbol_names.iter().map(|name| classify_data_symbol(graph, name, table)).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{NameSource, RecoveredFunction};
+
+    fn function_table(address: &str, display_name: &str) -> SymbolTable {
+        let functions = vec![RecoveredFunction {
+            address: address.to_string(),
+            raw_name: format!("FUN_{}", &address[2..]),
+            display_name: display_name.to_string(),
+            name_source: NameSource::Raw,
+            return_type: "void".to_string(),
+            params: String::new(),
+            decompilation: String::new(),
+        }];
+        crate::symtab::build_symbol_table(&[], &functions)
+    }
+
+    #[test]
+    fn address_is_parsed_from_the_symbols_own_trailing_hex() {
+        assert_eq!(address_from_symbol_name("DAT_140009070").as_deref(), Some("0x140009070"));
+        assert_eq!(address_from_symbol_name("PTR_FUN_140009a00").as_deref(), Some("0x140009a00"));
+        assert_eq!(address_from_symbol_name("PTR_IMAGE_DOS_HEADER_140009710").as_deref(), Some("0x140009710"));
+        assert_eq!(address_from_symbol_name("PTR_PTR_cout_1400096e0").as_deref(), Some("0x1400096e0"));
+    }
+
+    /// The real, confirmed case: `DAT_140009070`'s captured bytes decode
+    /// exactly as the IEEE-754 double 2.0, `.rdata`, read-only.
+    #[test]
+    fn a_readonly_initialized_object_with_no_pointee_is_constant_data() {
+        let mut graph = KnowledgeGraph::new();
+        graph.add_observation("0x140009070", "data_section", ".rdata", 0.95, "ghidra:data", None);
+        graph.add_observation("0x140009070", "data_readable", "true", 0.95, "ghidra:data", None);
+        graph.add_observation("0x140009070", "data_writable", "false", 0.95, "ghidra:data", None);
+        graph.add_observation("0x140009070", "data_initialized", "true", 0.95, "ghidra:data", None);
+        graph.add_observation("0x140009070", "data_size_bytes", "8", 0.95, "ghidra:data", None);
+        graph.add_observation("0x140009070", "data_bytes_hex", "0000000000000040", 0.95, "ghidra:data", None);
+
+        let table = SymbolTable::new();
+        let resolution = classify_data_symbol(&graph, "DAT_140009070", &table);
+
+        match resolution.kind {
+            DataSymbolKind::ConstantData { size, bytes } => {
+                assert_eq!(size, 8);
+                assert_eq!(bytes, vec![0, 0, 0, 0, 0, 0, 0, 0x40]);
+                assert_eq!(f64::from_le_bytes(bytes.try_into().unwrap()), 2.0);
+            }
+            other => panic!("expected ConstantData, got {other:?}"),
+        }
+        assert_eq!(resolution.confidence, 1.0);
+    }
+
+    #[test]
+    fn a_writable_initialized_object_is_mutable_static_data() {
+        let mut graph = KnowledgeGraph::new();
+        graph.add_observation("0x140011058", "data_section", ".CRT_placeholder_unused", 0.95, "ghidra:data", None);
+        graph.add_observation("0x140011058", "data_writable", "true", 0.95, "ghidra:data", None);
+        graph.add_observation("0x140011058", "data_initialized", "true", 0.95, "ghidra:data", None);
+        graph.add_observation("0x140011058", "data_size_bytes", "8", 0.95, "ghidra:data", None);
+        graph.add_observation("0x140011058", "data_bytes_hex", "0000000000000000", 0.95, "ghidra:data", None);
+
+        let table = SymbolTable::new();
+        let resolution = classify_data_symbol(&graph, "DAT_140011058", &table);
+
+        match resolution.kind {
+            DataSymbolKind::MutableStaticData { size, bytes } => {
+                assert_eq!(size, 8);
+                assert_eq!(bytes, vec![0u8; 8]);
+            }
+            other => panic!("expected MutableStaticData, got {other:?}"),
+        }
+    }
+
+    /// The real, confirmed case: `DAT_140011058` genuinely sits in the
+    /// `.CRT` section.
+    #[test]
+    fn the_crt_section_is_runtime_data_regardless_of_writability() {
+        let mut graph = KnowledgeGraph::new();
+        graph.add_observation("0x140011058", "data_section", ".CRT", 0.95, "ghidra:data", None);
+        graph.add_observation("0x140011058", "data_writable", "true", 0.95, "ghidra:data", None);
+
+        let table = SymbolTable::new();
+        let resolution = classify_data_symbol(&graph, "DAT_140011058", &table);
+
+        assert_eq!(resolution.kind, DataSymbolKind::RuntimeData);
+    }
+
+    /// The real, confirmed case: `PTR_FUN_140009a00` == `Food`'s own
+    /// `has_vtable_at` (0x1400099f0) + 0x10.
+    #[test]
+    fn a_vfunc0_address_is_vtable_data_reusing_the_m7_model() {
+        let mut graph = KnowledgeGraph::new();
+        graph.add_observation("Food", "has_vtable_at", "0x1400099f0", 1.0, "ghidra:vtable", None);
+        graph.add_observation("Food", "has_virtual_method", "slot 0: 0x1400018ca", 0.95, "ghidra:vtable", None);
+
+        let table = function_table("0x1400018ca", "draw");
+        let resolution = classify_data_symbol(&graph, "PTR_FUN_140009a00", &table);
+
+        assert_eq!(
+            resolution.kind,
+            DataSymbolKind::VtableData { class_name: "Food".to_string(), slot0_target: Some("draw".to_string()) }
+        );
+        assert_eq!(resolution.confidence, 1.0);
+    }
+
+    /// The real, confirmed case: `PTR_FUN_140009a00`'s own slot-0 target
+    /// (0x1400018ca) is a recovered *method*, not a free function -- no
+    /// safe plain-function-pointer representation, so this must stay
+    /// `None` rather than emit something that won't compile.
+    #[test]
+    fn a_vtable_slot_targeting_a_method_gets_no_function_pointer_representation() {
+        use crate::model::{RecoveredClass, RecoveredMethod};
+
+        let mut graph = KnowledgeGraph::new();
+        graph.add_observation("Food", "has_vtable_at", "0x1400099f0", 1.0, "ghidra:vtable", None);
+        graph.add_observation("Food", "has_virtual_method", "slot 0: 0x1400018ca", 0.95, "ghidra:vtable", None);
+
+        let classes = vec![RecoveredClass {
+            name: "Food".to_string(),
+            base: None,
+            vtable_address: "0x1400099f0".to_string(),
+            fields: Vec::new(),
+            methods: vec![RecoveredMethod {
+                address: "0x1400018ca".to_string(),
+                raw_name: "FUN_1400018ca".to_string(),
+                display_name: "draw".to_string(),
+                name_source: NameSource::Raw,
+                return_type: "void".to_string(),
+                params: String::new(),
+                is_constructor: false,
+                is_destructor: false,
+                receiver_alias: None,
+                decompilation: String::new(),
+            }],
+            references: Vec::new(),
+        }];
+        let table = crate::symtab::build_symbol_table(&classes, &[]);
+
+        let resolution = classify_data_symbol(&graph, "PTR_FUN_140009a00", &table);
+
+        assert_eq!(
+            resolution.kind,
+            DataSymbolKind::VtableData { class_name: "Food".to_string(), slot0_target: None }
+        );
+    }
+
+    /// The real, confirmed case: `PTR_IMAGE_DOS_HEADER_140009710`'s own
+    /// pointee (0x140000000) is real memory but matches no known
+    /// function, import, or vtable -- classified from the *pointee's*
+    /// resolved identity, never from this symbol's own embedded name.
+    #[test]
+    fn a_pointee_matching_nothing_debura_knows_is_an_external_global_alias() {
+        let mut graph = KnowledgeGraph::new();
+        graph.add_observation("0x140009710", "data_pointee", "0x140000000 (reference)", 0.95, "ghidra:data", None);
+
+        let table = SymbolTable::new();
+        let resolution = classify_data_symbol(&graph, "PTR_IMAGE_DOS_HEADER_140009710", &table);
+
+        assert_eq!(resolution.kind, DataSymbolKind::ExternalGlobalAlias { pointee: "0x140000000".to_string() });
+    }
+
+    #[test]
+    fn a_pointee_matching_a_recovered_free_function_is_a_function_pointer_alias() {
+        let mut graph = KnowledgeGraph::new();
+        graph.add_observation("0x140009050", "data_pointee", "0x1400070a0 (reference)", 0.95, "ghidra:data", None);
+        graph.add_observation("0x1400070a0", "calling_convention", "__fastcall", 0.95, "ghidra:function", None);
+
+        let table = function_table("0x1400070a0", "calculateOffset");
+        let resolution = classify_data_symbol(&graph, "PTR_DAT_140009050", &table);
+
+        assert_eq!(
+            resolution.kind,
+            DataSymbolKind::FunctionPointerAlias { target_function: "calculateOffset".to_string() }
+        );
+    }
+
+    /// The real, confirmed case: `LAB_140001000`/`LAB_140003a80` are
+    /// real, executable `.text` bytes -- a label taken as a value, not
+    /// data at all.
+    #[test]
+    fn an_executable_text_address_is_a_code_address_alias() {
+        let mut graph = KnowledgeGraph::new();
+        graph.add_observation("0x140001000", "data_section", ".text", 0.95, "ghidra:data", None);
+        graph.add_observation("0x140001000", "data_executable", "true", 0.95, "ghidra:data", None);
+
+        let table = SymbolTable::new();
+        let resolution = classify_data_symbol(&graph, "LAB_140001000", &table);
+
+        assert_eq!(resolution.kind, DataSymbolKind::CodeAddressAlias);
+    }
+
+    #[test]
+    fn no_supporting_facts_at_all_is_unknown_data_not_a_guess() {
+        let graph = KnowledgeGraph::new();
+        let table = SymbolTable::new();
+
+        let resolution = classify_data_symbol(&graph, "DAT_140012345", &table);
+
+        assert_eq!(resolution.kind, DataSymbolKind::UnknownData);
+        assert_eq!(resolution.confidence, 0.0);
+    }
+}

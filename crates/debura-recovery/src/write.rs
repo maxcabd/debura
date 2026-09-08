@@ -6,7 +6,7 @@ use anyhow::Result;
 use crate::compat::{render_ghidra_compat_header, GHIDRA_COMPAT_HEADER_NAME};
 use crate::model::RecoveredProgram;
 use crate::render::{render_functions_source, render_header, render_source};
-use crate::symbols::{render_function_declarations, render_ghidra_symbols_header, GHIDRA_SYMBOLS_HEADER_NAME};
+use crate::symbols::{render_function_declarations, render_ghidra_symbols_header_resolved, GHIDRA_SYMBOLS_HEADER_NAME};
 
 #[derive(Debug, Default)]
 pub struct RecoverySummary {
@@ -35,8 +35,9 @@ pub fn write_to_disk(project_root: &Path, program: &RecoveredProgram) -> Result<
         .collect();
     fs::write(
         include_dir.join(GHIDRA_SYMBOLS_HEADER_NAME),
-        render_ghidra_symbols_header(
+        render_ghidra_symbols_header_resolved(
             &program.ghidra_data_symbols,
+            &program.data_resolutions,
             &program.unresolved_calls,
             &render_function_declarations(&function_declarations),
         ),

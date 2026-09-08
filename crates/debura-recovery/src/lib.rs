@@ -9,6 +9,7 @@
 //! marked as such. Every recovered name says which of the two it is.
 
 mod compat;
+mod data_symbols;
 mod disposition;
 mod extract;
 mod frontier;
@@ -19,6 +20,7 @@ mod symtab;
 mod write;
 
 pub use compat::{render_ghidra_compat_header, GHIDRA_COMPAT_HEADER_NAME};
+pub use data_symbols::{classify_data_symbols, DataResolution, DataSymbolKind};
 pub use disposition::{classify_recovery_disposition, DispositionEntry, RecoveryDisposition};
 pub use extract::{extract, extract_with_required_runtime_bodies};
 pub use frontier::{classify_frontier, parse_undefined_symbols, reachable_from, FrontierBucket, FrontierEntry, UnresolvedSymbol};
@@ -27,7 +29,10 @@ pub use model::{
     RecoveredProgram,
 };
 pub use render::{render_functions_source, render_header, render_source};
-pub use symbols::{render_function_declarations, render_ghidra_symbols_header, GHIDRA_SYMBOLS_HEADER_NAME};
+pub use symbols::{
+    render_function_declarations, render_ghidra_symbols_header, render_ghidra_symbols_header_resolved,
+    GHIDRA_SYMBOLS_HEADER_NAME,
+};
 pub use write::{write_to_disk, RecoverySummary};
 
 use std::path::Path;
