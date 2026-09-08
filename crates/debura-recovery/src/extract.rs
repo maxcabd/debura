@@ -453,7 +453,7 @@ pub fn extract(graph: &KnowledgeGraph) -> RecoveredProgram {
         if class_method_addresses.contains(&subject) {
             continue; // already represented as a class method
         }
-        if classify_provenance(graph, &subject) == Provenance::CompilerLibraryGlue {
+        if classify_provenance(graph, &subject) != Provenance::Application {
             // Same reasoning as the class-name filter above, extended to
             // the harder case: a standalone function whose own name
             // looks like application code, but whose behavior is really
@@ -462,7 +462,13 @@ pub fn extract(graph: &KnowledgeGraph) -> RecoveredProgram {
             // std::string's own private `_M_create`/`_M_data`/
             // `_M_capacity`/`_M_set_length`) doesn't need recovering
             // either -- a real g++ build already supplies whatever
-            // std::string itself does.
+            // std::string itself does. Excludes `Unknown` too (PROJECT.md
+            // M17): this reevaluate_hypothesis's provenance gate should
+            // already keep an Unknown-provenance subject from reaching
+            // ACCEPTED at all, but a subject accepted before that gate
+            // existed (an older project re-recovered) still shouldn't be
+            // rendered under a name nothing ever confirmed was safe to
+            // apply.
             continue;
         }
         let Some(raw_name) = latest(graph, &subject, "has_name").map(|o| o.value.clone()) else {

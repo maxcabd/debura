@@ -269,7 +269,8 @@ fn main() -> Result<()> {
             println!();
             println!("Accepted semantic_role claims, by class:");
             println!("  Application:         {}", claims.application_accepted);
-            println!("  Library/compiler:    {}", claims.library_or_compiler_accepted);
+            println!("  Library/runtime:     {}", claims.library_or_runtime_accepted);
+            println!("  Unknown provenance:  {}", claims.unknown_provenance_accepted);
         }
         Command::Investigate { project, subject } => {
             let root = debura_core::config::projects_dir().join(&project);
