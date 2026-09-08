@@ -60,14 +60,26 @@ fn patch_known_idioms(text: &str) -> String {
     // real, implicit `this` (never re-declared as a local) is untouched.
     let text = rename_this_local_variable(&text);
 
-    // Ghidra decompiles non-static `std::string` member calls
-    // (`c_str`/`~basic_string`) as `Type::method(receiver, ...)` -- not
-    // real, compilable C++ syntax for a non-static member, regardless of
-    // whether the receiver argument is present. Must run before the
-    // template-argument stripping below, which would otherwise remove the
-    // exact bare-templated type name this looks for from the paired local
+    // Ghidra decompiles non-static member calls on real std:: types
+    // (`c_str`/`str`/`~basic_string`/`~basic_stringstream`, and a
+    // redundant explicit default-constructor call on an already-declared
+    // local) as `Type::member(receiver, ...)` -- not real, compilable C++
+    // syntax for a non-static member. Must run before the template-
+    // argument stripping below, which would otherwise remove the exact
+    // bare-templated type names this looks for from each paired local
     // declaration.
-    let text = fix_std_string_member_calls(&text);
+    let text = fix_qualified_member_calls(
+        &text,
+        "std::__cxx11::basic_string<char,std::char_traits<char>,std::allocator<char>>",
+        "basic_string<char,std::char_traits<char>,std::allocator<char>>",
+        "basic_string",
+    );
+    let text = fix_qualified_member_calls(
+        &text,
+        "std::__cxx11::basic_stringstream<char,std::char_traits<char>,std::allocator<char>>",
+        "basic_stringstream<char,std::char_traits<char>,std::allocator<char>>",
+        "basic_stringstream",
+    );
 
     // Two specific SDL API calls decompile with an `undefined`-typed
     // local where the real signature needs a struct value/pointer --
@@ -83,6 +95,12 @@ fn patch_known_idioms(text: &str) -> String {
     // fixed SDL function names rather than a generic pattern.
     let text = cast_last_call_argument(&text, "TTF_RenderText_Solid", "*(SDL_Color*)&");
     let text = cast_last_call_argument(&text, "SDL_RenderCopy", "(const SDL_Rect*)");
+    // `__stdio_common_vfprintf` is a real UCRT function (real signature
+    // ends `..., va_list arglist)`); Ghidra decompiles its own captured
+    // argument list as a plain `undefined8 *` pointer -- the same 8
+    // bytes `va_list` (a bare `char *` on this target) already is, just
+    // the wrong C++ type for an implicit conversion.
+    let text = cast_last_call_argument(&text, "__stdio_common_vfprintf", "(va_list)");
 
     // Ghidra always writes these STL types out with their real,
     // explicit (and in this codebase, always `char`-based) template
@@ -136,57 +154,115 @@ fn rename_this_local_variable(text: &str) -> String {
     replace_whole_word(text, "this", "debura_local_this")
 }
 
-/// Ghidra decompiles a non-static `std::string` member call as
-/// `Type::method(receiver, args...)` -- valid-looking C-shaped text, but
+/// Ghidra decompiles a non-static member call on a real `std::` type as
+/// `Type::member(receiver, args...)` -- valid-looking C-shaped text, but
 /// not real, compilable C++ for a non-static member (needs
-/// `receiver->method(args...)` instead), and for `c_str()` specifically,
-/// a real case had the receiver argument missing from Ghidra's own raw
-/// decompilation entirely. Rewrites both known shapes -- `~basic_string`
-/// (always has its receiver argument, just the wrong call syntax) and
-/// `c_str` (sometimes missing the argument too, recovered from the
-/// body's own single `basic_string<...> NAME [N];` local when there is
-/// exactly one -- guessing wrong here is worse than a visible compile
-/// error).
-fn fix_std_string_member_calls(text: &str) -> String {
-    const QUALIFIED_TYPE: &str = "std::__cxx11::basic_string<char,std::char_traits<char>,std::allocator<char>>";
+/// `receiver->member(args...)` instead). A real compile found three
+/// distinct shapes of this, all fixed here uniformly, for any method
+/// name, against `bare_type` (a `using` alias in `ghidra_compat.hpp`,
+/// e.g. `basic_string`) qualified as `qualified_type` (the real template
+/// Ghidra names, e.g. `std::__cxx11::basic_string<char,std::char_traits<char>,std::allocator<char>>`):
+/// - A destructor call (`~Bare(receiver)`) -> `receiver->~Bare()`.
+/// - A redundant explicit call to the type's own default constructor on
+///   an already-declared local (`Type::Bare();`) -- deleted outright,
+///   statement and all: the local's own declaration (`Bare local [N];`)
+///   already default-constructs it, so this is pure Ghidra ABI-level
+///   narration with nothing left for real C++ to do.
+/// - An ordinary accessor (`member(receiver, rest...)`) ->
+///   `receiver->member(rest...)`, or, when Ghidra's own raw decompilation
+///   dropped the receiver argument entirely (a real, observed case),
+///   recovered from the body's own single same-`bare_type` local when
+///   exactly one exists -- guessing wrong here is worse than a visible
+///   compile error, so anything less unambiguous is left alone.
+fn fix_qualified_member_calls(text: &str, qualified_type: &str, decl_type: &str, bare_type: &str) -> String {
+    let prefix = format!("{qualified_type}::");
+    if !text.contains(&prefix) {
+        return text.to_string();
+    }
 
-    let mut text = text.to_string();
+    let decl_needle = format!("{decl_type} ");
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(pos) = rest.find(&prefix) {
+        out.push_str(&rest[..pos]);
+        let after_prefix = &rest[pos + prefix.len()..];
+        // A real case had the member name wrapped onto the next line
+        // (Ghidra sometimes breaks a long qualified call across lines
+        // right after the `::`) -- skip leading whitespace/newlines
+        // before looking for the member name itself.
+        let member_start = after_prefix.trim_start();
+        let name_end = member_start
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '~'))
+            .unwrap_or(member_start.len());
+        let member = &member_start[..name_end];
+        let after_name = member_start[name_end..].trim_start();
+        if member.is_empty() || !after_name.starts_with('(') {
+            // Not a call shape this understands -- leave the prefix as
+            // literal text and keep scanning past it.
+            out.push_str(&prefix);
+            rest = after_prefix;
+            continue;
+        }
+        let call_rest = &after_name[1..];
+        let Some(close) = find_matching_close_paren(call_rest) else {
+            out.push_str(&prefix);
+            rest = after_prefix;
+            continue;
+        };
+        let args_text = call_rest[..close].trim();
+        let after_call = &call_rest[close + 1..];
 
-    let dtor_prefix = format!("{QUALIFIED_TYPE}::~basic_string(");
-    loop {
-        let Some(pos) = text.find(&dtor_prefix) else { break };
-        let after = pos + dtor_prefix.len();
-        let Some(close) = text[after..].find(')') else { break };
-        let receiver = text[after..after + close].trim().to_string();
+        if member == bare_type && args_text.is_empty() {
+            match after_call.find(';') {
+                Some(semi) => rest = &after_call[semi + 1..],
+                None => rest = after_call,
+            }
+            continue;
+        }
+
+        let (mut receiver, remaining_args) = split_first_arg(args_text);
         if receiver.is_empty() {
-            break;
+            let decl_matches: Vec<&str> = find_declared_local_names(text, &decl_needle);
+            match decl_matches.as_slice() {
+                [name] => {
+                    receiver = name;
+                }
+                _ => {
+                    out.push_str(&prefix);
+                    rest = after_prefix;
+                    continue;
+                }
+            }
         }
-        let whole = format!("{dtor_prefix}{receiver})");
-        let replacement = format!("{receiver}->~basic_string()");
-        text = text.replacen(&whole, &replacement, 1);
-    }
 
-    let c_str_empty = format!("{QUALIFIED_TYPE}::c_str()");
-    if text.contains(&c_str_empty) {
-        if let [name] = basic_string_local_names(&text).as_slice() {
-            text = text.replace(&c_str_empty, &format!("{name}->c_str()"));
+        if member.starts_with('~') {
+            out.push_str(&format!("{receiver}->~{bare_type}()"));
+        } else {
+            out.push_str(&format!("{receiver}->{member}({remaining_args})"));
         }
+        rest = after_call;
     }
-    let c_str_prefix = format!("{QUALIFIED_TYPE}::c_str(");
-    loop {
-        let Some(pos) = text.find(&c_str_prefix) else { break };
-        let after = pos + c_str_prefix.len();
-        let Some(close) = text[after..].find(')') else { break };
-        let receiver = text[after..after + close].trim().to_string();
-        if receiver.is_empty() {
-            break;
-        }
-        let whole = format!("{c_str_prefix}{receiver})");
-        let replacement = format!("{receiver}->c_str()");
-        text = text.replacen(&whole, &replacement, 1);
-    }
+    out.push_str(rest);
+    out
+}
 
-    text
+/// Splits `args` on its first top-level (paren/bracket-depth-0) comma --
+/// enough to separate a qualified member call's own receiver from its
+/// remaining, untouched arguments, without needing a full argument-list
+/// parser (`symtab.rs`'s `split_args` solves the same problem for a
+/// different caller, generalized to every comma; this only ever needs
+/// the first).
+fn split_first_arg(args: &str) -> (&str, &str) {
+    let mut depth = 0i32;
+    for (i, c) in args.char_indices() {
+        match c {
+            '(' | '[' => depth += 1,
+            ')' | ']' => depth -= 1,
+            ',' if depth == 0 => return (args[..i].trim(), args[i + 1..].trim()),
+            _ => {}
+        }
+    }
+    (args, "")
 }
 
 /// Wraps a call site's own last (comma-separated, top-level) argument in
@@ -252,15 +328,18 @@ fn find_matching_close_paren(text: &str) -> Option<usize> {
 /// Every local variable Ghidra declared as a stack-allocated
 /// `basic_string<char,std::char_traits<char>,std::allocator<char>> NAME
 /// [N];` -- the shape a decompiled `std::string` local always has.
-fn basic_string_local_names(text: &str) -> Vec<String> {
-    let needle = "basic_string<char,std::char_traits<char>,std::allocator<char>> ";
+/// Every local variable declared `{decl_needle}NAME [N];` -- the shape
+/// Ghidra always uses for a stack-allocated instance of a std:: type it
+/// otherwise renders with real template arguments (`decl_needle` already
+/// carries its own trailing space, e.g. `"basic_string<char,std::char_traits<char>,std::allocator<char>> "`).
+fn find_declared_local_names<'a>(text: &'a str, decl_needle: &str) -> Vec<&'a str> {
     let mut names = Vec::new();
     let mut rest = text;
-    while let Some(pos) = rest.find(needle) {
-        let after = &rest[pos + needle.len()..];
+    while let Some(pos) = rest.find(decl_needle) {
+        let after = &rest[pos + decl_needle.len()..];
         if let Some(name) = after.split(|c: char| c == ' ' || c == '[').next() {
             if !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
-                names.push(name.to_string());
+                names.push(name);
             }
         }
         rest = after;
@@ -340,6 +419,41 @@ mod idiom_tests {
         let text = "basic_string<char,std::char_traits<char>,std::allocator<char>> local_38 [40]; basic_string<char,std::char_traits<char>,std::allocator<char>> local_58 [40]; uVar1 = std::__cxx11::basic_string<char,std::char_traits<char>,std::allocator<char>>::c_str();";
         let patched = patch_known_idioms(text);
         assert!(patched.contains("::c_str();"), "{patched}");
+    }
+
+    /// PROJECT.md M18: the same qualified-member-call problem recurs for
+    /// `basic_stringstream`, with a third shape not seen for
+    /// `basic_string`: Ghidra decompiles a local's own default
+    /// construction as an explicit, redundant `Type::Type();` call --
+    /// invalid as a call (no object, and "protected constructor" errors
+    /// from the real compiler trying to resolve it some other way) and
+    /// pointless anyway, since the local's own declaration already
+    /// default-constructs it.
+    #[test]
+    fn a_stringstream_local_does_not_get_an_explicit_redundant_construction_call() {
+        let text = "basic_stringstream<char,std::char_traits<char>,std::allocator<char>> local_1a8 [16];\n  std::__cxx11::basic_stringstream<char,std::char_traits<char>,std::allocator<char>>::\n  basic_stringstream();\n  return;";
+        let patched = patch_known_idioms(text);
+        assert!(!patched.contains("basic_stringstream::"), "{patched}");
+        assert!(!patched.contains("basic_stringstream()"), "{patched}");
+        // The declaration itself (already valid, already constructs it)
+        // must survive untouched.
+        assert!(patched.contains("local_1a8 [16];"), "{patched}");
+    }
+
+    /// The same missing-receiver recovery `c_str()` gets, generalized: a
+    /// bare `str()` on the body's own single `basic_stringstream` local.
+    #[test]
+    fn a_bare_stringstream_str_call_is_given_the_bodys_own_local_name() {
+        let text = "basic_stringstream<char,std::char_traits<char>,std::allocator<char>> local_1a8 [16]; x = std::__cxx11::basic_stringstream<char,std::char_traits<char>,std::allocator<char>>::str();";
+        let patched = patch_known_idioms(text);
+        assert!(patched.contains("local_1a8->str()"), "{patched}");
+    }
+
+    #[test]
+    fn a_stringstream_destructor_call_becomes_real_member_call_syntax() {
+        let text = "std::__cxx11::basic_stringstream<char,std::char_traits<char>,std::allocator<char>>::\n  ~basic_stringstream(local_1a8);";
+        let patched = patch_known_idioms(text);
+        assert_eq!(patched, "local_1a8->~basic_stringstream();");
     }
 
     /// PROJECT.md M18: `TTF_RenderText_Solid`'s real third parameter is

@@ -37,6 +37,19 @@ pub struct RecoveredSymbol {
     /// such argument; always 1 for Destructor, which the language
     /// guarantees takes no parameters of its own).
     pub expected_args: usize,
+    /// Each declared parameter's own type (FreeFunction only; empty for
+    /// Method/Constructor/Destructor, whose receiver is already cast
+    /// separately and whose remaining parameters haven't shown this
+    /// problem in practice). PROJECT.md M18: a real compile found two
+    /// *different* Ghidra-inferred types for what's really the same
+    /// pointer value at two different observation points -- a local
+    /// declared `void **local_30;` at its own call site, passed straight
+    /// into a callee whose own recovered signature says `undefined8
+    /// *param_1`. C++ doesn't implicitly convert between unrelated
+    /// pointer types, so the call site needs its own explicit cast to
+    /// the callee's declared type, the same principle this module
+    /// already applies to a method call's own receiver.
+    pub param_types: Vec<String>,
 }
 
 /// Counts a recovered signature's own parameters -- `""`/`"void"` mean
@@ -51,6 +64,30 @@ fn count_params(params: &str) -> usize {
         0
     } else {
         trimmed.split(',').count()
+    }
+}
+
+/// One declared parameter's own type -- everything before its trailing
+/// identifier, the same split `extract.rs`'s `strip_receiver_param`
+/// already uses for the same shape of text (`TYPE *name`, `TYPE name`).
+/// Empty when nothing looks like a real trailing name at all (defensive;
+/// not expected against real Ghidra-shaped signatures).
+fn param_type(param: &str) -> String {
+    let trimmed = param.trim();
+    match trimmed.rsplit(|c: char| c == ' ' || c == '*').find(|s| !s.is_empty()) {
+        Some(name) if name.len() < trimmed.len() => trimmed[..trimmed.len() - name.len()].trim_end().to_string(),
+        _ => String::new(),
+    }
+}
+
+/// Every declared parameter's own type, in order -- `""`/`"void"` mean
+/// none, matching `count_params`'s own convention.
+fn param_types(params: &str) -> Vec<String> {
+    let trimmed = params.trim();
+    if trimmed.is_empty() || trimmed == "void" {
+        Vec::new()
+    } else {
+        trimmed.split(',').map(param_type).collect()
     }
 }
 
@@ -86,7 +123,7 @@ pub fn build_symbol_table(classes: &[RecoveredClass], functions: &[RecoveredFunc
             let expected_args = if m.is_destructor { 1 } else { count_params(&m.params) + 1 };
             table.insert(
                 m.address.clone(),
-                RecoveredSymbol { kind, owner: class.name.clone(), display_name, expected_args },
+                RecoveredSymbol { kind, owner: class.name.clone(), display_name, expected_args, param_types: Vec::new() },
             );
         }
     }
@@ -98,6 +135,7 @@ pub fn build_symbol_table(classes: &[RecoveredClass], functions: &[RecoveredFunc
                 owner: String::new(),
                 display_name: f.display_name.clone(),
                 expected_args: count_params(&f.params),
+                param_types: param_types(&f.params),
             },
         );
     }
@@ -268,7 +306,23 @@ pub fn rewrite_call_sites(text: &str, table: &SymbolTable, unresolved: &mut BTre
                 SymbolKind::FreeFunction => {
                     out.push_str(&sym.display_name);
                     out.push('(');
-                    out.push_str(&args.join(","));
+                    // Cast each argument to the callee's own declared
+                    // parameter type -- see `RecoveredSymbol::param_types`.
+                    // A redundant cast to an argument's own already-
+                    // correct type is inert; the only reason this always
+                    // runs is that Ghidra assigning two different types to
+                    // "the same" pointer at two different observation
+                    // points can't be told apart from an already-matching
+                    // one by comparing type text alone (formatting varies).
+                    let casted: Vec<String> = args
+                        .iter()
+                        .enumerate()
+                        .map(|(i, a)| match sym.param_types.get(i) {
+                            Some(ty) if !ty.is_empty() => format!("({ty})({a})"),
+                            _ => a.clone(),
+                        })
+                        .collect();
+                    out.push_str(&casted.join(","));
                     out.push(')');
                 }
                 SymbolKind::Method => {
@@ -387,6 +441,32 @@ mod tests {
 
         let rewritten = rewrite_call_sites("x = FUN_4(a,b);", &table, &mut unresolved);
         assert_eq!(rewritten, "x = calculateOffset(a,b);");
+    }
+
+    /// PROJECT.md M18: a real compile found two different Ghidra-inferred
+    /// types for the same pointer value at two different observation
+    /// points -- a caller's own local declared `void **local_30;`, passed
+    /// to a callee whose own recovered signature says `undefined8
+    /// *param_1`. C++ doesn't implicitly convert between unrelated
+    /// pointer types; an explicit cast to the callee's own declared type
+    /// is what a real compile confirmed fixes it.
+    #[test]
+    fn a_free_function_calls_own_arguments_are_cast_to_the_callees_declared_parameter_types() {
+        let functions = vec![RecoveredFunction {
+            address: "0x4".to_string(),
+            raw_name: "FUN_4".to_string(),
+            display_name: "FUN_4".to_string(),
+            name_source: NameSource::Raw,
+            return_type: "undefined".to_string(),
+            params: "undefined8 *param_1".to_string(),
+            decompilation: String::new(),
+        }];
+        let table = build_symbol_table(&[], &functions);
+        let mut unresolved = BTreeSet::new();
+
+        let rewritten = rewrite_call_sites("FUN_4(local_30);", &table, &mut unresolved);
+
+        assert_eq!(rewritten, "FUN_4((undefined8 *)(local_30));");
     }
 
     #[test]

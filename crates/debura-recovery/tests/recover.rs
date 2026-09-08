@@ -907,6 +907,33 @@ fn ghidra_data_symbols_are_collected_and_declared() {
     );
 }
 
+/// PROJECT.md M18: `_initterm`/`_ismbblead` are real, statically-linked
+/// MinGW CRT functions Ghidra's own decompiler calls by their real,
+/// recognized name -- never a `FUN_<addr>` placeholder, so `symtab.rs`'s
+/// own unresolved-call tracking never sees them. A real compile found
+/// them simply undeclared once a `RequiredUnknown` function that
+/// genuinely calls them got recovered for the first time.
+#[test]
+fn known_crt_functions_called_by_real_name_get_a_permissive_fallback_declaration() {
+    let mut graph = KnowledgeGraph::new();
+    graph.add_observation("0x1", "has_name", "FUN_1", 0.95, "ghidra:function", None);
+    graph.add_observation(
+        "0x1",
+        "decompiles_to",
+        "void FUN_1(void)\n\n{\n  _initterm(PTR_DAT_1,PTR_DAT_2);\n  return;\n}",
+        0.95,
+        "ghidra:decompiler",
+        None,
+    );
+    anchor_as_application(&mut graph, "0x1", "0x100");
+
+    let program = extract(&graph);
+
+    assert!(program.unresolved_calls.contains(&"_initterm".to_string()), "{:?}", program.unresolved_calls);
+    let header = render_ghidra_symbols_header(&program.ghidra_data_symbols, &program.unresolved_calls, "");
+    assert!(header.contains("long long _initterm(...);"), "header:\n{header}");
+}
+
 /// A real run showed `&LAB_x` isn't a goto target at all -- it's a
 /// MinGW CRT startup idiom taking a label's *address* as a function
 /// pointer value (`(_invalid_parameter_handler)&LAB_140001000`). Handled

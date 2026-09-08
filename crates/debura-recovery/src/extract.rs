@@ -447,6 +447,25 @@ fn ghidra_intrinsic_tokens(text: &str) -> impl Iterator<Item = &str> {
     })
 }
 
+/// Real, well-known MinGW CRT function names Ghidra's own decompiler
+/// calls by their real, recognized name (never a `FUN_<addr>` placeholder
+/// -- so `symtab.rs`'s own unresolved-call tracking, which only watches
+/// for that specific shape, never sees them) but which this project
+/// doesn't otherwise declare anywhere. A real compile found exactly these
+/// two, both genuine, statically-linked CRT internals (`_initterm` runs
+/// registered static-initializer function-pointer arrays; `_ismbblead`
+/// classifies a multi-byte character's lead byte) -- not application
+/// code Debura should ever try to recover a body for, just a name that
+/// needs *some* declaration so the call site that already, correctly,
+/// names them at least parses. Declared the same permissive, fully
+/// variadic way `unresolved_calls` already are (PROJECT.md M15): a real
+/// but generic prototype, not a guessed exact signature.
+const KNOWN_UNDECLARED_CRT_FUNCTIONS: &[&str] = &["_initterm", "_ismbblead"];
+
+fn crt_function_call_tokens(text: &str) -> impl Iterator<Item = &str> {
+    identifier_tokens(text).filter(|token| KNOWN_UNDECLARED_CRT_FUNCTIONS.contains(token))
+}
+
 /// Every other known class name `class` mentions in its own
 /// methods'/fields' signatures -- what needs its own `#include` beyond
 /// `class.base` (handled separately, since that relationship also needs
@@ -746,6 +765,17 @@ pub fn extract(graph: &KnowledgeGraph) -> RecoveredProgram {
     }
     for f in &mut functions {
         f.decompilation = rewrite_body_only(&f.decompilation, &symbol_table, &mut unresolved_calls);
+    }
+    // Real, recognized-by-name CRT calls never go through the FUN_<addr>
+    // resolution pass above at all, so they need their own scan to reach
+    // the same permissive-fallback-declaration treatment.
+    for class in &classes {
+        for m in &class.methods {
+            unresolved_calls.extend(crt_function_call_tokens(&m.decompilation).map(str::to_string));
+        }
+    }
+    for f in &functions {
+        unresolved_calls.extend(crt_function_call_tokens(&f.decompilation).map(str::to_string));
     }
 
     for class in &mut classes {
