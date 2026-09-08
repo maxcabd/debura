@@ -187,22 +187,40 @@ impl AgentProvider for OpenAiProvider {
             everything else. Prefer it unless this subject's own body, callers, or fields \
             actively contradict it. \
             \n\n\
-            The \"Call-sequence context\" section shows the nearest labeled call before and after \
-            this subject's own call site, inside each caller's own call sequence -- \"nearest\" \
-            meaning the search walks outward past unlabeled calls to find one, so it may be more \
-            than one call away; the reported distance tells you how far. This is real evidence \
-            about the subject's PURPOSE, not just its mechanics, even when nothing dispatches to \
-            it polymorphically: a subject called between something a few calls before labeled \
-            \"semantic_role: clearsScreen\" and something a few calls after labeled \
-            \"semantic_role: updatesScreen\", every frame, is doing the render step regardless of \
-            what its own body's loop and arithmetic look like in isolation -- propose a \
-            semantic_role at that level (e.g. \"draw\"), not a restatement of the loop itself \
-            (e.g. \"populateCells\", \"iteratesGrid\"), when the surrounding calls support it. \
-            Weigh distance: immediately-adjacent evidence is stronger than evidence several calls \
-            away, and several unrelated intervening calls should make you more cautious, not less. \
-            The reverse also holds: don't manufacture this kind of role if the neighbors are \
-            unlabeled or unrelated -- an empty or uninformative call-sequence section is not \
-            itself evidence of anything.";
+            Two more evidence sections work together and neither depends on any neighbor having \
+            an ACCEPTED name -- that dependency is exactly what made an earlier version of this \
+            context miss real signal, when the neighbor that would have supplied it (a screen- \
+            clear or screen-update function) never itself got accepted. \
+            \n\n\
+            \"API names reachable from this subject's own callee tree\" lists real, \
+            already-resolved names found by walking this subject's OWN calls -- Ghidra resolves \
+            calls into imported/library functions to their real names even in a fully stripped \
+            binary, so a subject that itself calls, say, an SDL render/texture function carries \
+            that evidence directly, with no hypothesis or acceptance needed at all. Treat this as \
+            strong, direct evidence of purpose. \
+            \n\n\
+            \"Call-sequence context\" lists EVERY nearby call in each direction (not just the \
+            first one with an accepted name), each with whatever raw evidence exists for it: an \
+            accepted label if one exists, a raw (possibly never-accepted) mechanical_behavior \
+            value, and/or its own reachable API names. Reason about this the way a person reading \
+            the same decompilation would: look at the ensemble of these raw facts across the \
+            whole cluster to infer what shared purpose (a rendering step, an input/update tick, a \
+            collision check, initialization, cleanup) the cluster represents, THEN use that \
+            inferred purpose -- combined with this subject's own mechanical_behavior -- to propose \
+            a semantic_role at that level, not a restatement of this subject's own loop or \
+            arithmetic. Worked example from a real case: a subject that itself only \
+            \"iteratesOverSections\" sits between a neighbor whose reachable API names include \
+            something memset-shaped (a buffer clear) and a neighbor whose reachable API names \
+            include SDL render/texture calls -- that ensemble supports inferring a shared \
+            rendering-phase purpose for the whole cluster, and thus a semantic_role like \"draw\" \
+            for this subject, even though nothing in the cluster ever earned its own accepted \
+            name and this subject's own body never mentions a single SDL call. Weigh distance: \
+            closer calls carry more weight, and a cluster with mixed, unrelated-looking neighbors \
+            should make you more cautious, not less. The reverse also holds just as firmly: don't \
+            manufacture a phase-level role when the ensemble is genuinely uninformative or \
+            unrelated -- empty or generic evidence here is not itself evidence of anything, and \
+            omitting semantic_role is still the honest choice when the ensemble doesn't actually \
+            support one.";
 
         let user = render_analyze_function_task(task);
         let value = self.complete(
@@ -276,22 +294,40 @@ impl AgentProvider for OpenAiProvider {
             against everything else. Prefer it unless that subject's own body, callers, or \
             fields actively contradict it. \
             \n\n\
-            Each subject's \"Call-sequence context\" section shows the nearest labeled call before \
-            and after its own call site, inside each caller's own call sequence -- \"nearest\" \
-            meaning the search walks outward past unlabeled calls to find one, so it may be more \
-            than one call away; the reported distance tells you how far. This is real evidence \
-            about that subject's PURPOSE, not just its mechanics, even when nothing dispatches to \
-            it polymorphically: a subject called between something a few calls before labeled \
-            \"semantic_role: clearsScreen\" and something a few calls after labeled \
-            \"semantic_role: updatesScreen\", every frame, is doing the render step regardless of \
-            what its own body's loop and arithmetic look like in isolation -- propose a \
-            semantic_role at that level (e.g. \"draw\"), not a restatement of the loop itself \
-            (e.g. \"populateCells\", \"iteratesGrid\"), when the surrounding calls support it. \
-            Weigh distance: immediately-adjacent evidence is stronger than evidence several calls \
-            away, and several unrelated intervening calls should make you more cautious, not less. \
-            The reverse also holds: don't manufacture this kind of role if a subject's neighbors \
-            are unlabeled or unrelated -- an empty or uninformative call-sequence section is not \
-            itself evidence of anything. \
+            Two more evidence sections work together for each subject and neither depends on any \
+            neighbor having an ACCEPTED name -- that dependency is exactly what made an earlier \
+            version of this context miss real signal, when the neighbor that would have supplied \
+            it (a screen-clear or screen-update function) never itself got accepted. \
+            \n\n\
+            \"API names reachable from this subject's own callee tree\" lists real, \
+            already-resolved names found by walking that subject's OWN calls -- Ghidra resolves \
+            calls into imported/library functions to their real names even in a fully stripped \
+            binary, so a subject that itself calls, say, an SDL render/texture function carries \
+            that evidence directly, with no hypothesis or acceptance needed at all. Treat this as \
+            strong, direct evidence of purpose. \
+            \n\n\
+            Each subject's \"Call-sequence context\" lists EVERY nearby call in each direction \
+            (not just the first one with an accepted name), each with whatever raw evidence \
+            exists for it: an accepted label if one exists, a raw (possibly never-accepted) \
+            mechanical_behavior value, and/or its own reachable API names. Reason about this the \
+            way a person reading the same decompilation would: look at the ensemble of these raw \
+            facts across the whole cluster to infer what shared purpose (a rendering step, an \
+            input/update tick, a collision check, initialization, cleanup) the cluster represents, \
+            THEN use that inferred purpose -- combined with the subject's own mechanical_behavior \
+            -- to propose a semantic_role at that level, not a restatement of the subject's own \
+            loop or arithmetic. Worked example from a real case: a subject that itself only \
+            \"iteratesOverSections\" sits between a neighbor whose reachable API names include \
+            something memset-shaped (a buffer clear) and a neighbor whose reachable API names \
+            include SDL render/texture calls -- that ensemble supports inferring a shared \
+            rendering-phase purpose for the whole cluster, and thus a semantic_role like \"draw\" \
+            for that subject, even though nothing in the cluster ever earned its own accepted name \
+            and the subject's own body never mentions a single SDL call. Weigh distance: closer \
+            calls carry more weight, and a cluster with mixed, unrelated-looking neighbors should \
+            make you more cautious, not less. The reverse also holds just as firmly: don't \
+            manufacture a phase-level role when the ensemble is genuinely uninformative or \
+            unrelated -- empty or generic evidence here is not itself evidence of anything, and \
+            omitting semantic_role is still the honest choice when the ensemble doesn't actually \
+            support one. \
             \n\n\
             Return exactly one result per subject listed below, \
             each carrying that subject's own address back so results can be matched up -- order \
@@ -504,6 +540,21 @@ const CHALLENGE_SYSTEM: &str = "You are Debura's ChallengeHypothesis adversarial
     doesn't hold here (a body, caller, or field pattern that contradicts it), not for the \
     analogy's mere existence. \
     \n\n\
+    A semantic_role can also be justified by a phase-level inference from the \"API names \
+    reachable from this subject's own callee tree\" and \"Call-sequence context\" sections below, \
+    rather than from this subject's own body alone or from any single neighbor's own ACCEPTED \
+    name -- e.g. \"draw\" for a subject that only mechanically iterates something, justified by a \
+    caller-sequence neighbor's reachable SDL render calls and another neighbor's memset-shaped \
+    buffer clear. Don't reject this kind of claim merely for not being independently re-derived \
+    from the subject's own body, or for citing a neighbor that itself has no ACCEPTED name -- \
+    that's the evidence working as intended, not a weakness. Instead, actually check the cited \
+    ensemble yourself in those two sections: does it genuinely support the claimed phase (real, \
+    specific reachable names or mechanical_behavior values pointing the same direction), or is the \
+    claim overstated relative to what's actually there (vague, sparse, or contradictory evidence \
+    dressed up as a confident phase inference)? Treat a phase-inferred role that isn't actually \
+    backed by the sections below as exactly the same kind of unsupported guess as one based on \
+    nothing at all. \
+    \n\n\
     If the hypothesis under review has the predicate \"semantic_role\" (not \
     \"mechanical_behavior\" -- that one is expected to describe the body's own mechanics and \
     isn't held to this bar), ask specifically: could this be describing only one internal side \
@@ -609,31 +660,51 @@ fn render_analyze_function_task(task: &AnalyzeFunctionTask) -> String {
         }
     }
 
-    out.push_str("\nCall-sequence context:\n");
+    out.push_str("\nAPI names reachable from this subject's own callee tree (real, already-resolved names, possibly several calls deep -- no accepted hypothesis needed to see these):\n");
+    if task.reachable_api_hints.is_empty() {
+        out.push_str("(none found)\n");
+    } else {
+        out.push_str(&format!("{}\n", task.reachable_api_hints.join(", ")));
+    }
+
+    out.push_str("\nCall-sequence context (raw evidence about each nearby call, not just ones with an accepted name):\n");
     if task.call_sequence.is_empty() {
         out.push_str("(no recorded caller, or no decompiled body for its caller)\n");
     }
     for neighbor in &task.call_sequence {
-        let describe = |c: &crate::call_context::SequencedCall| {
-            let position = if c.distance == 1 {
-                "immediately".to_string()
-            } else {
-                format!("{} calls", c.distance)
-            };
-            match &c.best_known_label {
-                Some(label) => format!("{position} away: {} ({label})", c.address),
-                None => format!("{position} away: {} (unlabeled)", c.address),
-            }
-        };
-        out.push_str(&format!(
-            "- inside caller {}: before it, {}; after it, {}\n",
-            neighbor.caller,
-            neighbor.before.as_ref().map(describe).unwrap_or_else(|| "nothing -- first call in this caller".to_string()),
-            neighbor.after.as_ref().map(describe).unwrap_or_else(|| "nothing -- last call in this caller".to_string()),
-        ));
+        out.push_str(&format!("- inside caller {}:\n", neighbor.caller));
+        render_sequenced_calls(&mut out, "before it", &neighbor.before);
+        render_sequenced_calls(&mut out, "after it", &neighbor.after);
     }
 
     out
+}
+
+fn render_sequenced_calls(out: &mut String, label: &str, calls: &[crate::call_context::SequencedCall]) {
+    if calls.is_empty() {
+        out.push_str(&format!("    {label}: nothing -- edge of this caller's call sequence\n"));
+        return;
+    }
+    for c in calls {
+        let position = if c.distance == 1 {
+            "immediately".to_string()
+        } else {
+            format!("{} calls", c.distance)
+        };
+        out.push_str(&format!("    {label}, {position} away: {}\n", c.address));
+        if let Some(label) = &c.best_known_label {
+            out.push_str(&format!("        accepted: {label}\n"));
+        }
+        if let Some(mech) = &c.raw_mechanical_behavior {
+            out.push_str(&format!("        mechanical_behavior (any status, unverified): {mech}\n"));
+        }
+        if !c.reachable_api_hints.is_empty() {
+            out.push_str(&format!(
+                "        reachable API names: {}\n",
+                c.reachable_api_hints.join(", ")
+            ));
+        }
+    }
 }
 
 fn render_challenge_batch(tasks: &[ChallengeHypothesisTask]) -> String {
@@ -665,6 +736,23 @@ fn render_challenge_task(task: &ChallengeHypothesisTask) -> String {
             "- {} {} = {} (confidence {:.2})\n",
             o.subject, o.predicate, o.value, o.confidence
         ));
+    }
+
+    out.push_str("\nAPI names reachable from this subject's own callee tree:\n");
+    if task.reachable_api_hints.is_empty() {
+        out.push_str("(none found)\n");
+    } else {
+        out.push_str(&format!("{}\n", task.reachable_api_hints.join(", ")));
+    }
+
+    out.push_str("\nCall-sequence context (the same raw ensemble AnalyzeFunction saw, if this claim cites it):\n");
+    if task.call_sequence.is_empty() {
+        out.push_str("(no recorded caller, or no decompiled body for its caller)\n");
+    }
+    for neighbor in &task.call_sequence {
+        out.push_str(&format!("- inside caller {}:\n", neighbor.caller));
+        render_sequenced_calls(&mut out, "before it", &neighbor.before);
+        render_sequenced_calls(&mut out, "after it", &neighbor.after);
     }
 
     out

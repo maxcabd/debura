@@ -33,6 +33,14 @@ pub struct AnalyzeFunctionTask {
     /// context a human would use to place these calls in the render step
     /// rather than naming only their own internal mechanism.
     pub call_sequence: Vec<CallSequenceNeighbor>,
+    /// PROJECT.md M17: real names reachable from this subject's *own*
+    /// callee tree -- needs no caller-sequence context at all. Grounded
+    /// against the real Snake source: `Screen::update`'s own decompiled
+    /// body already calls `SDL_RenderClear`/`SDL_RenderPresent` by their
+    /// real, already-resolved names, one hop into its own callees, even
+    /// in a fully stripped binary -- a signal this task simply never
+    /// surfaced before.
+    pub reachable_api_hints: Vec<String>,
 }
 
 impl AnalyzeFunctionTask {
@@ -77,6 +85,7 @@ impl AnalyzeFunctionTask {
             existing_hypotheses,
             rejection_reasons,
             call_sequence: call_context::call_sequence_neighbors(graph, subject),
+            reachable_api_hints: call_context::reachable_api_hints(graph, subject),
         }
     }
 }

@@ -1,6 +1,7 @@
 use debura_knowledge::{Evidence, Hypothesis, KnowledgeGraph, Observation};
 use serde::{Deserialize, Serialize};
 
+use crate::call_context::{self, CallSequenceNeighbor};
 use crate::evidence_view;
 use crate::result::ProposedHypothesis;
 
@@ -14,6 +15,15 @@ pub struct ChallengeHypothesisTask {
     pub hypothesis: Hypothesis,
     pub supporting_evidence: Vec<(Evidence, Observation)>,
     pub other_observations: Vec<Observation>,
+    /// PROJECT.md M17: the same raw ensemble evidence (caller-sequence
+    /// neighbors' mechanics/reachable API names, this subject's own
+    /// reachable API names) AnalyzeFunction saw -- without this, a
+    /// challenge on a phase-inferred semantic_role would only ever see the
+    /// hypothesis's own text and this subject's own observations, with no
+    /// way to judge whether the ensemble it cites actually supports it or
+    /// was overstated.
+    pub call_sequence: Vec<CallSequenceNeighbor>,
+    pub reachable_api_hints: Vec<String>,
 }
 
 impl ChallengeHypothesisTask {
@@ -31,6 +41,8 @@ impl ChallengeHypothesisTask {
                 .filter(|o| o.predicate != "agent_flagged_contradiction")
                 .cloned()
                 .collect(),
+            call_sequence: call_context::call_sequence_neighbors(graph, &hypothesis.subject),
+            reachable_api_hints: call_context::reachable_api_hints(graph, &hypothesis.subject),
             hypothesis: hypothesis.clone(),
         }
     }
