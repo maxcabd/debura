@@ -28,13 +28,32 @@ pub enum RecoveryDisposition {
     /// of. Recover it under its raw `FUN_<addr>` name; don't hold source
     /// completeness hostage to a semantic question M17 may never answer.
     RequiredUnknown,
-    /// Reachable, `Provenance::LibraryOrRuntime`, and resolves (directly
-    /// or through a thunk chain) to a real binary import -- needs a real
-    /// external library mapping, not AI-recovered application code.
+    /// Reachable, `Provenance::LibraryOrRuntime`, but with a real
+    /// (non-degenerate) decompiled body of its own -- statically-linked
+    /// runtime/CRT support code (an SDL event-poll loop, a VirtualProtect
+    /// table walk, an argv-duplication helper, `operator new[]`'s
+    /// overflow-length check) that just isn't application-owned. A real
+    /// linker frontier found 9 of 10 remaining library/runtime-provenance
+    /// unresolved symbols were exactly this shape, not bare thunks --
+    /// checked directly against each one's own decompiled text, not
+    /// assumed. `LibraryOrRuntime` governs semantic ownership (never
+    /// treat this as game logic, never give it a semantic name); it does
+    /// not mean "never emit source" -- that's `has_recoverable_body`'s
+    /// question, the same body-recovery machinery `RequiredUnknown`
+    /// already uses, extended here to a provenance this project's own
+    /// M17 gate correctly keeps from ever claiming Application meaning
+    /// for. Recovered under its raw `FUN_<addr>` name unconditionally
+    /// (no semantic_role can ever attach to non-Application provenance in
+    /// the first place, so there's nothing to fall back from).
+    RequiredRuntimeBody,
+    /// Reachable, `Provenance::LibraryOrRuntime`, with no recoverable
+    /// body of its own, and resolves (directly or through a thunk chain)
+    /// to a real binary import -- needs a real external library mapping
+    /// or thunk canonicalization, not AI-recovered application code (and
+    /// nothing to recover a body from even if it were wanted).
     ExternalLibrary,
-    /// Reachable, `Provenance::LibraryOrRuntime`, with no import anywhere
-    /// in its thunk chain -- statically-linked compiler/CRT support code
-    /// (allocator internals, runtime relocation, STL glue). Needs a real
+    /// Reachable, `Provenance::LibraryOrRuntime`, with no recoverable
+    /// body and no import anywhere in its thunk chain -- needs a real
     /// runtime-support implementation or a compat shim, not recovery.
     CompilerRuntime,
     /// Not reachable from the real entrypoint at all -- dead code from
@@ -186,6 +205,7 @@ fn diagnose_one(
             Provenance::Application => RecoveryDisposition::RequiredApplication,
             Provenance::Unknown if has_recoverable_body => RecoveryDisposition::RequiredUnknown,
             Provenance::Unknown => RecoveryDisposition::Deferred,
+            Provenance::LibraryOrRuntime if has_recoverable_body => RecoveryDisposition::RequiredRuntimeBody,
             Provenance::LibraryOrRuntime => {
                 if resolves_to_a_real_import(graph, address, IMPORT_CHAIN_DEPTH) {
                     RecoveryDisposition::ExternalLibrary
@@ -263,6 +283,34 @@ mod tests {
 
         assert_eq!(entries[0].disposition, RecoveryDisposition::Deferred);
         assert!(!entries[0].has_recoverable_body);
+    }
+
+    /// PROJECT.md M18: a real linker frontier found 9 of 10 remaining
+    /// library/runtime unresolved symbols were substantive, real
+    /// decompiled bodies (an SDL event-poll loop, a VirtualProtect table
+    /// walk, ...), not bare thunks -- `LibraryOrRuntime` provenance
+    /// controls semantic ownership, not whether a body can be emitted.
+    #[test]
+    fn library_provenance_with_a_real_body_is_required_runtime_body_not_external_or_compiler() {
+        let mut graph = KnowledgeGraph::new();
+        graph.add_observation("0xentry", "calls", "0x1", 0.95, "ghidra:call_graph", None);
+        graph.add_observation("0x1", "calls", "0x2", 0.95, "ghidra:call_graph", None);
+        graph.add_observation("0x2", "imports", "SDL2.DLL!SDL_PollEvent", 1.0, "ghidra:imports", None);
+        graph.add_observation("0x1", "size_bytes", "190", 0.95, "ghidra:function", None);
+        graph.add_observation(
+            "0x1",
+            "decompiles_to",
+            "undefined4 FUN_1(void)\n\n{\n  int local_48 [5];\n  while (SDL_PollEvent(local_48) != 0) {}\n  return 0;\n}",
+            0.95,
+            "ghidra:decompiler",
+            None,
+        );
+
+        let entries = classify_recovery_disposition(&graph, &unresolved("0x1"), "0xentry");
+
+        assert_eq!(classify_provenance(&graph, "0x1"), Provenance::LibraryOrRuntime);
+        assert!(entries[0].has_recoverable_body);
+        assert_eq!(entries[0].disposition, RecoveryDisposition::RequiredRuntimeBody);
     }
 
     #[test]

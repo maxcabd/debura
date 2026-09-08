@@ -571,18 +571,52 @@ fn disambiguate_method_names(methods: &mut [RecoveredMethod]) {
 }
 
 /// Extracts everything Debura currently has grounds to recover (PROJECT.md
-/// M9): every class with a detected vtable (M7) *or* with at least one
-/// method/constructor/destructor of its own (a real class the binary
-/// defines, just not a polymorphic one -- `has_vtable_at` alone missed
-/// this: a real run had non-polymorphic classes referenced by name in an
-/// already-recovered class's method signatures, e.g. `Food::draw(Screen
-/// *)`, with `Screen` itself never declared anywhere in the output), and
-/// every standalone function with Application provenance and a real
-/// decompiled body -- an ACCEPTED semantic name (M5) decides what it's
-/// *called* (a pretty name, or else its raw `FUN_<addr>`), not *whether*
-/// it's recovered at all (PROJECT.md M18: source completeness must not
-/// depend on M17's semantic-naming success).
+/// M9). Equivalent to `extract_with_required_runtime_bodies(graph,
+/// &BTreeSet::new())` -- no `LibraryOrRuntime`-provenance address is ever
+/// swept in project-wide (see that function's own doc comment for why:
+/// `LibraryOrRuntime` is a positive claim of non-ownership, and nothing
+/// in the graph alone can tell "a real, small runtime helper this
+/// specific build's toolchain genuinely lacks" apart from "STL/CRT
+/// internals code the real toolchain already supplies for free" -- only
+/// an actual failed link can).
 pub fn extract(graph: &KnowledgeGraph) -> RecoveredProgram {
+    extract_impl(graph, &BTreeSet::new())
+}
+
+/// Same as `extract`, but additionally recovers any address in
+/// `required_runtime_bodies` that has a real (non-degenerate) decompiled
+/// body, regardless of its own provenance -- specifically for
+/// `Provenance::LibraryOrRuntime` addresses `RecoveryDisposition`
+/// (`disposition.rs`) found were both linker-required (a real link
+/// actually failed to resolve them) and structurally real (a real,
+/// checked-against-the-body `RequiredRuntimeBody`, not a bare thunk).
+///
+/// PROJECT.md M18: deliberately NOT folded into `extract`'s own default,
+/// project-wide sweep the way `RequiredUnknown` is. A real test proved
+/// why: `LibraryOrRuntime` provenance covers both "a real, small runtime
+/// helper this build's toolchain doesn't already supply" (the 9 real
+/// cases this was built for -- an SDL event-poll loop, a VirtualProtect
+/// table walk, ...) *and* "inlined STL/CRT-internal glue a normal g++
+/// build already links in for free" (`constructString`'s real fixture:
+/// dominated by `_M_create`/`_M_data`/... calls, itself library-dominated
+/// by callee composition) -- and nothing in the graph alone can tell
+/// those apart; both are real, non-degenerate, reachable bodies. The only
+/// signal that actually distinguishes them is whether a real link
+/// genuinely failed to resolve this exact address -- if the real
+/// toolchain's own runtime library already supplies it, it was never
+/// going to show up as an unresolved symbol at all. `required_runtime_bodies`
+/// is that real, external signal, computed by the caller (the CLI's
+/// `recover` command, when given a real linker log) from
+/// `RecoveryDisposition::RequiredRuntimeBody` entries -- never guessed at
+/// project-wide.
+pub fn extract_with_required_runtime_bodies(
+    graph: &KnowledgeGraph,
+    required_runtime_bodies: &BTreeSet<String>,
+) -> RecoveredProgram {
+    extract_impl(graph, required_runtime_bodies)
+}
+
+fn extract_impl(graph: &KnowledgeGraph, required_runtime_bodies: &BTreeSet<String>) -> RecoveredProgram {
     // PROJECT.md M15: a real run found libstdc++/CRT-internal classes
     // (`_Guard`, `_Vector_impl`, `__class_type_info`) getting the exact
     // same recovery treatment as real application classes -- rendered
@@ -657,14 +691,41 @@ pub fn extract(graph: &KnowledgeGraph) -> RecoveredProgram {
     // or a project state predating M7's entry extraction) -- in that
     // case, nothing new is included here, matching this code's own
     // pre-existing behavior exactly.
+    //
+    // A second real iteration on the same finding, and a real regression
+    // caught before shipping: recovering the 28 exposed 9 more unresolved
+    // symbols whose provenance genuinely is `LibraryOrRuntime` (an SDL
+    // event-poll loop, a VirtualProtect table walk, ...) with real,
+    // substantive bodies, not bare forwarding thunks. But sweeping *every*
+    // reachable `LibraryOrRuntime`-with-a-body address the same
+    // project-wide way `RequiredUnknown` does broke a real, pre-existing
+    // protection -- a test proved it: a `constructString`-shaped function
+    // (dominated by `_M_create`/`_M_data`/... calls, so classified
+    // `LibraryOrRuntime` the same as the 9 real cases) also has a real,
+    // non-degenerate body, and would get swept in the exact same way,
+    // recovering inlined STL glue a real g++ build already supplies for
+    // free -- exactly the M15 bug this whole provenance discipline exists
+    // to prevent. Nothing in the graph alone distinguishes "a real
+    // toolchain-missing runtime helper" from "STL/CRT internals the
+    // toolchain already links in" -- both are real, reachable,
+    // non-degenerate bodies. The only signal that actually tells them
+    // apart is whether a real link genuinely failed to resolve this exact
+    // address: `required_runtime_bodies` is that real, external signal
+    // (computed by the caller from an actual linker log's
+    // `RecoveryDisposition::RequiredRuntimeBody` entries), so a
+    // `LibraryOrRuntime` address is only ever included here when it's
+    // explicitly named, never by project-wide provenance/reachability
+    // alone the way `Provenance::Unknown` is.
     let entry = graph
         .observations()
         .find(|o| o.predicate == "exports" && o.value == "entry")
         .map(|o| o.subject.clone());
     let reachable = entry.as_deref().map(|e| crate::frontier::reachable_from(graph, e));
-    let is_required_unknown = |subject: &str| -> bool {
-        classify_provenance(graph, subject) == Provenance::Unknown
-            && reachable.as_ref().is_some_and(|r| r.contains(subject))
+    let is_reachable = |subject: &str| reachable.as_ref().is_some_and(|r| r.contains(subject));
+    let recoverable_by_disposition_alone = |subject: &str, provenance: Provenance, has_real_body: bool| -> bool {
+        has_real_body
+            && ((is_reachable(subject) && provenance == Provenance::Unknown)
+                || (provenance == Provenance::LibraryOrRuntime && required_runtime_bodies.contains(subject)))
     };
 
     for o in graph.observations().filter(|o| o.predicate == "has_name") {
@@ -674,7 +735,10 @@ pub fn extract(graph: &KnowledgeGraph) -> RecoveredProgram {
         let has_real_body = latest_decompilation(graph, &o.subject)
             .is_some_and(|d| !is_degenerate_decompilation(&d.value));
         let provenance = classify_provenance(graph, &o.subject);
-        if has_real_body && (provenance == Provenance::Application || is_required_unknown(&o.subject)) {
+        if has_real_body
+            && (provenance == Provenance::Application
+                || recoverable_by_disposition_alone(&o.subject, provenance, has_real_body))
+        {
             subjects.insert(o.subject.clone());
         }
     }
@@ -684,7 +748,12 @@ pub fn extract(graph: &KnowledgeGraph) -> RecoveredProgram {
         if class_method_addresses.contains(&subject) {
             continue; // already represented as a class method
         }
-        if classify_provenance(graph, &subject) != Provenance::Application && !is_required_unknown(&subject) {
+        let provenance = classify_provenance(graph, &subject);
+        let has_real_body = latest_decompilation(graph, &subject)
+            .is_some_and(|d| !is_degenerate_decompilation(&d.value));
+        if provenance != Provenance::Application
+            && !recoverable_by_disposition_alone(&subject, provenance, has_real_body)
+        {
             // Same reasoning as the class-name filter above, extended to
             // the harder case: a standalone function whose own name
             // looks like application code, but whose behavior is really
@@ -694,10 +763,10 @@ pub fn extract(graph: &KnowledgeGraph) -> RecoveredProgram {
             // `_M_capacity`/`_M_set_length`) doesn't need recovering
             // either -- a real g++ build already supplies whatever
             // std::string itself does. A subject accepted (or added by
-            // the RequiredUnknown path above) before this specific check
-            // -- an older project re-recovered, or reachability changed
-            // -- still isn't rendered under a name/existence nothing
-            // currently confirms is safe to apply.
+            // the RequiredUnknown/RequiredRuntimeBody paths above) before
+            // this specific check -- an older project re-recovered, or
+            // reachability changed -- still isn't rendered under a
+            // name/existence nothing currently confirms is safe to apply.
             continue;
         }
         let Some(raw_name) = latest(graph, &subject, "has_name").map(|o| o.value.clone()) else {

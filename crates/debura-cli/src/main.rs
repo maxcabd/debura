@@ -618,6 +618,7 @@ fn main() -> Result<()> {
                 let tag = match e.disposition {
                     debura_recovery::RecoveryDisposition::RequiredApplication => "RequiredApplication",
                     debura_recovery::RecoveryDisposition::RequiredUnknown => "RequiredUnknown",
+                    debura_recovery::RecoveryDisposition::RequiredRuntimeBody => "RequiredRuntimeBody",
                     debura_recovery::RecoveryDisposition::ExternalLibrary => "ExternalLibrary",
                     debura_recovery::RecoveryDisposition::CompilerRuntime => "CompilerRuntime",
                     debura_recovery::RecoveryDisposition::Unreachable => "Unreachable",
@@ -643,6 +644,7 @@ fn main() -> Result<()> {
             println!("\nSummary ({} total unresolved functions):", entries.len());
             println!("  RequiredApplication: {}", count(debura_recovery::RecoveryDisposition::RequiredApplication));
             println!("  RequiredUnknown:     {}", count(debura_recovery::RecoveryDisposition::RequiredUnknown));
+            println!("  RequiredRuntimeBody: {}", count(debura_recovery::RecoveryDisposition::RequiredRuntimeBody));
             println!("  ExternalLibrary:     {}", count(debura_recovery::RecoveryDisposition::ExternalLibrary));
             println!("  CompilerRuntime:     {}", count(debura_recovery::RecoveryDisposition::CompilerRuntime));
             println!("  Unreachable:         {}", count(debura_recovery::RecoveryDisposition::Unreachable));

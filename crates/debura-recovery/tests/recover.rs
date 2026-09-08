@@ -588,6 +588,68 @@ fn functions_dominated_by_library_callees_are_not_recovered_despite_an_applicati
     assert!(program.functions.is_empty(), "{:?}", program.functions);
 }
 
+/// PROJECT.md M18's `RequiredRuntimeBody` disposition must not undo
+/// this exact protection when the graph *does* have a real entry fact
+/// (the previous test's fixture has none, so it can't actually exercise
+/// the new sweep at all) -- a trivial, real (non-degenerate)
+/// STL-glue-shaped body is exactly the kind of "has a body" case that
+/// must stay excluded regardless of reachability.
+#[test]
+fn library_dominated_glue_is_still_excluded_even_when_reachable_from_a_real_entry() {
+    let mut graph = KnowledgeGraph::new();
+    graph.add_observation("0xentry", "exports", "entry", 0.95, "ghidra:exports", None);
+    graph.add_observation("0xentry", "calls", "0x1", 0.95, "ghidra:call_graph", None);
+    graph.add_observation("0x1", "has_name", "constructString", 0.95, "ghidra:function", None);
+    graph.add_observation("0x1", "has_signature", "void constructString(void)", 0.95, "ghidra:function", None);
+    graph.add_observation("0x1", "decompiles_to", "void constructString(void)\n\n{\n  return;\n}", 0.95, "ghidra:decompiler", None);
+    for callee in ["0x2", "0x3", "0x4", "0x5"] {
+        graph.add_observation("0x1", "calls", callee, 0.95, "ghidra:call_graph", None);
+    }
+    for (addr, name) in [
+        ("0x2", "_M_create"),
+        ("0x3", "_M_data"),
+        ("0x4", "_M_capacity"),
+        ("0x5", "_M_set_length"),
+    ] {
+        graph.add_observation(addr, "has_name", name, 0.95, "ghidra:function", None);
+    }
+
+    let program = extract(&graph);
+    assert!(program.functions.is_empty(), "{:?}", program.functions);
+}
+
+/// The positive side of the same finding: `extract_with_required_runtime_bodies`
+/// still recovers an explicitly-named `LibraryOrRuntime` address with a
+/// real body -- the 9 real cases (an SDL event-poll loop, a
+/// VirtualProtect table walk, ...) a real linker log's
+/// `RecoveryDisposition::RequiredRuntimeBody` entries name explicitly.
+#[test]
+fn an_explicitly_required_runtime_body_is_recovered_under_its_raw_name() {
+    let mut graph = KnowledgeGraph::new();
+    graph.add_observation("0xentry", "exports", "entry", 0.95, "ghidra:exports", None);
+    graph.add_observation("0xentry", "calls", "0x1", 0.95, "ghidra:call_graph", None);
+    graph.add_observation("0x1", "has_name", "FUN_1", 0.95, "ghidra:function", None);
+    graph.add_observation(
+        "0x1",
+        "decompiles_to",
+        "undefined4 FUN_1(void)\n\n{\n  int local_48 [5];\n  while (SDL_PollEvent(local_48) != 0) {}\n  return 0;\n}",
+        0.95,
+        "ghidra:decompiler",
+        None,
+    );
+    graph.add_observation("0x1", "calls", "0x2", 0.95, "ghidra:call_graph", None);
+    graph.add_observation("0x2", "imports", "SDL2.DLL!SDL_PollEvent", 1.0, "ghidra:imports", None);
+
+    let mut required = std::collections::BTreeSet::new();
+    required.insert("0x1".to_string());
+
+    let program = debura_recovery::extract_with_required_runtime_bodies(&graph, &required);
+
+    let f = program.functions.iter().find(|f| f.address == "0x1").expect("explicitly required runtime body recovered");
+    assert_eq!(f.display_name, "FUN_1");
+    assert!(matches!(f.name_source, NameSource::Raw));
+}
+
 /// A real run had two unrelated addresses independently earn the exact
 /// same generic name (`invokeFunction`) from a conservative
 /// mechanical-behavior-style guess -- both landing in `functions.cpp`'s
