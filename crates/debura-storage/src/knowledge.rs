@@ -12,7 +12,8 @@ use anyhow::{bail, Result};
 use chrono::{DateTime, Utc};
 use debura_knowledge::{
     Dependency, DependencyKind, Evidence, EvidenceId, Hypothesis, HypothesisId, HypothesisStatus,
-    Investigation, InvestigationId, KnowledgeGraph, Observation, ObservationId, RejectionReason,
+    Investigation, InvestigationId, KnowledgeGraph, Observation, ObservationId, ObservationStatus,
+    RejectionReason,
 };
 use rusqlite::{params, Connection};
 
@@ -27,8 +28,8 @@ pub fn save(conn: &Connection, graph: &KnowledgeGraph) -> Result<()> {
 
     for o in graph.observations() {
         tx.execute(
-            "INSERT INTO observations (id, subject, predicate, value, confidence, source, artifact, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO observations (id, subject, predicate, value, confidence, source, artifact, created_at, status, superseded_by)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 o.id.0,
                 o.subject,
@@ -38,6 +39,8 @@ pub fn save(conn: &Connection, graph: &KnowledgeGraph) -> Result<()> {
                 o.source,
                 o.artifact,
                 o.created_at.to_rfc3339(),
+                observation_status_to_str(o.status),
+                o.superseded_by.map(|id| id.0),
             ],
         )?;
     }
@@ -125,7 +128,7 @@ pub fn load(conn: &Connection) -> Result<KnowledgeGraph> {
     let mut graph = KnowledgeGraph::new();
 
     let mut stmt = conn.prepare(
-        "SELECT id, subject, predicate, value, confidence, source, artifact, created_at
+        "SELECT id, subject, predicate, value, confidence, source, artifact, created_at, status, superseded_by
          FROM observations",
     )?;
     let rows = stmt
@@ -139,10 +142,12 @@ pub fn load(conn: &Connection) -> Result<KnowledgeGraph> {
                 row.get::<_, String>(5)?,
                 row.get::<_, Option<String>>(6)?,
                 row.get::<_, String>(7)?,
+                row.get::<_, String>(8)?,
+                row.get::<_, Option<i64>>(9)?,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    for (id, subject, predicate, value, confidence, source, artifact, created_at) in rows {
+    for (id, subject, predicate, value, confidence, source, artifact, created_at, status, superseded_by) in rows {
         graph.insert_observation(Observation {
             id: ObservationId(id as u64),
             subject,
@@ -152,6 +157,8 @@ pub fn load(conn: &Connection) -> Result<KnowledgeGraph> {
             source,
             artifact,
             created_at: parse_dt(&created_at)?,
+            status: observation_status_from_str(&status)?,
+            superseded_by: superseded_by.map(|id| ObservationId(id as u64)),
         });
     }
 
@@ -382,6 +389,23 @@ fn status_from_str(s: &str) -> Result<HypothesisStatus> {
         "STALE" => HypothesisStatus::Stale,
         "REJECTED" => HypothesisStatus::Rejected,
         other => bail!("unknown hypothesis status in database: {other}"),
+    })
+}
+
+fn observation_status_to_str(status: ObservationStatus) -> &'static str {
+    match status {
+        ObservationStatus::Active => "ACTIVE",
+        ObservationStatus::Superseded => "SUPERSEDED",
+        ObservationStatus::Retracted => "RETRACTED",
+    }
+}
+
+fn observation_status_from_str(s: &str) -> Result<ObservationStatus> {
+    Ok(match s {
+        "ACTIVE" => ObservationStatus::Active,
+        "SUPERSEDED" => ObservationStatus::Superseded,
+        "RETRACTED" => ObservationStatus::Retracted,
+        other => bail!("unknown observation status in database: {other}"),
     })
 }
 

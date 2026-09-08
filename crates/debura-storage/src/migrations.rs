@@ -101,6 +101,13 @@ const MIGRATIONS: &[(&str, &str)] = &[
         ALTER TABLE hypotheses ADD COLUMN rejection_reason TEXT;
         "#,
     ),
+    (
+        "0006_observation_lifecycle",
+        r#"
+        ALTER TABLE observations ADD COLUMN status TEXT NOT NULL DEFAULT 'ACTIVE';
+        ALTER TABLE observations ADD COLUMN superseded_by INTEGER;
+        "#,
+    ),
 ];
 
 pub fn run(conn: &Connection) -> Result<()> {

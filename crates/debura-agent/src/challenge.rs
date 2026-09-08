@@ -35,8 +35,19 @@ impl ChallengeHypothesisTask {
             // `commit_contradiction`), unbounded and purely historical --
             // a fresh challenge needs the subject's real facts, not a
             // growing transcript of every previous verdict against it.
+            //
+            // Reads `active_observations()`, not `observations()`: a real
+            // run found a challenger re-rejecting a reconsidered hypothesis
+            // partly because it was still reading a `provenance_gate_rejected`
+            // observation as live evidence, even though a later observation
+            // on the same subject had already recorded that its premise no
+            // longer held (PROJECT.md M18 -- `reconsider_stale_provenance_rejections`
+            // now supersedes that old observation instead of leaving it to
+            // look current forever). Superseded/Retracted facts stay on the
+            // record for history; they just don't get to argue with fresh
+            // reasoning.
             other_observations: graph
-                .observations()
+                .active_observations()
                 .filter(|o| o.subject == hypothesis.subject)
                 .filter(|o| o.predicate != "agent_flagged_contradiction")
                 .cloned()

@@ -206,3 +206,42 @@ fn end_to_end_acceptance_requires_a_challenge() {
 
     assert_eq!(graph.hypothesis(h).unwrap().status, HypothesisStatus::Accepted);
 }
+
+/// PROJECT.md M18: a real run found a fresh challenge re-rejecting a
+/// reconsidered hypothesis partly because it was still reading a now-
+/// outdated observation as if it were current. A Superseded observation
+/// must stay on the record (for history/audit) but must not reach a fresh
+/// challenge's context as if it were live evidence.
+#[test]
+fn build_challenge_task_excludes_superseded_observations() {
+    let mut graph = KnowledgeGraph::new();
+    graph.add_observation("0x1", "is_method_of", "Wall", 0.95, "ghidra:function", None);
+    let old = graph.add_observation(
+        "0x1",
+        "provenance_gate_rejected",
+        "semantic_role 'renderFrame' rejected: subject's provenance is not Application",
+        0.5,
+        "debura:provenance_gate",
+        None,
+    );
+    let new = graph.add_observation(
+        "0x1",
+        "rejection_premise_invalidated",
+        "provenance now classifies as Application",
+        0.5,
+        "debura:premise_reconsideration",
+        None,
+    );
+    graph.supersede_observation(old, new).unwrap();
+
+    let h = graph.propose_hypothesis("0x1", "semantic_role", "renderFrame", 0.9, None);
+
+    let task = debura_verifier::build_challenge_task(&graph, h).unwrap();
+
+    assert!(
+        task.other_observations.iter().all(|o| o.id != old),
+        "superseded observation leaked into a fresh challenge's context: {:?}",
+        task.other_observations
+    );
+    assert!(task.other_observations.iter().any(|o| o.id == new));
+}

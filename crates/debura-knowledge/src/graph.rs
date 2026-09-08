@@ -8,7 +8,7 @@ use crate::evidence::Evidence;
 use crate::hypothesis::{Hypothesis, HypothesisStatus, RejectionReason};
 use crate::ids::{EvidenceId, HypothesisId, InvestigationId, ObservationId};
 use crate::investigation::Investigation;
-use crate::observation::Observation;
+use crate::observation::{Observation, ObservationStatus};
 use crate::program_model::ProgramModel;
 
 type Result<T> = std::result::Result<T, KnowledgeError>;
@@ -61,6 +61,8 @@ impl KnowledgeGraph {
                 source: source.into(),
                 artifact,
                 created_at: Utc::now(),
+                status: ObservationStatus::Active,
+                superseded_by: None,
             },
         );
         id
@@ -68,6 +70,43 @@ impl KnowledgeGraph {
 
     pub fn observation(&self, id: ObservationId) -> Option<&Observation> {
         self.observations.get(&id)
+    }
+
+    /// All observations, live evidence only -- excludes anything
+    /// `Superseded`/`Retracted` (PROJECT.md M18). This is what new
+    /// reasoning (e.g. `ChallengeHypothesisTask`'s context) should read by
+    /// default; `observations()` remains available for audit/history
+    /// views that genuinely want the full record.
+    pub fn active_observations(&self) -> impl Iterator<Item = &Observation> {
+        self.observations.values().filter(|o| o.status == ObservationStatus::Active)
+    }
+
+    /// Marks `old` as Superseded by `new`: a later fact corrects it, so it
+    /// stays on the record for history but stops being live evidence for
+    /// new reasoning (`active_observations`). Never deletes anything.
+    pub fn supersede_observation(&mut self, old: ObservationId, new: ObservationId) -> Result<()> {
+        if !self.observations.contains_key(&new) {
+            return Err(KnowledgeError::UnknownObservation(new));
+        }
+        let o = self
+            .observations
+            .get_mut(&old)
+            .ok_or(KnowledgeError::UnknownObservation(old))?;
+        o.status = ObservationStatus::Superseded;
+        o.superseded_by = Some(new);
+        Ok(())
+    }
+
+    /// Withdraws `id` outright (no replacement fact) -- e.g. a genuine
+    /// extraction error found later. Distinct from `supersede_observation`:
+    /// nothing corrects it, it's simply no longer treated as true.
+    pub fn retract_observation(&mut self, id: ObservationId) -> Result<()> {
+        let o = self
+            .observations
+            .get_mut(&id)
+            .ok_or(KnowledgeError::UnknownObservation(id))?;
+        o.status = ObservationStatus::Retracted;
+        Ok(())
     }
 
     // --- Evidence ----------------------------------------------------------

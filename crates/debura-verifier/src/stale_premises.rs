@@ -1,4 +1,7 @@
-use debura_knowledge::{classify_provenance, HypothesisId, HypothesisStatus, KnowledgeGraph, Provenance, RejectionReason};
+use debura_knowledge::{
+    classify_provenance, HypothesisId, HypothesisStatus, KnowledgeGraph, ObservationId, Provenance,
+    RejectionReason,
+};
 
 /// PROJECT.md M18: `reevaluate_hypothesis`'s provenance gate REJECTs a
 /// `semantic_role` hypothesis whenever `classify_provenance` says the
@@ -30,7 +33,7 @@ pub fn reconsider_stale_provenance_rejections(graph: &mut KnowledgeGraph) -> Vec
         .map(|h| (h.id, h.subject.clone(), h.value.clone()))
         .collect();
     for (id, subject, value) in unbackfilled {
-        if legacy_provenance_gate_rejection(graph, &subject, &value) {
+        if find_active_provenance_gate_rejection(graph, &subject, &value).is_some() {
             graph.backfill_rejection_reason(id, RejectionReason::ProvenanceNotApplication);
         }
     }
@@ -50,8 +53,8 @@ pub fn reconsider_stale_provenance_rejections(graph: &mut KnowledgeGraph) -> Vec
             continue;
         }
         if graph.reconsider_rejected(id, &RejectionReason::ProvenanceNotApplication) {
-            graph.add_observation(
-                subject,
+            let new_obs = graph.add_observation(
+                subject.clone(),
                 "rejection_premise_invalidated",
                 format!(
                     "semantic_role '{value}' was rejected when this subject's provenance \
@@ -62,24 +65,41 @@ pub fn reconsider_stale_provenance_rejections(graph: &mut KnowledgeGraph) -> Vec
                 "debura:premise_reconsideration",
                 None,
             );
+            // PROJECT.md M18: a real run found a fresh ChallengeHypothesis
+            // pass re-rejecting this hypothesis partly because it was
+            // still reading the old `provenance_gate_rejected` observation
+            // as live evidence. Superseding it (not deleting it -- it's
+            // still real history) is what keeps `active_observations()`
+            // from handing that stale premise to new reasoning as if it
+            // were still current.
+            if let Some(old_obs) = find_active_provenance_gate_rejection(graph, &subject, &value) {
+                let _ = graph.supersede_observation(old_obs, new_obs);
+            }
             reconsidered.push(id);
         }
     }
     reconsidered
 }
 
-/// Whether `reevaluate_hypothesis`'s provenance gate really did reject
-/// this exact `semantic_role` value on this exact subject, per its own
-/// prior `provenance_gate_rejected` observation -- the free-text record
-/// left behind before `RejectionReason` existed. Matches the literal
-/// message `reevaluate_hypothesis` writes, so a change to that wording
-/// would need a matching change here (same coupling `mechanical_shape`'s
-/// own text-matching checks already accept elsewhere in this crate).
-fn legacy_provenance_gate_rejection(graph: &KnowledgeGraph, subject: &str, value: &str) -> bool {
+/// The still-Active `provenance_gate_rejected` observation recording that
+/// `reevaluate_hypothesis`'s provenance gate rejected this exact
+/// `semantic_role` value on this exact subject, if one exists -- the
+/// free-text record left behind (a) before `RejectionReason` existed at
+/// all, or (b) by this very function on an earlier run, before it's
+/// superseded below. Matches the literal message `reevaluate_hypothesis`
+/// writes, so a change to that wording would need a matching change here
+/// (same coupling `mechanical_shape`'s own text-matching checks already
+/// accept elsewhere in this crate).
+fn find_active_provenance_gate_rejection(
+    graph: &KnowledgeGraph,
+    subject: &str,
+    value: &str,
+) -> Option<ObservationId> {
     let needle = format!("semantic_role '{value}' rejected: subject's provenance is not Application");
     graph
-        .observations()
-        .any(|o| o.subject == subject && o.predicate == "provenance_gate_rejected" && o.value == needle)
+        .active_observations()
+        .find(|o| o.subject == subject && o.predicate == "provenance_gate_rejected" && o.value == needle)
+        .map(|o| o.id)
 }
 
 #[cfg(test)]
@@ -139,6 +159,48 @@ mod tests {
         let h = graph.hypothesis(id).unwrap();
         assert_eq!(h.status, HypothesisStatus::Stale);
         assert_eq!(h.rejection_reason, None);
+    }
+
+    #[test]
+    fn reconsideration_supersedes_the_stale_observation_instead_of_leaving_it_live() {
+        use debura_knowledge::ObservationStatus;
+
+        let mut graph = KnowledgeGraph::new();
+        graph.add_observation("0x1", "has_name", "FUN_1", 0.95, "ghidra:function", None);
+        graph.add_observation(
+            "0x1",
+            "decompiles_to",
+            "void FUN_1(longlong param_1)\n\n{\n  *(int *)(param_1 + 4) = 0;\n  *(int *)(param_1 + 8) = 1;\n  FUN_2(*(void **)param_1);\n  return;\n}",
+            0.95,
+            "ghidra:decompiler",
+            None,
+        );
+        graph.add_observation("0x1", "calls", "0x2", 0.95, "ghidra:call_graph", None);
+        graph.add_observation("0x2", "imports", "SDL_DestroyWindow", 0.95, "ghidra:import", None);
+        let id = graph.propose_hypothesis("0x1", "semantic_role", "renderFrame", 0.9, None);
+        graph
+            .reject_with_reason(id, RejectionReason::ProvenanceNotApplication)
+            .unwrap();
+        let stale_obs_id = graph
+            .add_observation(
+                "0x1",
+                "provenance_gate_rejected",
+                "semantic_role 'renderFrame' rejected: subject's provenance is not Application",
+                0.5,
+                "debura:provenance_gate",
+                None,
+            );
+
+        reconsider_stale_provenance_rejections(&mut graph);
+
+        let stale_obs = graph.observation(stale_obs_id).unwrap();
+        assert_eq!(stale_obs.status, ObservationStatus::Superseded);
+        assert!(stale_obs.superseded_by.is_some());
+
+        // Still on the record for history -- `observations()` sees it --
+        // but no longer live evidence for new reasoning.
+        assert!(graph.observations().any(|o| o.id == stale_obs_id));
+        assert!(!graph.active_observations().any(|o| o.id == stale_obs_id));
     }
 
     #[test]

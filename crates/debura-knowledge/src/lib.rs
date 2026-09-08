@@ -26,5 +26,5 @@ pub use graph::KnowledgeGraph;
 pub use hypothesis::{Hypothesis, HypothesisStatus, RejectionReason};
 pub use ids::{EvidenceId, HypothesisId, InvestigationId, ObservationId};
 pub use investigation::Investigation;
-pub use observation::Observation;
+pub use observation::{Observation, ObservationStatus};
 pub use program_model::ProgramModel;
