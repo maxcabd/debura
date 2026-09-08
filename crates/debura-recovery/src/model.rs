@@ -36,6 +36,23 @@ pub struct RecoveredMethod {
     pub params: String,
     pub is_constructor: bool,
     pub is_destructor: bool,
+    /// A local-variable declaration to splice into the body's first
+    /// statement, re-binding a structurally-discovered method's own raw
+    /// receiver name (`param_1`, never recognized by Ghidra's own type
+    /// system as `this`) back to the real, implicit `this` -- `None` for
+    /// a method Ghidra did recognize (nothing to re-bind: the body's own
+    /// uses of the identifier `this` already resolve correctly once it's
+    /// dropped from the declared params) or a standalone function (no
+    /// receiver at all). Deliberately NOT already spliced into
+    /// `decompilation`: this text contains the literal keyword `this`,
+    /// and `render.rs`'s `patch_known_idioms` separately renames a
+    /// *different*, unrelated local variable Ghidra's decompiler
+    /// sometimes names that exact way (`rename_this_local_variable`) --
+    /// splicing this in before that rename ran corrupted this alias's
+    /// own use of the keyword right along with it (a real regression,
+    /// caught immediately by a real compile). `render.rs` inserts this
+    /// itself, after that rename has already run.
+    pub receiver_alias: Option<String>,
     /// Ghidra's decompiled body (PROJECT.md S31 doesn't specify how
     /// faithful the recovered body must be -- this is annotated decompiler
     /// output, not hand-lifted C++, and says so where it's rendered).

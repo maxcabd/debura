@@ -225,22 +225,12 @@ fn params_from_decompilation(decompilation: &str, is_method: bool) -> Option<(St
 /// that name in the body resolves exactly as it did when it was a real
 /// parameter -- the only thing that changed is where the value comes
 /// from.
+/// Not spliced into the method's own `decompilation` here -- see
+/// `build_method`'s own comment on `receiver_alias` for why `render.rs`
+/// has to be the one to insert this, after its own `patch_known_idioms`
+/// has already run.
 fn render_receiver_alias(alias: &ReceiverAlias) -> String {
     format!("\n  {} {} = ({}){};\n", alias.ty, alias.name, alias.ty, "this")
-}
-
-/// Splices `alias`'s declaration in as the first statement of
-/// `decompilation`'s own body (right after its opening `{`), leaving
-/// everything else -- including the header/signature line before it --
-/// untouched.
-fn splice_receiver_alias(decompilation: &str, alias: &ReceiverAlias) -> String {
-    match decompilation.find('{') {
-        Some(brace) => {
-            let (before, after) = decompilation.split_at(brace + 1);
-            format!("{before}{}{after}", render_receiver_alias(alias))
-        }
-        None => decompilation.to_string(),
-    }
 }
 
 /// Removes every `/* ... */` block from `text` -- just enough to keep
@@ -258,6 +248,21 @@ fn strip_c_comments(text: &str) -> String {
     }
     out.push_str(rest);
     out
+}
+
+/// Applies `symtab::rewrite_call_sites` to `decompilation`'s body only,
+/// leaving the header/signature line before it untouched -- see the
+/// M18 comment at this function's own call site in `extract()` for why
+/// that distinction matters (a method's own signature always contains a
+/// literal `FUN_<its own address>(`, which is not a call at all).
+fn rewrite_body_only(decompilation: &str, table: &crate::symtab::SymbolTable, unresolved: &mut BTreeSet<String>) -> String {
+    match decompilation.find('{') {
+        Some(brace) => {
+            let (header, body) = decompilation.split_at(brace);
+            format!("{header}{}", crate::symtab::rewrite_call_sites(body, table, unresolved))
+        }
+        None => decompilation.to_string(),
+    }
 }
 
 fn build_method(
@@ -299,12 +304,17 @@ fn build_method(
     // `symtab.rs`'s call-site rewriting -- which always supplies the
     // receiver implicitly, via `->method(...)`/placement-new -- has the
     // right arity) would leave the body referencing an undeclared name;
-    // splicing a local alias back in (`<type> param_1 = (<type>)this;`)
-    // keeps every other line of the body exactly as Ghidra wrote it.
-    let decompilation = match &alias {
-        Some(alias) => splice_receiver_alias(&decompilation, alias),
-        None => decompilation,
-    };
+    // re-binding it to the real `this` instead (`<type> param_1 =
+    // (<type>)this;`) keeps every other line of the body exactly as
+    // Ghidra wrote it. NOT spliced into `decompilation` here: this text
+    // contains the literal keyword `this`, and `render.rs`'s own
+    // `patch_known_idioms` separately renames a *different*, unrelated
+    // `this` -- a local variable Ghidra's decompiler occasionally names
+    // that exact way (see `rename_this_local_variable`) -- if that rename
+    // ran on this text too, it would clobber this alias's own use of the
+    // keyword right along with it. `render.rs` splices this in itself,
+    // after that rename has already run.
+    let receiver_alias = alias.as_ref().map(render_receiver_alias);
 
     Some(RecoveredMethod {
         address: address.to_string(),
@@ -315,6 +325,7 @@ fn build_method(
         params,
         is_constructor,
         is_destructor,
+        receiver_alias,
         decompilation,
     })
 }
@@ -679,6 +690,20 @@ pub fn extract(graph: &KnowledgeGraph) -> RecoveredProgram {
     functions.sort_by(|a, b| a.address.cmp(&b.address));
     disambiguate_function_names(&mut functions);
 
+    // PROJECT.md M18: a real compile found a genuinely surprising
+    // self-rewrite -- `rewrite_call_sites` used to run on the *whole*
+    // decompilation text, header included, and a method's own signature
+    // line (`void FUN_1(longlong param_1,longlong param_2)`) always
+    // contains a literal `FUN_<its own address>(` matching its own
+    // symbol-table entry. This was silently harmless as long as the
+    // header's own comma-separated "arguments" (really just its
+    // parameter list) never happened to match that entry's arity -- but
+    // fixing the receiver-arity bug elsewhere in this same pass made that
+    // coincidence far more likely, and once it hit, the signature line
+    // itself got rewritten into a bogus method-dispatch expression.
+    // Scoping the rewrite to the body only removes the coincidence
+    // entirely rather than relying on it to keep not firing.
+    //
     // PROJECT.md M15: resolve every `FUN_<addr>`/`thunk_FUN_<addr>` call
     // site against the whole-program symbol table *before* anything else
     // reads these bodies -- both `find_references` below (so a call
@@ -690,13 +715,11 @@ pub fn extract(graph: &KnowledgeGraph) -> RecoveredProgram {
     let mut unresolved_calls: BTreeSet<String> = BTreeSet::new();
     for class in &mut classes {
         for m in &mut class.methods {
-            m.decompilation =
-                crate::symtab::rewrite_call_sites(&m.decompilation, &symbol_table, &mut unresolved_calls);
+            m.decompilation = rewrite_body_only(&m.decompilation, &symbol_table, &mut unresolved_calls);
         }
     }
     for f in &mut functions {
-        f.decompilation =
-            crate::symtab::rewrite_call_sites(&f.decompilation, &symbol_table, &mut unresolved_calls);
+        f.decompilation = rewrite_body_only(&f.decompilation, &symbol_table, &mut unresolved_calls);
     }
 
     for class in &mut classes {

@@ -244,8 +244,15 @@ fn a_stale_void_signature_does_not_override_the_decompiled_bodys_own_params() {
     // and re-bound inside the body instead (PROJECT.md M18), so the
     // body's own `FUN_2(param_2,param_1)` still resolves correctly.
     assert_eq!(method.params, "longlong param_2");
-    assert!(method.decompilation.contains("longlong param_1 = (longlong)this;"), "{}", method.decompilation);
-    assert!(method.decompilation.contains("FUN_2(param_2,param_1)"), "{}", method.decompilation);
+    // The alias is spliced in at render time, not stored back onto
+    // `decompilation` itself (PROJECT.md M18: it has to run after
+    // `render.rs`'s own `this`-local rename, not before).
+    let source = render_source(section);
+    assert!(
+        source.replace(' ', "").contains("longlongparam_1=(longlong)this;"),
+        "source:\n{source}"
+    );
+    assert!(source.contains("FUN_2(param_2,param_1)"), "source:\n{source}");
 }
 
 /// PROJECT.md M18: the real end-to-end regression this was built for --
@@ -309,11 +316,14 @@ fn a_structurally_discovered_constructor_call_resolves_through_the_general_path(
     let collideable = program.classes.iter().find(|c| c.name == "Collideable").unwrap();
     let ctor = &collideable.methods[0];
     assert_eq!(ctor.params, "undefined4 param_2, undefined4 param_3");
-    let body = ctor.decompilation.replace(' ', "");
+    // The alias is spliced in at render time (see the Section test above),
+    // not stored back onto `decompilation` itself.
+    let collideable_source = render_source(collideable);
+    let body = collideable_source.replace(' ', "");
     assert!(
         body.contains("undefined8*param_1=(undefined8*)this;"),
         "the receiver must be re-bound to the real `this` inside the body: {}",
-        ctor.decompilation
+        collideable_source
     );
 }
 

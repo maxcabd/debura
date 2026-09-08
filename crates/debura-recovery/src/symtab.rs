@@ -324,6 +324,7 @@ mod tests {
             params: params.to_string(),
             is_constructor,
             is_destructor,
+            receiver_alias: None,
             decompilation: String::new(),
         }
     }

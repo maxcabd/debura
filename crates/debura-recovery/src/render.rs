@@ -414,7 +414,19 @@ pub fn render_source(class: &RecoveredClass) -> String {
         } else {
             (format!("{} ", m.return_type), m.display_name.clone())
         };
-        let decompilation = patch_known_idioms(&m.decompilation);
+        // `patch_known_idioms` must run before `receiver_alias` is
+        // spliced in, not after: that pass separately renames a
+        // *different*, unrelated local variable Ghidra's decompiler
+        // sometimes names literally `this` (`rename_this_local_variable`)
+        // -- doing that after splicing would rename this alias's own use
+        // of the real keyword right along with it (a real regression, see
+        // `RecoveredMethod::receiver_alias`'s own doc comment).
+        let mut decompilation = patch_known_idioms(&m.decompilation);
+        if let Some(alias) = &m.receiver_alias {
+            if let Some(brace) = decompilation.find('{') {
+                decompilation.insert_str(brace + 1, alias);
+            }
+        }
         let base_init = m.is_constructor.then(|| {
             class.base.as_ref().and_then(|base| extract_base_constructor_call(&decompilation, base))
         }).flatten();
