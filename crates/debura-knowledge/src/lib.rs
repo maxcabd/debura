@@ -5,6 +5,7 @@
 //! for this graph is M3; the agent that actually populates it is M4.
 
 mod claims;
+mod decompilation;
 mod dependency;
 mod error;
 mod evidence;
@@ -19,6 +20,7 @@ pub use claims::{
     claim_breakdown, classify_provenance, classify_subject, is_reserved_identifier,
     library_callee_ratio, ClaimBreakdown, ClaimClass, Provenance,
 };
+pub use decompilation::{is_degenerate_decompilation, latest_decompilation};
 pub use dependency::{Dependency, DependencyKind};
 pub use error::KnowledgeError;
 pub use evidence::Evidence;

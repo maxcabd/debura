@@ -1,8 +1,8 @@
 use std::collections::BTreeSet;
 
-use debura_knowledge::{classify_provenance, KnowledgeGraph, Provenance};
+use debura_knowledge::{classify_provenance, is_degenerate_decompilation, latest_decompilation, KnowledgeGraph, Provenance};
 
-use crate::extract::{extract, is_degenerate_decompilation, latest_decompilation};
+use crate::extract::extract;
 use crate::frontier::{reachable_from, UnresolvedSymbol};
 
 /// PROJECT.md M18: `Provenance` (debura-knowledge) answers "is this

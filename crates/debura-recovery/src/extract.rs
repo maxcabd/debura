@@ -1,8 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use debura_knowledge::{
-    classify_provenance, is_reserved_identifier, Hypothesis, HypothesisStatus, KnowledgeGraph,
-    Observation, Provenance,
+    classify_provenance, is_degenerate_decompilation, is_reserved_identifier, latest_decompilation,
+    Hypothesis, HypothesisStatus, KnowledgeGraph, Observation, Provenance,
 };
 
 use crate::model::{NameSource, RecoveredClass, RecoveredField, RecoveredFunction, RecoveredMethod, RecoveredProgram};
@@ -12,44 +12,20 @@ use crate::model::{NameSource, RecoveredClass, RecoveredField, RecoveredFunction
 /// observation can exist for the same (subject, predicate). The highest id
 /// is the most recent -- iteration order over the graph's internal map is
 /// not otherwise meaningful (learned the hard way while testing M8).
+///
+/// `decompiles_to` specifically is never looked up this way -- see
+/// `debura_knowledge::latest_decompilation`, which this crate uses
+/// directly (PROJECT.md M18: a real case had a subject with two
+/// `decompiles_to` observations, an earlier one carrying the real, full
+/// decompiled body and a later one -- a second Ghidra pass, M8's
+/// `reextract` -- carrying a degenerate `{...}` placeholder; this
+/// function's own "highest id wins" rule would silently throw the real
+/// body away in favor of the newer-but-worse one).
 fn latest<'a>(graph: &'a KnowledgeGraph, subject: &str, predicate: &str) -> Option<&'a Observation> {
     graph
         .observations()
         .filter(|o| o.subject == subject && o.predicate == predicate)
         .max_by_key(|o| o.id.0)
-}
-
-/// `decompiles_to` specifically needs a different tiebreak than `latest`'s
-/// general "highest id wins": a real case had a subject with two
-/// observations, an earlier one carrying the real, full decompiled body
-/// and a later one (a second Ghidra pass, M8's `reextract`) carrying a
-/// degenerate `{...}` placeholder -- `latest` silently threw the real
-/// body away in favor of the newer-but-worse one, rendering a body that
-/// was literally the three characters `...`. Prefers the most recent
-/// *substantive* decompilation over the most recent of any kind, falling
-/// back to the latest overall only if every one on record is degenerate.
-pub(crate) fn latest_decompilation<'a>(graph: &'a KnowledgeGraph, subject: &str) -> Option<&'a Observation> {
-    let mut candidates: Vec<&Observation> = graph
-        .observations()
-        .filter(|o| o.subject == subject && o.predicate == "decompiles_to")
-        .collect();
-    candidates.sort_by_key(|o| o.id.0);
-    candidates
-        .iter()
-        .rev()
-        .find(|o| !is_degenerate_decompilation(&o.value))
-        .or_else(|| candidates.last())
-        .copied()
-}
-
-/// A decompilation whose body is empty or just an elided `{...}`
-/// placeholder -- Ghidra emits this on some re-analysis passes for a
-/// subject it successfully decompiled fully on an earlier pass.
-pub(crate) fn is_degenerate_decompilation(text: &str) -> bool {
-    match text.find('{') {
-        Some(idx) => matches!(text[idx..].trim(), "{...}" | "{ ... }"),
-        None => true,
-    }
 }
 
 /// The model is told to give `semantic_role` an identifier-style value,

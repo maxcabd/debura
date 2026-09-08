@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use debura_knowledge::{HypothesisStatus, KnowledgeGraph};
+use debura_knowledge::{latest_decompilation, HypothesisStatus, KnowledgeGraph};
 
 /// PROJECT.md M17: raw, structural evidence about a function's role that
 /// needs no accepted neighbor name at all -- the "weak link" problem two
@@ -144,10 +144,13 @@ pub fn call_sequence_neighbors(graph: &KnowledgeGraph, subject: &str) -> Vec<Cal
     callers
         .into_iter()
         .filter_map(|caller| {
-            let body = graph
-                .observations()
-                .find(|o| o.subject == caller && o.predicate == "decompiles_to")
-                .map(|o| o.value.clone())?;
+            // PROJECT.md M18: was a bare `.find()` -- whatever order
+            // `KnowledgeGraph`'s internal storage happens to iterate in,
+            // not even id-ordered -- picking an essentially arbitrary
+            // `decompiles_to` fact when a caller has more than one on
+            // record. Centralized on the same substantive-preferring
+            // selector every recoverability/provenance decision uses.
+            let body = latest_decompilation(graph, &caller).map(|o| o.value.clone())?;
             let order = call_order_in_body(&body);
             let pos = order.iter().position(|c| c == subject)?;
             Some(CallSequenceNeighbor {

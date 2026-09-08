@@ -330,8 +330,8 @@ fn classify_shallow(
     // a chain that eventually reaches one", which almost any code
     // technically is) is what keeps this from re-admitting exactly the
     // library-leakage case the M17 provenance gate was built to close.
-    if let Some(decompilation) = latest_decompilation(graph, subject) {
-        if let Some(param) = first_param_name(&decompilation) {
+    if let Some(decompilation) = crate::decompilation::latest_decompilation(graph, subject).map(|o| o.value.as_str()) {
+        if let Some(param) = first_param_name(decompilation) {
             // Body only, not the full text: the parameter's own
             // declaration (`TYPE *param_1`) contains the same `*param_1`
             // substring `distinct_param_slots_accessed`'s bare-dereference
@@ -366,17 +366,6 @@ fn classify_shallow(
 /// one field, if any) from genuine lifecycle code, not measure how
 /// elaborate the lifecycle code is.
 const MIN_OWN_STATE_SLOTS: usize = 2;
-
-/// The most recent `decompiles_to` fact for `subject`, matching the
-/// "highest id wins" convention used everywhere else a subject can carry
-/// more than one observation for the same predicate.
-fn latest_decompilation(graph: &KnowledgeGraph, subject: &str) -> Option<String> {
-    graph
-        .observations()
-        .filter(|o| o.subject == subject && o.predicate == "decompiles_to")
-        .max_by_key(|o| o.id.0)
-        .map(|o| o.value.clone())
-}
 
 /// The name of a decompiled function's own first parameter -- Ghidra's
 /// own C-shaped signature always has one, `param_1` in every case this
