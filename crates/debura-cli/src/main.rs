@@ -97,6 +97,20 @@ enum Command {
     Recover {
         /// Project id, as printed by `debura new`
         project: String,
+        /// Path to a file containing a real linker's stderr output (or
+        /// `-` for stdin). When given, any `RecoveryDisposition::RequiredRuntimeBody`
+        /// address `disposition` would report against this exact linker
+        /// log -- reachable, `Provenance::LibraryOrRuntime`, but with a
+        /// real, non-degenerate decompiled body a real link genuinely
+        /// failed to resolve -- is recovered under its raw `FUN_<addr>`
+        /// name too (PROJECT.md M18: never a project-wide sweep for this
+        /// provenance -- only these exact, linker-verified addresses;
+        /// see `debura_recovery::extract_with_required_runtime_bodies`'s
+        /// own doc comment for why). Omit to recover exactly what
+        /// `Provenance::Application`/`RequiredUnknown` already cover,
+        /// unchanged.
+        #[arg(long)]
+        linker_log: Option<PathBuf>,
     },
     /// Classify a real linker's undefined-symbol output into the
     /// concrete recovery frontier (PROJECT.md M18): which unresolved
@@ -513,17 +527,48 @@ fn main() -> Result<()> {
                 println!("Nothing to apply or revert.");
             }
         }
-        Command::Recover { project } => {
+        Command::Recover { project, linker_log } => {
             let root = debura_core::config::projects_dir().join(&project);
             anyhow::ensure!(root.is_dir(), "no such project: {project}");
 
             let conn = debura_storage::init_project_db(&root.join("project.sqlite"))?;
             let graph = debura_storage::knowledge::load(&conn)?;
 
-            let summary = debura_recovery::recover(&graph, &root)?;
+            let (program, runtime_bodies_recovered) = match linker_log {
+                None => (debura_recovery::extract(&graph), 0usize),
+                Some(linker_log) => {
+                    let entry = graph
+                        .observations()
+                        .find(|o| o.predicate == "exports" && o.value == "entry")
+                        .map(|o| o.subject.clone())
+                        .context("no 'entry' export found -- was this project analyzed?")?;
+                    let log_text = if linker_log.as_os_str() == "-" {
+                        std::io::read_to_string(std::io::stdin()).context("reading linker log from stdin")?
+                    } else {
+                        std::fs::read_to_string(&linker_log)
+                            .with_context(|| format!("reading linker log at {}", linker_log.display()))?
+                    };
+                    let unresolved = debura_recovery::parse_undefined_symbols(&log_text);
+                    let disposition = debura_recovery::classify_recovery_disposition(&graph, &unresolved, &entry);
+                    let required_runtime_bodies: std::collections::BTreeSet<String> = disposition
+                        .iter()
+                        .filter(|e| e.disposition == debura_recovery::RecoveryDisposition::RequiredRuntimeBody)
+                        .map(|e| e.address.clone())
+                        .collect();
+                    let count = required_runtime_bodies.len();
+                    (
+                        debura_recovery::extract_with_required_runtime_bodies(&graph, &required_runtime_bodies),
+                        count,
+                    )
+                }
+            };
+            let summary = debura_recovery::write_to_disk(&root, &program)?;
 
             println!("Classes recovered:   {}", summary.classes_written);
             println!("Functions recovered: {}", summary.functions_written);
+            if runtime_bodies_recovered > 0 {
+                println!("  (including {runtime_bodies_recovered} linker-verified RequiredRuntimeBody)");
+            }
             println!("Written to: {}", root.join("recovered").display());
         }
         Command::Frontier { project, linker_log } => {
