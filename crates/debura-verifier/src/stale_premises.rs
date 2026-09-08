@@ -27,6 +27,8 @@ use debura_knowledge::{
 /// first (never fabricated: it's read from the gate's own prior record),
 /// then treated exactly the same as a freshly-structured rejection below.
 pub fn reconsider_stale_provenance_rejections(graph: &mut KnowledgeGraph) -> Vec<HypothesisId> {
+    backfill_missing_supersession_links(graph);
+
     let unbackfilled: Vec<(HypothesisId, String, String)> = graph
         .hypotheses()
         .filter(|h| h.status == HypothesisStatus::Rejected && h.rejection_reason.is_none() && h.predicate == "semantic_role")
@@ -79,6 +81,33 @@ pub fn reconsider_stale_provenance_rejections(graph: &mut KnowledgeGraph) -> Vec
         }
     }
     reconsidered
+}
+
+/// Backfills the Superseded link itself for data that predates
+/// `ObservationStatus` existing at all: an earlier run of this function,
+/// before supersession was implemented, could already have written a
+/// `rejection_premise_invalidated` observation without marking the
+/// `provenance_gate_rejected` observation it corrects as Superseded. Finds
+/// any such still-Active pair on the same subject and links them now --
+/// same backward-compatibility reasoning as `backfill_rejection_reason`
+/// above, applied to the newer field. Idempotent: already-Superseded
+/// observations are invisible to `active_observations()`, so re-running
+/// this is always safe.
+fn backfill_missing_supersession_links(graph: &mut KnowledgeGraph) {
+    let pairs: Vec<(ObservationId, ObservationId)> = graph
+        .active_observations()
+        .filter(|o| o.predicate == "provenance_gate_rejected")
+        .filter_map(|old| {
+            graph
+                .active_observations()
+                .filter(|new| new.predicate == "rejection_premise_invalidated" && new.subject == old.subject)
+                .max_by_key(|new| new.id.0)
+                .map(|new| (old.id, new.id))
+        })
+        .collect();
+    for (old, new) in pairs {
+        let _ = graph.supersede_observation(old, new);
+    }
 }
 
 /// The still-Active `provenance_gate_rejected` observation recording that
@@ -235,6 +264,41 @@ mod tests {
 
         assert_eq!(reconsidered, vec![id]);
         assert_eq!(graph.hypothesis(id).unwrap().status, HypothesisStatus::Stale);
+    }
+
+    #[test]
+    fn a_prior_run_that_predates_supersession_gets_its_link_backfilled() {
+        use debura_knowledge::ObservationStatus;
+
+        let mut graph = KnowledgeGraph::new();
+        // Simulates exactly what an earlier build of `reconsider` left
+        // behind on a real project database: the hypothesis already moved
+        // past REJECTED-for-provenance (e.g. a later ChallengeHypothesis
+        // content rejection), so the main reconsideration loop below has
+        // nothing left to do -- only the missing supersession link itself
+        // needs to be backfilled.
+        let old = graph.add_observation(
+            "0x1",
+            "provenance_gate_rejected",
+            "semantic_role 'renderFrame' rejected: subject's provenance is not Application",
+            0.5,
+            "debura:provenance_gate",
+            None,
+        );
+        let new = graph.add_observation(
+            "0x1",
+            "rejection_premise_invalidated",
+            "semantic_role 'renderFrame' ... marked STALE for reevaluation",
+            0.5,
+            "debura:premise_reconsideration",
+            None,
+        );
+
+        reconsider_stale_provenance_rejections(&mut graph);
+
+        let old_obs = graph.observation(old).unwrap();
+        assert_eq!(old_obs.status, ObservationStatus::Superseded);
+        assert_eq!(old_obs.superseded_by, Some(new));
     }
 
     #[test]
