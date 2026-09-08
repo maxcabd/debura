@@ -72,6 +72,11 @@ fn a_structurally_identical_subject_reuses_the_accepted_answer_without_a_fresh_i
     let mut graph = KnowledgeGraph::new();
 
     graph.add_observation("0x1", "has_name", "resetLevel", 0.95, "ghidra:function", None);
+    // PROJECT.md M17: the provenance gate needs a real application signal
+    // on both subjects, or the cloned hypothesis below would be rejected
+    // as Unknown-provenance instead of reusing the Accepted answer -- not
+    // what this test is about.
+    graph.add_observation("0x1", "is_method_of", "Snake", 0.95, "ghidra:function", None);
     graph.add_observation(
         "0x1",
         "decompiles_to",
@@ -88,6 +93,7 @@ fn a_structurally_identical_subject_reuses_the_accepted_answer_without_a_fresh_i
     // of the same source at another address (or a duplicate/COMDAT-folded
     // copy) actually looks like.
     graph.add_observation("0x2", "has_name", "FUN_dead", 0.95, "ghidra:function", None);
+    graph.add_observation("0x2", "is_method_of", "Snake", 0.95, "ghidra:function", None);
     graph.add_observation(
         "0x2",
         "decompiles_to",
@@ -194,6 +200,12 @@ impl AgentProvider for AlwaysContradicts {
 #[test]
 fn contested_hypotheses_get_a_resolve_contradiction_followup() {
     let mut graph = seeded_graph();
+    // PROJECT.md M17: the provenance gate needs a real application signal,
+    // or the final "everything reaches Accepted" assertion below would
+    // see Rejected (Unknown provenance) instead -- not what this test is
+    // about (it's exercising the ResolveContradiction followup path).
+    graph.add_observation("0x1", "is_method_of", "Snake", 0.95, "ghidra:function", None);
+    graph.add_observation("0x2", "is_method_of", "Snake", 0.95, "ghidra:function", None);
 
     let summary = run(
         &mut graph,
