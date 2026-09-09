@@ -136,7 +136,87 @@ fn patch_known_idioms(text: &str) -> String {
         "basic_string<char,std::char_traits<char>,std::allocator<char>>",
         "basic_string",
     );
-    strip_redundant_template_args(&text, "basic_ostream<char,std::char_traits<char>>", "basic_ostream")
+    let text = strip_redundant_template_args(&text, "basic_ostream<char,std::char_traits<char>>", "basic_ostream");
+
+    // Must run last: looks for the bare `receiver->method()` shape the
+    // fixes above just produced.
+    patch_hidden_return_slot_construction(&text)
+}
+
+/// STL methods that return a non-trivial type by value, keyed by the
+/// receiver's bare (post-`strip_redundant_template_args`) type name --
+/// consulted only by `patch_hidden_return_slot_construction` below.
+const KNOWN_BY_VALUE_RETURNING_METHODS: &[(&str, &str, &str)] = &[("basic_stringstream", "str", "basic_string")];
+
+/// x86-64 returns a class type with a non-trivial destructor/copy
+/// constructor by writing the result through a hidden pointer passed as
+/// the function's own first argument, then handing that same pointer
+/// back as the return value -- a real ABI convention, but Ghidra's
+/// decompiler frequently loses track of the hidden write itself,
+/// rendering a bare, receiver-qualified call (already given its receiver
+/// by `fix_qualified_member_calls` above) whose real by-value return is
+/// just constructed and immediately discarded as a temporary, instead of
+/// being written through the parameter the rest of the function
+/// unconditionally hands back untouched. A real Snake case:
+/// `Screen::createText`'s helper builds a `std::string` via
+/// `basic_stringstream::str()` and discards it -- its caller
+/// (`Screen::drawText`) never actually receives the built string, so the
+/// on-screen score text silently renders empty. Recognized structurally,
+/// never by address: the function's first parameter is never read or
+/// written anywhere in the body except the final, unconditional `return
+/// param_N;`, and the body declares exactly one local of a known
+/// by-value-returning method's receiver type, called bare and discarded.
+fn patch_hidden_return_slot_construction(text: &str) -> String {
+    let Some(open_paren) = text.find('(') else {
+        return text.to_string();
+    };
+    let Some(brace_idx) = text.find('{') else {
+        return text.to_string();
+    };
+    if open_paren >= brace_idx {
+        return text.to_string();
+    }
+    let Some(rel_close) = find_matching_close_paren(&text[open_paren + 1..]) else {
+        return text.to_string();
+    };
+    let close_paren = open_paren + 1 + rel_close;
+    if close_paren >= brace_idx {
+        return text.to_string();
+    }
+    let params_text = &text[open_paren + 1..close_paren];
+    let (first_param, _) = split_first_arg(params_text);
+    let Some(param_name) = first_param.trim().rsplit(['*', '&', ' ']).next().filter(|s| !s.is_empty()) else {
+        return text.to_string();
+    };
+
+    let remainder = text[brace_idx..].trim_end();
+    let Some(body) = remainder.strip_prefix('{').and_then(|s| s.strip_suffix('}')) else {
+        return text.to_string();
+    };
+
+    let return_stmt = format!("return {param_name};");
+    if !body.trim_end().ends_with(&return_stmt) {
+        return text.to_string();
+    }
+    // The parameter must never be read or written anywhere else in the
+    // body -- otherwise it's a real, meaningfully-used parameter, not a
+    // hidden return slot the decompiler merely echoes back untouched.
+    if body.matches(param_name).count() != 1 {
+        return text.to_string();
+    }
+
+    for (receiver_type, method, return_type) in KNOWN_BY_VALUE_RETURNING_METHODS {
+        let candidates = find_declared_local_names(body, &format!("{receiver_type} "));
+        let [local] = candidates.as_slice() else {
+            continue;
+        };
+        let bare_call = format!("{local}->{method}();");
+        if body.matches(bare_call.as_str()).count() == 1 {
+            let replacement = format!("*({return_type} *){param_name} = {local}->{method}();");
+            return text.replacen(&bare_call, &replacement, 1);
+        }
+    }
+    text.to_string()
 }
 
 /// Renames a local variable literally declared `this` (e.g.
@@ -527,6 +607,37 @@ mod idiom_tests {
         let text = "std::__cxx11::basic_stringstream<char,std::char_traits<char>,std::allocator<char>>::\n  ~basic_stringstream(local_1a8);";
         let patched = patch_known_idioms(text);
         assert_eq!(patched, "local_1a8->~basic_stringstream();");
+    }
+
+    /// The real, confirmed case: `FUN_14000205a` (`Screen::createText`'s
+    /// helper) builds a `std::string` into a `basic_stringstream`, then
+    /// discards `str()`'s by-value return instead of writing it through
+    /// its own first parameter -- the hidden return-value slot the x64
+    /// ABI actually uses. Uncaught, the caller's own `std::string` local
+    /// stays permanently empty, and the on-screen text it feeds to
+    /// `TTF_RenderText_Solid` silently renders blank.
+    #[test]
+    fn a_discarded_stringstream_str_is_written_through_the_hidden_return_slot() {
+        let text = "undefined8 FUN_14000205a(undefined8 param_1,undefined8 param_2,int param_3,int param_4)\n\n{\n  basic_stringstream<char,std::char_traits<char>,std::allocator<char>> local_1a8 [16];\n  \n  std::__cxx11::basic_stringstream<char,std::char_traits<char>,std::allocator<char>>::\n  basic_stringstream();\n  std::__cxx11::basic_stringstream<char,std::char_traits<char>,std::allocator<char>>::str();\n  std::__cxx11::basic_stringstream<char,std::char_traits<char>,std::allocator<char>>::\n  ~basic_stringstream(local_1a8);\n  return param_1;\n}";
+        let patched = patch_known_idioms(text);
+        assert!(
+            patched.contains("*(basic_string *)param_1 = local_1a8->str();"),
+            "{patched}"
+        );
+        assert_eq!(patched.matches("local_1a8->str()").count(), 1, "{patched}");
+    }
+
+    /// A parameter that's actually used for something else in the body
+    /// (not merely echoed back by the final `return`) must never be
+    /// treated as a hidden return slot -- this is a real, ordinary
+    /// parameter, and rewriting through it would corrupt whatever it
+    /// actually points to.
+    #[test]
+    fn a_first_parameter_that_is_read_elsewhere_is_never_treated_as_a_return_slot() {
+        let text = "undefined8 FUN_1(undefined8 param_1)\n\n{\n  basic_stringstream<char,std::char_traits<char>,std::allocator<char>> local_1a8 [16];\n  \n  *(int *)param_1 = 5;\n  std::__cxx11::basic_stringstream<char,std::char_traits<char>,std::allocator<char>>::str();\n  return param_1;\n}";
+        let patched = patch_known_idioms(text);
+        assert!(patched.contains("local_1a8->str();"), "{patched}");
+        assert!(!patched.contains("*(basic_string *)param_1 = "), "{patched}");
     }
 
     /// PROJECT.md M18: `std::basic_ostream`'s own default constructor is
