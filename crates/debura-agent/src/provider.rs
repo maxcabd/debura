@@ -1,6 +1,7 @@
 use anyhow::Result;
 
 use crate::challenge::{ChallengeHypothesisTask, ChallengeResult};
+use crate::field_task::ProposeFieldNameTask;
 use crate::resolution::{ResolutionResult, ResolveContradictionTask};
 use crate::result::InvestigationResult;
 use crate::task::AnalyzeFunctionTask;
@@ -18,6 +19,20 @@ pub trait AgentProvider {
     fn investigate(&self, task: &AnalyzeFunctionTask) -> Result<InvestigationResult>;
     fn challenge(&self, task: &ChallengeHypothesisTask) -> Result<ChallengeResult>;
     fn resolve_contradiction(&self, task: &ResolveContradictionTask) -> Result<ResolutionResult>;
+
+    /// PROJECT.md, "Field-level semantic naming": proposes a name for one
+    /// struct/stack field, reusing `InvestigationResult`/
+    /// `ProposedHypothesis` exactly as `investigate` does (predicate
+    /// `"field_semantic_name"` rather than `"semantic_role"`) -- the
+    /// harness's existing `commit_hypothesis` needs no changes to accept
+    /// either. Defaults to a clear error rather than requiring every
+    /// existing provider (including every test double across this
+    /// workspace) to implement a task type it doesn't care about -- only
+    /// a provider that actually supports field naming needs to override
+    /// this.
+    fn propose_field_name(&self, _task: &ProposeFieldNameTask) -> Result<InvestigationResult> {
+        Err(anyhow::anyhow!("this provider does not support field-name proposals"))
+    }
 
     /// PROJECT.md M10: every task type here reasons about strictly
     /// per-subject/per-hypothesis context (S23) and so is safe to batch

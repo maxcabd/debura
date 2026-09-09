@@ -1,8 +1,8 @@
 use debura_agent::{
-    analyze_function, commit_contradiction, mock::EchoProvider, AgentProvider,
+    analyze_function, commit_contradiction, commit_hypothesis, mock::EchoProvider, AgentProvider,
     AnalyzeFunctionTask, ChallengeHypothesisTask, ChallengeResult, ConfidenceUpdate,
-    InvestigationResult, ProposedContradiction, ProposedHypothesis, ProposedObservation,
-    Resolution, ResolutionResult, ResolveContradictionTask,
+    InvestigationResult, ProposeFieldNameTask, ProposedContradiction, ProposedHypothesis,
+    ProposedObservation, Resolution, ResolutionResult, ResolveContradictionTask,
 };
 use debura_knowledge::{HypothesisId, HypothesisStatus, KnowledgeGraph};
 
@@ -273,4 +273,35 @@ fn agent_proposed_observations_are_committed() {
     assert_eq!(graph.observations().count(), 1);
     let obs = graph.observations().next().unwrap();
     assert_eq!(obs.predicate, "reads_offset");
+}
+
+/// PROJECT.md, "Field-level semantic naming": `EchoProvider`'s field-
+/// naming proposal, committed through the *existing*, unchanged
+/// `commit_hypothesis` -- proves a field subject needs no special-casing
+/// anywhere in the harness, exactly as the design intended.
+#[test]
+fn a_proposed_field_name_commits_through_the_existing_hypothesis_machinery() {
+    let graph = KnowledgeGraph::new();
+    let task = ProposeFieldNameTask::build(
+        &graph,
+        "field:FUN_1400025b0:local_b8+0x4",
+        "0x1400025b0",
+        "initializeFoodParameters",
+        "undefined initializeFoodParameters(undefined4 *param_1) { ... }",
+        "local_b8",
+        4,
+        4,
+        "int",
+        Vec::new(),
+    );
+
+    let result = EchoProvider.propose_field_name(&task).unwrap();
+    assert_eq!(result.hypotheses.len(), 1);
+    assert_eq!(result.hypotheses[0].predicate, "field_semantic_name");
+
+    let mut graph = graph;
+    let id = commit_hypothesis(&mut graph, &task.subject, &result.hypotheses[0], None);
+    let committed = graph.hypothesis(id).unwrap();
+    assert_eq!(committed.subject, "field:FUN_1400025b0:local_b8+0x4");
+    assert_eq!(committed.predicate, "field_semantic_name");
 }

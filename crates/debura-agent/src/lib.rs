@@ -9,6 +9,7 @@
 mod call_context;
 mod challenge;
 mod evidence_view;
+mod field_task;
 mod harness;
 mod provider;
 mod resolution;
@@ -31,3 +32,4 @@ pub use result::{
     ProposedObservation,
 };
 pub use task::AnalyzeFunctionTask;
+pub use field_task::ProposeFieldNameTask;

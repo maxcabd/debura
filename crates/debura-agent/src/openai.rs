@@ -14,6 +14,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::challenge::{ChallengeHypothesisTask, ChallengeResult};
+use crate::field_task::ProposeFieldNameTask;
 use crate::resolution::{Resolution, ResolutionResult, ResolveContradictionTask};
 use crate::result::InvestigationResult;
 use crate::task::AnalyzeFunctionTask;
@@ -479,7 +480,43 @@ impl AgentProvider for OpenAiProvider {
             })
             .collect()
     }
+
+    fn propose_field_name(&self, task: &ProposeFieldNameTask) -> Result<InvestigationResult> {
+        let user = render_propose_field_name_task(task);
+        let value = self.complete(
+            FIELD_NAMING_SYSTEM,
+            &user,
+            "investigation_result",
+            investigation_result_schema(),
+        )?;
+        serde_json::from_value(value).context("mapping OpenAI output to InvestigationResult")
+    }
 }
+
+const FIELD_NAMING_SYSTEM: &str = "You are Debura's field-naming reasoning step. You are given \
+    one real struct/stack field a deterministic pass already confirmed the exact byte offset and \
+    width of (never guessed), inside a function whose body a compiled binary decompiled into. \
+    Propose, at most, one hypothesis under the predicate \"field_semantic_name\" (that literal \
+    string) -- the only predicate Debura's C++ recovery step reads to rename a field; anything \
+    under another predicate is invisible to it. \
+    \n\n\
+    Evidence bar, same spirit as function naming: base the name on how the field is actually \
+    used -- what it's compared against, what modifies it, what nearby sibling fields on the same \
+    object suggest about the object's overall purpose, and what the defining function's own \
+    reachable API calls suggest about its domain (a function that calls SDL_RenderCopy is \
+    probably rendering-related, for instance). A real case this covers: a 4-byte field that's \
+    read in a loop condition as \"greater than zero keep going\", decremented somewhere on a \
+    collision path, and displayed next to a \"Lives: \" label is well-evidenced as \"m_lives\"; a \
+    field with no comparison, no clear write pattern, and no naming sibling fields is not -- leave \
+    it unproposed rather than guess. Never propose a generic placeholder (\"field\", \"value\", \
+    \"data\", \"state\", \"flag\" alone) -- that conveys nothing beyond the mechanical name \
+    already available, and is exactly as useless as no name at all while looking like real \
+    recovered knowledge. The value must be a valid C++ identifier, conventionally member-style \
+    (e.g. \"m_lives\", \"m_hasUpdated\") to match this codebase's existing recovered names. If an \
+    existing hypothesis for this exact field is marked contested or rejected with a stated reason, \
+    do not propose the same name again -- either address why it failed or propose something \
+    genuinely different, or leave it unproposed if the evidence doesn't actually support a \
+    different name either.";
 
 const CHALLENGE_SYSTEM: &str = "You are Debura's ChallengeHypothesis adversarial verification \
     step. Your objective is NOT to find more evidence that the hypothesis is right -- it is to \
@@ -657,6 +694,44 @@ fn render_sequenced_calls(out: &mut String, label: &str, calls: &[crate::call_co
             ));
         }
     }
+}
+
+fn render_propose_field_name_task(task: &ProposeFieldNameTask) -> String {
+    let mut out = format!(
+        "Field subject: {}\nDefining function: {}\nField: byte offset 0x{:x}, width {} bytes, accessed as `{} {} *const)({} + 0x{:x})`\n\n",
+        task.subject, task.function_display_name, task.offset, task.width, task.declared_type, task.declared_type, task.base, task.offset
+    );
+
+    out.push_str("Other confirmed fields on the same object:\n");
+    if task.sibling_fields.is_empty() {
+        out.push_str("(none)\n");
+    } else {
+        for sibling in &task.sibling_fields {
+            out.push_str(&format!("- {sibling}\n"));
+        }
+    }
+
+    out.push_str(&format!("\nDefining function's own decompiled body:\n{}\n", task.function_decompilation));
+
+    out.push_str("\nAPI names reachable from the defining function's own callee tree:\n");
+    if task.reachable_api_hints.is_empty() {
+        out.push_str("(none found)\n");
+    } else {
+        out.push_str(&format!("{}\n", task.reachable_api_hints.join(", ")));
+    }
+
+    out.push_str("\nExisting hypotheses about this exact field:\n");
+    if task.existing_hypotheses.is_empty() {
+        out.push_str("(none)\n");
+    }
+    for h in &task.existing_hypotheses {
+        out.push_str(&format!(
+            "- {}: {} = {} (confidence {:.2}, status {:?})\n",
+            h.id, h.predicate, h.value, h.confidence, h.status
+        ));
+    }
+
+    out
 }
 
 fn render_challenge_batch(tasks: &[ChallengeHypothesisTask]) -> String {

@@ -7,6 +7,7 @@
 use anyhow::Result;
 
 use crate::challenge::{ChallengeHypothesisTask, ChallengeResult};
+use crate::field_task::ProposeFieldNameTask;
 use crate::resolution::{Resolution, ResolutionResult, ResolveContradictionTask};
 use crate::result::{InvestigationResult, ProposedHypothesis};
 use crate::task::AnalyzeFunctionTask;
@@ -64,6 +65,21 @@ impl AgentProvider for EchoProvider {
                 confidence: task.hypothesis.confidence,
             },
             reasoning: "EchoProvider performs no real adversarial reasoning".to_string(),
+        })
+    }
+
+    /// Echoes the mechanical `field_{offset}` name back at low confidence
+    /// -- same honest "exercises the plumbing, interprets nothing" line
+    /// as `investigate` above.
+    fn propose_field_name(&self, task: &ProposeFieldNameTask) -> Result<InvestigationResult> {
+        Ok(InvestigationResult {
+            hypotheses: vec![ProposedHypothesis {
+                predicate: "field_semantic_name".to_string(),
+                value: format!("field_0x{:x}", task.offset),
+                confidence: 0.3,
+                depends_on: Vec::new(),
+            }],
+            ..Default::default()
         })
     }
 }
