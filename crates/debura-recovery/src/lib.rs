@@ -19,6 +19,7 @@ mod model;
 mod phantom_local;
 mod render;
 mod return_forwarding;
+mod stack_object;
 mod symbols;
 mod symtab;
 mod write;

@@ -843,6 +843,20 @@ fn extract_impl(
     // trampoline signatures, call-site casting) reads either.
     crate::return_forwarding::propagate_forwarded_return_types(&mut functions);
 
+    // PROJECT.md M18.3/M19: reconstructs a real object Ghidra modeled as
+    // several separately-declared, undersized locals (a bare scalar
+    // whose address is really passed around as a struct/vector base, or
+    // a too-small buffer a library call writes a larger real type into)
+    // into one real, correctly-sized byte-addressable object. Must run
+    // *before* `phantom_local.rs` below: that pass needs a real,
+    // byte-granular pointer or array already in scope to alias a phantom
+    // local against, which this pass is what actually produces (a real,
+    // confirmed dependency -- see `phantom_local.rs`'s own "known scope
+    // limit" doc comment). Also, like `phantom_local.rs`, must run
+    // before call sites are rewritten against the whole-program symbol
+    // table, matching every raw `FUN_<addr>` call site by its own text.
+    crate::stack_object::reconstruct_stack_objects(&mut functions);
+
     // PROJECT.md M18.3/M19: a real Ghidra decompiler bug found by hand
     // (Snake's own self-collision-check loop) generalized into a real
     // pass -- a declared-but-never-assigned local passed to a
