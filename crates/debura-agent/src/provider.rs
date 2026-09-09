@@ -1,7 +1,7 @@
 use anyhow::Result;
 
 use crate::challenge::{ChallengeHypothesisTask, ChallengeResult};
-use crate::field_task::ProposeFieldNameTask;
+use crate::field_task::{ProposeFieldNameTask, ProposeFieldSemanticRoleTask, SemanticRoleResult};
 use crate::resolution::{ResolutionResult, ResolveContradictionTask};
 use crate::result::InvestigationResult;
 use crate::task::AnalyzeFunctionTask;
@@ -32,6 +32,15 @@ pub trait AgentProvider {
     /// this.
     fn propose_field_name(&self, _task: &ProposeFieldNameTask) -> Result<InvestigationResult> {
         Err(anyhow::anyhow!("this provider does not support field-name proposals"))
+    }
+
+    /// PROJECT.md, "Two-stage semantic reasoning": proposes what a field
+    /// *means* -- forced to trace the tracked value through the supplied
+    /// evidence and cite a `decisive_sink`, never an identifier -- before
+    /// `propose_field_name` is ever asked to spell it. Defaults to a
+    /// clear error, same reasoning as `propose_field_name`'s own default.
+    fn propose_field_semantic_role(&self, _task: &ProposeFieldSemanticRoleTask) -> Result<SemanticRoleResult> {
+        Err(anyhow::anyhow!("this provider does not support field-semantic-role proposals"))
     }
 
     /// PROJECT.md M10: every task type here reasons about strictly

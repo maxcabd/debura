@@ -7,7 +7,7 @@
 use anyhow::Result;
 
 use crate::challenge::{ChallengeHypothesisTask, ChallengeResult};
-use crate::field_task::ProposeFieldNameTask;
+use crate::field_task::{ProposeFieldNameTask, ProposeFieldSemanticRoleTask, SemanticRoleResult};
 use crate::resolution::{Resolution, ResolutionResult, ResolveContradictionTask};
 use crate::result::{InvestigationResult, ProposedHypothesis};
 use crate::task::AnalyzeFunctionTask;
@@ -80,6 +80,25 @@ impl AgentProvider for EchoProvider {
                 depends_on: Vec::new(),
             }],
             ..Default::default()
+        })
+    }
+
+    /// Same honest "exercises the plumbing, interprets nothing" line as
+    /// `investigate`/`propose_field_name` above -- proposes a mechanical
+    /// placeholder role but deliberately cites no `decisive_sink` at all
+    /// (it did no real tracing), so `debura_confidence_for_role` always
+    /// rejects it before anything gets committed. That's the correct,
+    /// honest behavior for a provider that does no real reasoning, not a
+    /// bug in the gate.
+    fn propose_field_semantic_role(&self, task: &ProposeFieldSemanticRoleTask) -> Result<SemanticRoleResult> {
+        Ok(SemanticRoleResult {
+            tracked_value: format!("{} + 0x{:x}", task.base, task.offset),
+            propagation_chain: Vec::new(),
+            decisive_sink: None,
+            semantic_role: Some(format!("field_0x{:x}", task.offset)),
+            evidence: Vec::new(),
+            competing_interpretations: Vec::new(),
+            confidence: 0.3,
         })
     }
 }

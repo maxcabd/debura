@@ -685,7 +685,13 @@ fn main() -> Result<()> {
                 program.functions.iter().map(|f| (f.raw_name.as_str(), f)).collect();
             let symbol_table = debura_recovery::build_symbol_table(&program.classes, &program.functions);
 
-            let (mut proposed, mut accepted, mut skipped_existing, mut skipped_no_function) = (0u32, 0u32, 0u32, 0u32);
+            let mut skipped_existing = 0u32;
+            let mut skipped_no_function = 0u32;
+            let mut roles_proposed = 0u32;
+            let mut roles_accepted = 0u32;
+            let mut skipped_no_role = 0u32;
+            let mut names_proposed = 0u32;
+            let mut names_accepted = 0u32;
 
             for field in &program.discovered_fields {
                 let already_named = graph.hypotheses().any(|h| {
@@ -729,17 +735,125 @@ fn main() -> Result<()> {
                     data_symbol_names.extend(extract_data_symbol_references(&c.callee_decompilation));
                 }
                 let data_symbol_names: Vec<String> = data_symbol_names.into_iter().collect();
-                let relevant_data_references: Vec<String> =
-                    debura_recovery::classify_data_symbols(&graph, &data_symbol_names, &symbol_table)
-                        .into_iter()
-                        .filter_map(|r| match r.kind {
-                            debura_recovery::DataSymbolKind::StringLiteral(value) => {
-                                Some(format!("{}: string {:?}", r.symbol_name, value))
-                            }
-                            _ => None,
-                        })
-                        .collect();
+                let string_resolutions = debura_recovery::classify_data_symbols(&graph, &data_symbol_names, &symbol_table);
+                let relevant_data_references: Vec<String> = string_resolutions
+                    .iter()
+                    .filter_map(|r| match &r.kind {
+                        debura_recovery::DataSymbolKind::StringLiteral(value) => {
+                            Some(format!("{}: string {:?}", r.symbol_name, value))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                let resolved_strings: std::collections::HashMap<String, String> = string_resolutions
+                    .into_iter()
+                    .filter_map(|r| match r.kind {
+                        debura_recovery::DataSymbolKind::StringLiteral(value) => Some((r.symbol_name, value)),
+                        _ => None,
+                    })
+                    .collect();
 
+                // PROJECT.md, "Two-stage semantic reasoning": real,
+                // deterministic sink facts -- never model-guessed -- that
+                // the tracked value is displayed adjacent to a resolved
+                // string literal. The single strongest evidence category
+                // when non-empty.
+                let mut display_associations = Vec::new();
+                for consumer in &value_consumer_list {
+                    display_associations.extend(debura_recovery::find_display_associations(consumer, &resolved_strings));
+                }
+                let display_association_lines: Vec<String> = display_associations
+                    .iter()
+                    .map(|a| {
+                        format!(
+                            "tracked value, as \"{}\", is displayed immediately adjacent to {} (\"{}\") in {}",
+                            a.value_expr, a.label_symbol, a.label, a.sink_function
+                        )
+                    })
+                    .collect();
+                // The exact evidence strings a `decisive_sink` citation is
+                // checked against -- the same evidence the task itself was
+                // given, so a proposal can never cite something it wasn't
+                // actually shown.
+                let mut known_sinks = display_association_lines.clone();
+                known_sinks.extend(value_consumer_list.iter().map(|c| c.callee_raw_name.clone()));
+
+                // Stage 1: establish what the field *means* before ever
+                // asking how to spell it. An ACCEPTED role from a
+                // previous run is reused as-is; otherwise propose one now
+                // and commit only a Debura-computed confidence (never the
+                // model's own self-report) once `decisive_sink` verifies
+                // against real evidence -- `None` means no proposal is
+                // committed at all this run, not even at low confidence.
+                let accepted_role = graph
+                    .hypotheses()
+                    .filter(|h| {
+                        h.subject == field.subject
+                            && h.predicate == "field_semantic_role"
+                            && h.status == debura_knowledge::HypothesisStatus::Accepted
+                    })
+                    .max_by_key(|h| h.id.0)
+                    .map(|h| h.value.clone());
+
+                let role = match accepted_role {
+                    Some(role) => Some(role),
+                    None => {
+                        let role_task = debura_agent::ProposeFieldSemanticRoleTask::build(
+                            &graph,
+                            &field.subject,
+                            &function.address,
+                            &function.display_name,
+                            &function.decompilation,
+                            &field.base,
+                            field.offset,
+                            field.width,
+                            &field.declared_type,
+                            sibling_fields.clone(),
+                            value_consumers.clone(),
+                            relevant_data_references.clone(),
+                            display_association_lines,
+                            known_sinks.clone(),
+                        );
+                        let role_result = provider.propose_field_semantic_role(&role_task)?;
+                        match debura_agent::debura_confidence_for_role(&role_result, &known_sinks) {
+                            None => {
+                                skipped_no_role += 1;
+                                None
+                            }
+                            Some(confidence) => {
+                                roles_proposed += 1;
+                                let hypothesis = debura_agent::ProposedHypothesis {
+                                    predicate: "field_semantic_role".to_string(),
+                                    value: role_result.semantic_role.clone().unwrap_or_default(),
+                                    confidence,
+                                    depends_on: Vec::new(),
+                                };
+                                let id = debura_agent::commit_hypothesis(&mut graph, &field.subject, &hypothesis, None);
+                                debura_verifier::challenge_hypothesis(&mut graph, provider.as_ref(), id, &policy)?;
+                                if graph.hypothesis(id).map(|h| h.status) == Some(debura_knowledge::HypothesisStatus::Contested) {
+                                    debura_verifier::resolve_contradiction(&mut graph, provider.as_ref(), id, &policy)?;
+                                }
+                                let status = graph.hypothesis(id).map(|h| h.status);
+                                println!("{} (role): {} = {:.2} ({:?})", field.subject, hypothesis.value, confidence, status);
+                                if status == Some(debura_knowledge::HypothesisStatus::Accepted) {
+                                    roles_accepted += 1;
+                                    Some(hypothesis.value)
+                                } else {
+                                    None
+                                }
+                            }
+                        }
+                    }
+                };
+                let Some(role) = role else {
+                    // No accepted role yet this run -- naming would have
+                    // nothing real to spell, so it doesn't run at all.
+                    continue;
+                };
+
+                // Stage 2: spell the already-established role as a real
+                // identifier -- this task no longer has to (and must not)
+                // re-derive what the field means.
                 let task = debura_agent::ProposeFieldNameTask::build(
                     &graph,
                     &field.subject,
@@ -753,6 +867,7 @@ fn main() -> Result<()> {
                     sibling_fields,
                     value_consumers,
                     relevant_data_references,
+                    &role,
                 );
 
                 let result = provider.propose_field_name(&task)?;
@@ -760,7 +875,7 @@ fn main() -> Result<()> {
                     if hypothesis.predicate != "field_semantic_name" {
                         continue;
                     }
-                    proposed += 1;
+                    names_proposed += 1;
                     let id = debura_agent::commit_hypothesis(&mut graph, &field.subject, hypothesis, None);
                     debura_verifier::challenge_hypothesis(&mut graph, provider.as_ref(), id, &policy)?;
                     if graph.hypothesis(id).map(|h| h.status) == Some(debura_knowledge::HypothesisStatus::Contested) {
@@ -769,7 +884,7 @@ fn main() -> Result<()> {
                     if let Some(h) = graph.hypothesis(id) {
                         println!("{}: {} = {} ({:?})", field.subject, h.value, h.confidence, h.status);
                         if h.status == debura_knowledge::HypothesisStatus::Accepted {
-                            accepted += 1;
+                            names_accepted += 1;
                         }
                     }
                 }
@@ -780,8 +895,11 @@ fn main() -> Result<()> {
             println!("\nFields considered:      {}", program.discovered_fields.len());
             println!("Already named:          {skipped_existing}");
             println!("No recovered function:  {skipped_no_function}");
-            println!("Proposed this run:      {proposed}");
-            println!("Accepted this run:      {accepted}");
+            println!("Roles proposed:         {roles_proposed}");
+            println!("Roles accepted:         {roles_accepted}");
+            println!("No role this run:       {skipped_no_role}");
+            println!("Names proposed:         {names_proposed}");
+            println!("Names accepted:         {names_accepted}");
         }
         Command::Frontier { project, linker_log } => {
             let root = debura_core::config::projects_dir().join(&project);

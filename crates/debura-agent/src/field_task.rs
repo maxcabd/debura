@@ -1,4 +1,5 @@
 use debura_knowledge::{Hypothesis, KnowledgeGraph};
+use serde::{Deserialize, Serialize};
 
 use crate::call_context;
 
@@ -56,6 +57,14 @@ pub struct ProposeFieldNameTask {
     /// real string (never every data reference regardless of relevance)
     /// -- strings are the highest-value piece of this evidence class.
     pub relevant_data_references: Vec<String>,
+    /// PROJECT.md, "Two-stage semantic reasoning": the ALREADY-ACCEPTED
+    /// `field_semantic_role` for this exact field (e.g. `"remaining_lives"`)
+    /// -- this task's own real job narrows to spelling that established
+    /// concept as a real, idiomatic C++ identifier, never re-deriving or
+    /// second-guessing what the field actually means. That reasoning
+    /// already happened, adversarially verified, in
+    /// `ProposeFieldSemanticRoleTask` below.
+    pub established_role: String,
     /// Any hypothesis already proposed for this exact field subject (a
     /// retry after a REJECTED/CONTESTED name), mirroring
     /// `AnalyzeFunctionTask::rejection_reasons`'s own purpose.
@@ -77,6 +86,7 @@ impl ProposeFieldNameTask {
         sibling_fields: Vec<String>,
         value_consumers: Vec<String>,
         relevant_data_references: Vec<String>,
+        established_role: &str,
     ) -> Self {
         Self {
             subject: subject.to_string(),
@@ -90,9 +100,153 @@ impl ProposeFieldNameTask {
             reachable_api_hints: call_context::reachable_api_hints(graph, function_address),
             value_consumers,
             relevant_data_references,
+            established_role: established_role.to_string(),
             existing_hypotheses: graph.hypotheses().filter(|h| h.subject == subject).cloned().collect(),
         }
     }
+}
+
+/// PROJECT.md, "Two-stage semantic reasoning": proposes what a field
+/// *means* -- a concept (`"remaining_lives"`), never an identifier --
+/// forcing the model to trace the tracked value through the same
+/// evidence `ProposeFieldNameTask` sees and cite a `decisive_sink`
+/// Debura can independently verify, rather than free-associating a
+/// plausible-sounding name in one shot. The real, confirmed reason this
+/// exists: with every piece of evidence already correct and complete
+/// (the full value-consumer chain, a resolved `"Lives: "` string
+/// literal immediately adjacent to the tracked value), a single-stage
+/// naming task still proposed `m_drawableCount` at 0.95 self-reported
+/// confidence -- correct evidence, wrong abstraction, a confidence
+/// number with no real relationship to evidence quality. Splitting
+/// "what does this mean" from "what do we call it" and requiring a
+/// verifiable citation is the fix; `debura_confidence_for_role` below is
+/// the other half (never trusting the model's own confidence directly).
+#[derive(Debug, Clone)]
+pub struct ProposeFieldSemanticRoleTask {
+    pub subject: String,
+    pub function_display_name: String,
+    pub function_decompilation: String,
+    pub base: String,
+    pub offset: i64,
+    pub width: u32,
+    pub declared_type: String,
+    pub sibling_fields: Vec<String>,
+    pub reachable_api_hints: Vec<String>,
+    pub value_consumers: Vec<String>,
+    pub relevant_data_references: Vec<String>,
+    /// PROJECT.md, "Deterministic string-literal extraction" +
+    /// "Two-stage semantic reasoning": `DisplayAssociation` facts
+    /// (`display_association::find_display_associations`, debura-
+    /// recovery), formatted as human-readable sink descriptions (e.g.
+    /// `"tracked value, as \"param_4 + -1\", is displayed immediately
+    /// after DAT_14000e0c0 (\"Lives: \") in FUN_14000205a"`) -- the
+    /// single strongest evidence category when non-empty, framed as
+    /// such in the system prompt.
+    pub display_associations: Vec<String>,
+    /// The exact set of citable sink identifiers `verify_decisive_sink`
+    /// checks a proposal's own `decisive_sink` against -- built from
+    /// `display_associations` and `value_consumers` above, the same
+    /// evidence the task itself was given, so a proposal can never cite
+    /// a sink that wasn't actually shown to it.
+    pub known_sinks: Vec<String>,
+    pub existing_hypotheses: Vec<Hypothesis>,
+}
+
+impl ProposeFieldSemanticRoleTask {
+    #[allow(clippy::too_many_arguments)]
+    pub fn build(
+        graph: &KnowledgeGraph,
+        subject: &str,
+        function_address: &str,
+        function_display_name: &str,
+        function_decompilation: &str,
+        base: &str,
+        offset: i64,
+        width: u32,
+        declared_type: &str,
+        sibling_fields: Vec<String>,
+        value_consumers: Vec<String>,
+        relevant_data_references: Vec<String>,
+        display_associations: Vec<String>,
+        known_sinks: Vec<String>,
+    ) -> Self {
+        Self {
+            subject: subject.to_string(),
+            function_display_name: function_display_name.to_string(),
+            function_decompilation: function_decompilation.to_string(),
+            base: base.to_string(),
+            offset,
+            width,
+            declared_type: declared_type.to_string(),
+            sibling_fields,
+            reachable_api_hints: call_context::reachable_api_hints(graph, function_address),
+            value_consumers,
+            relevant_data_references,
+            display_associations,
+            known_sinks,
+            existing_hypotheses: graph.hypotheses().filter(|h| h.subject == subject).cloned().collect(),
+        }
+    }
+}
+
+/// What an `AgentProvider` returns for one `ProposeFieldSemanticRoleTask`
+/// -- structured to force tracing, not just conclude. `semantic_role`
+/// and `decisive_sink` are both `None`-able: the honest outcome when the
+/// evidence doesn't actually support a specific claim is proposing
+/// nothing, the same "leave it unproposed rather than guess" discipline
+/// every other predicate in this codebase already follows.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SemanticRoleResult {
+    pub tracked_value: String,
+    pub propagation_chain: Vec<String>,
+    pub decisive_sink: Option<String>,
+    pub semantic_role: Option<String>,
+    pub evidence: Vec<String>,
+    pub competing_interpretations: Vec<String>,
+    /// The model's own self-reported confidence -- kept on the wire type
+    /// for transparency and debugging, but `debura_confidence_for_role`
+    /// below is what actually gets committed; this number, alone, is
+    /// never trusted (the real, confirmed reason: `m_drawableCount` self-
+    /// reported 0.95 with no relationship to evidence quality at all).
+    pub confidence: f64,
+}
+
+/// Whether `result`'s own `decisive_sink` actually corresponds to a real
+/// piece of evidence this exact task was given -- `known_sinks` is the
+/// same list the task itself carried, so a proposal can never cite
+/// something that wasn't actually shown to it. A citation is accepted by
+/// substring match in either direction (the model may paraphrase, e.g.
+/// quoting only the label text rather than the full formatted sink
+/// description) -- deliberately loose enough to not punish reasonable
+/// phrasing, deliberately strict in requiring the cited text to overlap
+/// with something real either way.
+pub fn verify_decisive_sink(result: &SemanticRoleResult, known_sinks: &[String]) -> bool {
+    let Some(sink) = result.decisive_sink.as_deref().map(str::trim).filter(|s| !s.is_empty()) else {
+        return false;
+    };
+    known_sinks.iter().any(|known| known.contains(sink) || sink.contains(known.as_str()))
+}
+
+/// PROJECT.md, "Two-stage semantic reasoning": Debura's own confidence
+/// for a proposed `field_semantic_role` -- never `result.confidence`
+/// (the model's own self-report) directly. `None` means: propose
+/// nothing at all, not even at low confidence -- the "reject before
+/// naming" gate, hit whenever no role was proposed, or a role was
+/// proposed with no `decisive_sink` that `verify_decisive_sink` can
+/// confirm against real evidence (exactly the `m_drawableCount` failure
+/// mode: a confident-sounding claim with nothing underneath it).
+/// `Some(confidence)` is a small, fixed, deliberately simple two-tier
+/// value -- a real, defensible starting point, not a tuned weighted
+/// formula -- rewarding a real, verified sink citation and a
+/// non-trivial propagation trace, never the model's own number.
+pub fn debura_confidence_for_role(result: &SemanticRoleResult, known_sinks: &[String]) -> Option<f64> {
+    let role = result.semantic_role.as_deref().map(str::trim).filter(|s| !s.is_empty())?;
+    let _ = role;
+    if !verify_decisive_sink(result, known_sinks) {
+        return None;
+    }
+    let trace_bonus = if result.propagation_chain.len() >= 2 { 0.1 } else { 0.0 };
+    Some((0.8_f64 + trace_bonus).min(0.95))
 }
 
 #[cfg(test)]
@@ -118,9 +272,103 @@ mod tests {
             vec!["offset 0xc, width 1, type char".to_string()],
             Vec::new(),
             Vec::new(),
+            "remaining_lives",
         );
 
         assert_eq!(task.existing_hypotheses.len(), 1);
         assert_eq!(task.existing_hypotheses[0].value, "m_lives");
+    }
+
+    fn known_sinks() -> Vec<String> {
+        vec![
+            "tracked value, as \"param_4 + -1\", is displayed immediately adjacent to DAT_14000e0c0 (\"Lives: \") in FUN_14000205a".to_string(),
+            "FUN_140001cb0".to_string(),
+            "FUN_14000213e".to_string(),
+        ]
+    }
+
+    /// The real, confirmed regression case: a role citing the exact real
+    /// display-association evidence must verify and get a real,
+    /// deterministic confidence -- never the model's own self-report.
+    #[test]
+    fn a_role_citing_the_real_display_association_verifies_and_gets_a_real_confidence() {
+        let result = SemanticRoleResult {
+            tracked_value: "param_4".to_string(),
+            propagation_chain: vec![
+                "field +0x4".to_string(),
+                "passed to FUN_140001cb0 parameter 2".to_string(),
+                "passed to FUN_14000205a parameter 3".to_string(),
+            ],
+            decisive_sink: Some(
+                "tracked value, as \"param_4 + -1\", is displayed immediately adjacent to DAT_14000e0c0 (\"Lives: \") in FUN_14000205a"
+                    .to_string(),
+            ),
+            semantic_role: Some("remaining_lives".to_string()),
+            evidence: vec!["displayed next to Lives: label".to_string()],
+            competing_interpretations: vec!["drawable_count -- rejected, does not explain the Lives: label".to_string()],
+            confidence: 0.42, // deliberately different from what Debura should compute -- must never be used directly
+        };
+
+        assert!(verify_decisive_sink(&result, &known_sinks()));
+        let confidence = debura_confidence_for_role(&result, &known_sinks());
+        assert!(confidence.is_some());
+        assert!((confidence.unwrap() - 0.42).abs() > 0.01, "must not reuse the model's own self-reported confidence");
+    }
+
+    /// The real, confirmed failure mode this whole mechanism exists to
+    /// catch: a confident-sounding role (`drawable_count`, self-reported
+    /// 0.95 -- exactly what a real run without this gate produced) that
+    /// cites no real sink from the evidence it was actually given. Must
+    /// never be committed, regardless of its own stated confidence.
+    #[test]
+    fn a_drawable_count_shaped_proposal_with_no_matching_sink_is_never_committed() {
+        let result = SemanticRoleResult {
+            tracked_value: "param_4".to_string(),
+            propagation_chain: vec!["field +0x4".to_string()],
+            decisive_sink: Some("the field is used to track how many drawable objects exist".to_string()),
+            semantic_role: Some("drawable_count".to_string()),
+            evidence: Vec::new(),
+            competing_interpretations: Vec::new(),
+            confidence: 0.95,
+        };
+
+        assert!(!verify_decisive_sink(&result, &known_sinks()));
+        assert_eq!(debura_confidence_for_role(&result, &known_sinks()), None);
+    }
+
+    /// No `decisive_sink` cited at all (the honest "I did no real
+    /// tracing" outcome, e.g. `EchoProvider`'s own response) must also
+    /// never be committed, even when a role is proposed.
+    #[test]
+    fn a_role_with_no_decisive_sink_at_all_is_never_committed() {
+        let result = SemanticRoleResult {
+            tracked_value: "param_4".to_string(),
+            propagation_chain: Vec::new(),
+            decisive_sink: None,
+            semantic_role: Some("field_0x4".to_string()),
+            evidence: Vec::new(),
+            competing_interpretations: Vec::new(),
+            confidence: 0.3,
+        };
+
+        assert_eq!(debura_confidence_for_role(&result, &known_sinks()), None);
+    }
+
+    /// No `semantic_role` proposed at all (the honest "the evidence
+    /// doesn't support a specific claim" outcome) must never be
+    /// committed either, even if a sink happens to be cited.
+    #[test]
+    fn no_semantic_role_proposed_is_never_committed() {
+        let result = SemanticRoleResult {
+            tracked_value: "param_4".to_string(),
+            propagation_chain: Vec::new(),
+            decisive_sink: Some("FUN_14000205a".to_string()),
+            semantic_role: None,
+            evidence: Vec::new(),
+            competing_interpretations: Vec::new(),
+            confidence: 0.9,
+        };
+
+        assert_eq!(debura_confidence_for_role(&result, &known_sinks()), None);
     }
 }

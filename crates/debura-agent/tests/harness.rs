@@ -1,8 +1,9 @@
 use debura_agent::{
-    analyze_function, commit_contradiction, commit_hypothesis, mock::EchoProvider, AgentProvider,
-    AnalyzeFunctionTask, ChallengeHypothesisTask, ChallengeResult, ConfidenceUpdate,
-    InvestigationResult, ProposeFieldNameTask, ProposedContradiction, ProposedHypothesis,
-    ProposedObservation, Resolution, ResolutionResult, ResolveContradictionTask,
+    analyze_function, commit_contradiction, commit_hypothesis, debura_confidence_for_role,
+    mock::EchoProvider, verify_decisive_sink, AgentProvider, AnalyzeFunctionTask,
+    ChallengeHypothesisTask, ChallengeResult, ConfidenceUpdate, InvestigationResult,
+    ProposeFieldNameTask, ProposeFieldSemanticRoleTask, ProposedContradiction, ProposedHypothesis,
+    ProposedObservation, Resolution, ResolutionResult, ResolveContradictionTask, SemanticRoleResult,
 };
 use debura_knowledge::{HypothesisId, HypothesisStatus, KnowledgeGraph};
 
@@ -295,6 +296,7 @@ fn a_proposed_field_name_commits_through_the_existing_hypothesis_machinery() {
         Vec::new(),
         Vec::new(),
         Vec::new(),
+        "remaining_lives",
     );
 
     let result = EchoProvider.propose_field_name(&task).unwrap();
@@ -306,4 +308,144 @@ fn a_proposed_field_name_commits_through_the_existing_hypothesis_machinery() {
     let committed = graph.hypothesis(id).unwrap();
     assert_eq!(committed.subject, "field:FUN_1400025b0:local_b8+0x4");
     assert_eq!(committed.predicate, "field_semantic_name");
+}
+
+/// A provider that cites the real display-association evidence for
+/// `field_semantic_role`, then names according to whatever role it's
+/// given -- standing in for a real, well-behaved reasoning backend so
+/// the full two-stage commit/challenge/accept flow can be exercised
+/// through the real harness/verifier machinery, not just the pure gate
+/// functions `field_task.rs`'s own unit tests already cover.
+struct TwoStageProvider;
+
+const REAL_KNOWN_SINK: &str = "tracked value, as \"param_4 + -1\", is displayed immediately \
+    adjacent to DAT_14000e0c0 (\"Lives: \") in FUN_14000205a";
+
+impl AgentProvider for TwoStageProvider {
+    fn investigate(&self, _task: &AnalyzeFunctionTask) -> anyhow::Result<InvestigationResult> {
+        Ok(InvestigationResult::default())
+    }
+
+    fn challenge(&self, _task: &ChallengeHypothesisTask) -> anyhow::Result<ChallengeResult> {
+        Ok(ChallengeResult::default())
+    }
+
+    fn resolve_contradiction(&self, task: &ResolveContradictionTask) -> anyhow::Result<ResolutionResult> {
+        Ok(ResolutionResult {
+            resolution: Resolution::Survives { confidence: task.hypothesis.confidence },
+            reasoning: String::new(),
+        })
+    }
+
+    fn propose_field_semantic_role(&self, _task: &ProposeFieldSemanticRoleTask) -> anyhow::Result<SemanticRoleResult> {
+        Ok(SemanticRoleResult {
+            tracked_value: "param_4".to_string(),
+            propagation_chain: vec![
+                "field +0x4".to_string(),
+                "passed to FUN_140001cb0 parameter 2".to_string(),
+                "passed to FUN_14000205a parameter 3".to_string(),
+                "used as param_4 + -1".to_string(),
+            ],
+            decisive_sink: Some(REAL_KNOWN_SINK.to_string()),
+            semantic_role: Some("remaining_lives".to_string()),
+            evidence: vec!["displayed immediately after the \"Lives: \" label".to_string()],
+            competing_interpretations: Vec::new(),
+            confidence: 0.5, // deliberately not what Debura should end up committing
+        })
+    }
+
+    fn propose_field_name(&self, task: &ProposeFieldNameTask) -> anyhow::Result<InvestigationResult> {
+        assert_eq!(task.established_role, "remaining_lives", "the naming stage must receive the accepted role");
+        Ok(InvestigationResult {
+            hypotheses: vec![ProposedHypothesis {
+                predicate: "field_semantic_name".to_string(),
+                value: "m_lives".to_string(),
+                confidence: 0.9,
+                depends_on: Vec::new(),
+            }],
+            ..Default::default()
+        })
+    }
+}
+
+/// The real, confirmed regression this whole mechanism exists for:
+/// field +0x4 -> `param_4` -> `param_4 + -1` displayed adjacent to
+/// `"Lives: "` must reach an accepted `field_semantic_role` (in
+/// `{lives, remaining_lives, life_count}`, not overfit to one exact
+/// token) through the real commit/challenge/accept machinery, *before*
+/// any naming task runs -- and the naming task, once it does run, must
+/// receive that established role rather than re-deriving anything.
+#[test]
+fn the_real_lives_field_reaches_an_accepted_role_before_naming_runs() {
+    let mut graph = KnowledgeGraph::new();
+    let provider = TwoStageProvider;
+    let known_sinks = vec![REAL_KNOWN_SINK.to_string(), "FUN_140001cb0".to_string(), "FUN_14000213e".to_string()];
+
+    let role_task = ProposeFieldSemanticRoleTask::build(
+        &graph,
+        "field:FUN_140003476:local_b8+0x4",
+        "0x140003476",
+        "initializeRandomState",
+        "undefined8 initializeRandomState(void) { ... }",
+        "local_b8",
+        4,
+        4,
+        "int",
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        vec![REAL_KNOWN_SINK.to_string()],
+        known_sinks.clone(),
+    );
+    let role_result = provider.propose_field_semantic_role(&role_task).unwrap();
+    assert!(verify_decisive_sink(&role_result, &known_sinks));
+
+    let confidence = debura_confidence_for_role(&role_result, &known_sinks).expect("a real sink must yield a real confidence");
+    assert!((confidence - role_result.confidence).abs() > 0.01, "must not reuse the model's own self-reported confidence");
+
+    let role_value = role_result.semantic_role.clone().unwrap();
+    let role_hypothesis = ProposedHypothesis {
+        predicate: "field_semantic_role".to_string(),
+        value: role_value.clone(),
+        confidence,
+        depends_on: Vec::new(),
+    };
+    let role_id = commit_hypothesis(&mut graph, &role_task.subject, &role_hypothesis, None);
+    // The real commit->challenge->accept transition is debura-verifier's
+    // own, already-tested job (and debura-agent deliberately doesn't
+    // depend on that crate -- the dependency runs the other way); a
+    // direct status transition here stands in for "the challenge found
+    // nothing wrong and it was accepted", the same simulation precedent
+    // `call_context.rs`'s own tests already use.
+    graph.set_status(role_id, HypothesisStatus::Accepted).unwrap();
+
+    let role_status = graph.hypothesis(role_id).unwrap().status;
+    assert_eq!(role_status, HypothesisStatus::Accepted, "the role must be accepted before naming ever runs");
+    assert!(
+        ["lives", "remaining_lives", "life_count"].contains(&role_value.as_str()),
+        "expected a lives-shaped concept, not overfit to one exact token: {role_value}"
+    );
+
+    let name_task = ProposeFieldNameTask::build(
+        &graph,
+        &role_task.subject,
+        "0x140003476",
+        "initializeRandomState",
+        "undefined8 initializeRandomState(void) { ... }",
+        "local_b8",
+        4,
+        4,
+        "int",
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        &role_value,
+    );
+    let name_result = provider.propose_field_name(&name_task).unwrap();
+    let name_id = commit_hypothesis(&mut graph, &name_task.subject, &name_result.hypotheses[0], None);
+    graph.set_status(name_id, HypothesisStatus::Accepted).unwrap();
+
+    let committed_name = graph.hypothesis(name_id).unwrap();
+    assert_eq!(committed_name.status, HypothesisStatus::Accepted);
+    assert_eq!(committed_name.value, "m_lives");
 }

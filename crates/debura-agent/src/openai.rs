@@ -14,7 +14,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::challenge::{ChallengeHypothesisTask, ChallengeResult};
-use crate::field_task::ProposeFieldNameTask;
+use crate::field_task::{ProposeFieldNameTask, ProposeFieldSemanticRoleTask, SemanticRoleResult};
 use crate::resolution::{Resolution, ResolutionResult, ResolveContradictionTask};
 use crate::result::InvestigationResult;
 use crate::task::AnalyzeFunctionTask;
@@ -491,60 +491,167 @@ impl AgentProvider for OpenAiProvider {
         )?;
         serde_json::from_value(value).context("mapping OpenAI output to InvestigationResult")
     }
+
+    fn propose_field_semantic_role(&self, task: &ProposeFieldSemanticRoleTask) -> Result<SemanticRoleResult> {
+        let user = render_propose_field_semantic_role_task(task);
+        let value = self.complete(
+            SEMANTIC_ROLE_SYSTEM,
+            &user,
+            "semantic_role_result",
+            semantic_role_result_schema(),
+        )?;
+        serde_json::from_value(value).context("mapping OpenAI output to SemanticRoleResult")
+    }
 }
 
-const FIELD_NAMING_SYSTEM: &str = "You are Debura's field-naming reasoning step. You are given \
-    one real struct/stack field a deterministic pass already confirmed the exact byte offset and \
-    width of (never guessed), inside a function whose body a compiled binary decompiled into. \
-    Propose, at most, one hypothesis under the predicate \"field_semantic_name\" (that literal \
+const SEMANTIC_ROLE_SYSTEM: &str = "You are Debura's field-semantic-role reasoning step, stage \
+    one of two. Your ONLY job here is determining what CONCEPT a field's value represents -- \
+    NEVER propose an identifier or variable name (that is a separate, later stage, run only once \
+    a role from this stage is accepted). You are given one real field a deterministic pass already \
+    confirmed the exact byte offset and width of (never guessed). \
+    \n\n\
+    Track the field through the evidence given below: identify every real occurrence of its own \
+    value -- or a value derived from it, such as a simple arithmetic transform -- across the \
+    defining function and every listed value consumer. Do not conclude first and justify \
+    afterward; trace first. \
+    \n\n\
+    The \"Display associations\" section, when non-empty, is the single strongest evidence \
+    available: it states a real, deterministic, machine-verified fact -- the tracked value's own \
+    expression is displayed immediately adjacent to a specific, already-decoded string literal, \
+    inside the same real stream chain. When it applies, you MUST explain what concept the tracked \
+    value represents specifically in terms of that relationship, and your decisive_sink MUST quote \
+    that exact display-association line (or close enough that Debura's own verification -- a plain \
+    substring match against the exact evidence you were given, not your paraphrase of it -- \
+    recognizes it). A semantic_role that does not explain the strongest available sink is invalid \
+    and will always be rejected, regardless of how confident it sounds; propose nothing at all \
+    rather than a role you cannot ground this way. When no display association exists, ground \
+    decisive_sink in the next-strongest real evidence instead -- a specific value-consumer body, \
+    quoted or closely referenced by that consumer's own function name -- never a vague restatement \
+    of \"the evidence provided.\" \
+    \n\n\
+    propagation_chain must list the real hops the tracked value actually takes, in order (e.g. \
+    \"field +0x4\", \"passed to FUN_140001cb0 parameter 2\", \"passed to FUN_14000205a parameter \
+    3\", \"used as param_4 + -1\", \"streamed immediately after DAT_14000e0c0 (\\\"Lives: \\\")\") \
+    -- the actual trace, not a summary of the sections below. \
+    \n\n\
+    semantic_role must be a concept, not an identifier -- snake_case or plain words (\"lives\", \
+    \"remaining_lives\", \"life_count\"), never member-styled (\"m_lives\") or camelCase; spelling \
+    the real identifier is entirely the next stage's job, once this role is independently accepted. \
+    List any genuinely different competing_interpretations you seriously considered, and why the \
+    cited evidence favors your answer over them, whenever more than one reading was plausible \
+    before you traced the value. If an existing hypothesis for this exact field is marked contested \
+    or rejected with a stated reason, do not propose the same role again -- address why it failed, \
+    propose something genuinely different and better-grounded, or propose nothing.";
+
+fn render_propose_field_semantic_role_task(task: &ProposeFieldSemanticRoleTask) -> String {
+    let mut out = format!(
+        "Field subject: {}\nDefining function: {}\nField: byte offset 0x{:x}, width {} bytes, declared type {}\n\n",
+        task.subject, task.function_display_name, task.offset, task.width, task.declared_type
+    );
+
+    out.push_str("Other confirmed fields on the same object:\n");
+    if task.sibling_fields.is_empty() {
+        out.push_str("(none)\n");
+    } else {
+        for sibling in &task.sibling_fields {
+            out.push_str(&format!("- {sibling}\n"));
+        }
+    }
+
+    out.push_str(&format!("\nDefining function's own decompiled body:\n{}\n", task.function_decompilation));
+
+    out.push_str("\nOther functions this field's own VALUE (not just its address) flows into, each with its own decompiled body:\n");
+    if task.value_consumers.is_empty() {
+        out.push_str("(none found)\n");
+    } else {
+        for consumer in &task.value_consumers {
+            out.push_str(&format!("- {consumer}\n"));
+        }
+    }
+
+    out.push_str("\nDisplay associations -- real, deterministic, machine-verified: the tracked value's own expression is displayed immediately adjacent to a resolved string literal, inside the same real stream chain. When present, this is your strongest evidence:\n");
+    if task.display_associations.is_empty() {
+        out.push_str("(none found)\n");
+    } else {
+        for assoc in &task.display_associations {
+            out.push_str(&format!("- {assoc}\n"));
+        }
+    }
+
+    out.push_str("\nRelevant data references -- real, deterministic content for DAT_*/PTR_* symbols mentioned above:\n");
+    if task.relevant_data_references.is_empty() {
+        out.push_str("(none found)\n");
+    } else {
+        for reference in &task.relevant_data_references {
+            out.push_str(&format!("- {reference}\n"));
+        }
+    }
+
+    out.push_str("\nAPI names reachable from the defining function's own callee tree:\n");
+    if task.reachable_api_hints.is_empty() {
+        out.push_str("(none found)\n");
+    } else {
+        out.push_str(&format!("{}\n", task.reachable_api_hints.join(", ")));
+    }
+
+    out.push_str("\nExisting hypotheses about this exact field's semantic role:\n");
+    if task.existing_hypotheses.is_empty() {
+        out.push_str("(none)\n");
+    }
+    for h in &task.existing_hypotheses {
+        out.push_str(&format!(
+            "- {}: {} = {} (confidence {:.2}, status {:?})\n",
+            h.id, h.predicate, h.value, h.confidence, h.status
+        ));
+    }
+
+    out
+}
+
+fn semantic_role_result_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "tracked_value": {"type": "string"},
+            "propagation_chain": {"type": "array", "items": {"type": "string"}},
+            "decisive_sink": {"type": ["string", "null"]},
+            "semantic_role": {"type": ["string", "null"]},
+            "evidence": {"type": "array", "items": {"type": "string"}},
+            "competing_interpretations": {"type": "array", "items": {"type": "string"}},
+            "confidence": {"type": "number"}
+        },
+        "required": [
+            "tracked_value", "propagation_chain", "decisive_sink", "semantic_role",
+            "evidence", "competing_interpretations", "confidence"
+        ],
+        "additionalProperties": false
+    })
+}
+
+const FIELD_NAMING_SYSTEM: &str = "You are Debura's field-naming reasoning step, stage two of \
+    two. A semantic role for this field has ALREADY been independently proposed, verified, and \
+    ACCEPTED -- it is given to you below as an established fact, not something to re-derive, \
+    question, or second-guess. If you genuinely believe the established role is wrong, propose \
+    nothing at all rather than silently substituting a different one; that disagreement belongs \
+    in a fresh role proposal, a separate task this one never runs. \
+    \n\n\
+    Your ONLY job is to spell that already-established concept as a real, idiomatic C++ member \
+    identifier matching this codebase's own existing recovered names (e.g. \"m_lives\", \
+    \"m_hasUpdated\", \"m_remainingLives\") -- member-style, never a bare word or snake_case \
+    concept name on its own. Propose, at most, one hypothesis under the predicate \"field_semantic_name\" (that literal \
     string) -- the only predicate Debura's C++ recovery step reads to rename a field; anything \
     under another predicate is invisible to it. \
     \n\n\
-    Evidence bar, same spirit as function naming: base the name on how the field is actually \
-    used -- what it's compared against, what modifies it, what nearby sibling fields on the same \
-    object suggest about the object's overall purpose, and what the defining function's own \
-    reachable API calls suggest about its domain (a function that calls SDL_RenderCopy is \
-    probably rendering-related, for instance). \
-    \n\n\
-    Give the heaviest weight to the \"other functions this field's own value flows into\" section \
-    below, when it's non-empty -- a field is frequently only *set* where it's declared, while the \
-    evidence that actually explains what it means lives in a completely different function that \
-    receives its value as a plain argument (not its address). A real, confirmed case: a lives \
-    counter's own defining function only decrements and compares it -- nothing there says \
-    \"lives\" -- but a function two calls away, reached exactly through this section, builds and \
-    renders a \"Lives: \" label using that same value. Read every listed consumer's own body for \
-    exactly this kind of clinching evidence before deciding the defining function's own body is \
-    all there is to go on. A real run without this section available proposed \
-    \"m_counter\"/\"m_isActive\" for fields like this and, correctly, had them rejected for lacking \
-    exactly this kind of evidence -- don't repeat that mistake when the section is available and \
-    actually says something. A 4-byte field that's read in a loop condition as \"greater than \
-    zero keep going\", decremented somewhere on a collision path, and displayed next to a \
-    \"Lives: \" label (whether found in the defining function or a value consumer) is \
-    well-evidenced as \"m_lives\"; a field with no comparison, no clear write pattern, no naming \
-    sibling fields, and no clinching value-consumer evidence is not -- leave it unproposed rather \
-    than guess. \
-    \n\n\
-    Weight the \"relevant data references\" section above that: it is the single strongest signal \
-    available when it applies. Every DAT_*/PTR_* symbol listed there has a real, deterministic, \
-    decoded string value (never a guess -- either Ghidra's own type system already confirmed it, \
-    or Debura found the exact literal argument passed to the real constructor call that builds \
-    that object). When a value consumer's own body both receives this field's value *and* \
-    references one of these resolved symbols -- the real, confirmed case: a function builds a \
-    display string by streaming this field's value together with a symbol that resolves to \
-    \"Lives: \" -- that symbol's own decoded text is direct, textual evidence for the field's real \
-    name, not merely structural inference from control flow. Prefer a name drawn straight from a \
-    resolved string that's actually adjacent to this field's own value (\"Lives: \" -> \"lives\" / \
-    \"m_lives\") over one inferred only from comparisons or a generic API domain -- text the \
-    program itself displays next to this exact value is stronger evidence than any structural \
-    pattern this evidence bar's earlier paragraphs describe. Never propose a generic placeholder (\"field\", \"value\", \
-    \"data\", \"state\", \"flag\" alone) -- that conveys nothing beyond the mechanical name \
-    already available, and is exactly as useless as no name at all while looking like real \
-    recovered knowledge. The value must be a valid C++ identifier, conventionally member-style \
-    (e.g. \"m_lives\", \"m_hasUpdated\") to match this codebase's existing recovered names. If an \
-    existing hypothesis for this exact field is marked contested or rejected with a stated reason, \
-    do not propose the same name again -- either address why it failed or propose something \
-    genuinely different, or leave it unproposed if the evidence doesn't actually support a \
-    different name either.";
+    Canonicalize the established role into idiomatic C++ member style: prefer the shortest, most \
+    conventional spelling a real codebase would use (\"remaining_lives\" -> \"m_lives\" is a real, \
+    confirmed acceptable canonicalization -- exact token preservation is not required, faithfulness \
+    to the established *meaning* is). Sibling field names given below (if any already have \
+    accepted names) are a real style signal -- match their own casing/prefix convention. Never \
+    propose a generic placeholder (\"field\", \"value\", \"data\", \"state\", \"flag\" alone) -- \
+    that conveys nothing beyond the mechanical name already available. The value must be a valid \
+    C++ identifier. If an existing hypothesis for this exact field's name is marked contested or \
+    rejected with a stated reason, do not propose the same name again -- either address why it \
+    failed or propose something genuinely different, still faithful to the established role.";
 
 const CHALLENGE_SYSTEM: &str = "You are Debura's ChallengeHypothesis adversarial verification \
     step. Your objective is NOT to find more evidence that the hypothesis is right -- it is to \
@@ -726,8 +833,8 @@ fn render_sequenced_calls(out: &mut String, label: &str, calls: &[crate::call_co
 
 fn render_propose_field_name_task(task: &ProposeFieldNameTask) -> String {
     let mut out = format!(
-        "Field subject: {}\nDefining function: {}\nField: byte offset 0x{:x}, width {} bytes, accessed as `{} {} *const)({} + 0x{:x})`\n\n",
-        task.subject, task.function_display_name, task.offset, task.width, task.declared_type, task.declared_type, task.base, task.offset
+        "ESTABLISHED SEMANTIC ROLE (already accepted -- spell this, do not re-derive it): {}\n\nField subject: {}\nDefining function: {}\nField: byte offset 0x{:x}, width {} bytes, accessed as `{} {} *const)({} + 0x{:x})`\n\n",
+        task.established_role, task.subject, task.function_display_name, task.offset, task.width, task.declared_type, task.declared_type, task.base, task.offset
     );
 
     out.push_str("Other confirmed fields on the same object:\n");

@@ -32,4 +32,7 @@ pub use result::{
     ProposedObservation,
 };
 pub use task::AnalyzeFunctionTask;
-pub use field_task::ProposeFieldNameTask;
+pub use field_task::{
+    debura_confidence_for_role, verify_decisive_sink, ProposeFieldNameTask, ProposeFieldSemanticRoleTask,
+    SemanticRoleResult,
+};
