@@ -3,7 +3,6 @@ use std::collections::HashMap;
 use debura_knowledge::KnowledgeGraph;
 
 use crate::forwarding_thunk::split_top_level_comma;
-use crate::model::RecoveredFunction;
 use crate::phantom_local::{find_calls, strip_casts_and_parens};
 use crate::symtab::{SymbolKind, SymbolTable};
 
@@ -595,10 +594,27 @@ fn quoted_string_literal(arg: &str) -> Option<String> {
 /// recognizes elsewhere) -- a symbol merely mentioned somewhere else in
 /// a call's argument list is not this pattern, and guessing so would
 /// attribute an unrelated literal to the wrong object.
-pub fn find_constructor_string_literals(functions: &[RecoveredFunction]) -> HashMap<String, String> {
+///
+/// Deliberately reads every subject's own `decompiles_to` text directly
+/// from the graph (`latest_decompilation`, the same "prefer substantive
+/// over degenerate/stale" selection every other real lookup in this
+/// codebase already trusts), not `extract()`'s own recovered-functions
+/// list -- a real, confirmed gap found while verifying this: Snake's own
+/// `FUN_14000227e` is never *called* from anything Debura's own
+/// reachability analysis recovers (it only ever runs via the CRT's own
+/// static-initializer table, a data-driven mechanism outside any
+/// recovered call graph), so it never clears `extract()`'s own
+/// Application-provenance gate and never appears in `RecoveredFunction`s
+/// at all -- yet Ghidra decompiled it just fine, and its own real
+/// literal is sitting right there, unused, the moment this reads the
+/// graph directly instead.
+pub fn find_constructor_string_literals(graph: &KnowledgeGraph) -> HashMap<String, String> {
     let mut literals = HashMap::new();
-    for f in functions {
-        for (_, args_text) in find_calls(&f.decompilation) {
+    let subjects: std::collections::BTreeSet<&str> =
+        graph.observations().filter(|o| o.predicate == "decompiles_to").map(|o| o.subject.as_str()).collect();
+    for subject in subjects {
+        let Some(decompilation) = debura_knowledge::latest_decompilation(graph, subject) else { continue };
+        for (_, args_text) in find_calls(&decompilation.value) {
             let args = split_top_level_comma(args_text);
             let Some(first) = args.first() else { continue };
             let first = strip_casts_and_parens(first);
@@ -651,17 +667,8 @@ fn classify_string_literal(
 /// Classifies every symbol in `symbol_names` (PROJECT.md M18.2) --
 /// `extract()`'s own convenience entry point, called once per recovery
 /// pass with the same symbol set `ghidra_data_symbols` already collects.
-/// `functions` is the same whole-program function list `extract()`
-/// already has in scope -- consulted only for
-/// `find_constructor_string_literals` above; every other classification
-/// path is unaffected and still reads purely from `graph`/`table`.
-pub fn classify_data_symbols(
-    graph: &KnowledgeGraph,
-    symbol_names: &[String],
-    table: &SymbolTable,
-    functions: &[RecoveredFunction],
-) -> Vec<DataResolution> {
-    let constructor_literals = find_constructor_string_literals(functions);
+pub fn classify_data_symbols(graph: &KnowledgeGraph, symbol_names: &[String], table: &SymbolTable) -> Vec<DataResolution> {
+    let constructor_literals = find_constructor_string_literals(graph);
     symbol_names
         .iter()
         .map(|name| classify_string_literal(graph, name, &constructor_literals).unwrap_or_else(|| classify_data_symbol(graph, name, table)))
@@ -1092,32 +1099,31 @@ mod tests {
         assert!(matches!(resolution.kind, DataSymbolKind::ConstantData { size: 8, .. }), "{:?}", resolution.kind);
     }
 
-    fn function(raw_name: &str, decompilation: &str) -> RecoveredFunction {
-        RecoveredFunction {
-            address: "0x1".to_string(),
-            raw_name: raw_name.to_string(),
-            display_name: raw_name.to_string(),
-            name_source: NameSource::Raw,
-            return_type: "void".to_string(),
-            params: String::new(),
-            decompilation: decompilation.to_string(),
-        }
-    }
-
     /// The real, confirmed case: Snake's own static initializer,
     /// `FUN_14000227e`, constructs two global `std::string`s from real
     /// literal arguments -- `DAT_14000e0a0` from `"Score: "`,
     /// `DAT_14000e0c0` from `"Lives: "`. Neither symbol has any static
     /// content of its own (`.bss`, uninitialized); the literals are only
-    /// ever visible in this constructor's own decompiled text.
+    /// ever visible in this constructor's own decompiled text. Also the
+    /// real, confirmed reason this reads the graph's own `decompiles_to`
+    /// observations directly, not `RecoveredFunction`s: this exact
+    /// constructor is never called from anything Debura's own
+    /// reachability analysis recovers (only the CRT's own static-
+    /// initializer table invokes it), so it never appears in a recovered
+    /// function list at all -- Ghidra decompiled it just fine regardless.
     #[test]
     fn finds_the_real_constructor_string_literals() {
-        let functions = vec![function(
-            "FUN_14000227e",
+        let mut graph = KnowledgeGraph::new();
+        graph.add_observation(
+            "0x14000227e",
+            "decompiles_to",
             "void FUN_14000227e(void)\n\n{\n  allocator local_2a;\n  allocator local_29;\n  \n  FUN_1400073b0((ulonglong *)&DAT_14000e0a0,\"Score: \",&local_2a);\n  FUN_140006740();\n  FUN_1400073b0((ulonglong *)&DAT_14000e0c0,\"Lives: \",&local_29);\n  FUN_140006740();\n  return;\n}",
-        )];
+            0.95,
+            "ghidra:decompiler",
+            None,
+        );
 
-        let literals = find_constructor_string_literals(&functions);
+        let literals = find_constructor_string_literals(&graph);
 
         assert_eq!(literals.get("DAT_14000e0a0").map(String::as_str), Some("Score: "));
         assert_eq!(literals.get("DAT_14000e0c0").map(String::as_str), Some("Lives: "));
@@ -1129,12 +1135,17 @@ mod tests {
     /// and guessing so risks pairing a literal with the wrong object.
     #[test]
     fn a_symbol_that_is_not_the_first_argument_gets_no_literal() {
-        let functions = vec![function(
-            "FUN_1",
+        let mut graph = KnowledgeGraph::new();
+        graph.add_observation(
+            "0x1",
+            "decompiles_to",
             "void FUN_1(void)\n\n{\n  FUN_2(local_1,\"unrelated\",&DAT_140009000);\n  return;\n}",
-        )];
+            0.95,
+            "ghidra:decompiler",
+            None,
+        );
 
-        let literals = find_constructor_string_literals(&functions);
+        let literals = find_constructor_string_literals(&graph);
 
         assert!(literals.get("DAT_140009000").is_none(), "{literals:?}");
     }
@@ -1145,14 +1156,18 @@ mod tests {
     /// object), but the constructor-literal source still resolves it.
     #[test]
     fn classify_data_symbols_resolves_a_constructor_literal_with_no_contains_string_observation() {
-        let graph = KnowledgeGraph::new();
-        let table = SymbolTable::new();
-        let functions = vec![function(
-            "FUN_14000227e",
+        let mut graph = KnowledgeGraph::new();
+        graph.add_observation(
+            "0x14000227e",
+            "decompiles_to",
             "void FUN_14000227e(void)\n\n{\n  FUN_1400073b0((ulonglong *)&DAT_14000e0c0,\"Lives: \",&local_29);\n  return;\n}",
-        )];
+            0.95,
+            "ghidra:decompiler",
+            None,
+        );
+        let table = SymbolTable::new();
 
-        let resolutions = classify_data_symbols(&graph, &["DAT_14000e0c0".to_string()], &table, &functions);
+        let resolutions = classify_data_symbols(&graph, &["DAT_14000e0c0".to_string()], &table);
 
         assert_eq!(resolutions.len(), 1);
         assert_eq!(resolutions[0].kind, DataSymbolKind::StringLiteral("Lives: ".to_string()));
@@ -1167,13 +1182,17 @@ mod tests {
     fn a_real_contains_string_observation_is_preferred_over_a_constructor_literal() {
         let mut graph = KnowledgeGraph::new();
         graph.add_observation("0x140009000", "contains_string", "\"Ghidra's own value\"", 0.95, "ghidra:data", None);
-        let table = SymbolTable::new();
-        let functions = vec![function(
-            "FUN_1",
+        graph.add_observation(
+            "0x1",
+            "decompiles_to",
             "void FUN_1(void)\n\n{\n  FUN_2((ulonglong *)&DAT_140009000,\"a different literal\",0);\n  return;\n}",
-        )];
+            0.95,
+            "ghidra:decompiler",
+            None,
+        );
+        let table = SymbolTable::new();
 
-        let resolutions = classify_data_symbols(&graph, &["DAT_140009000".to_string()], &table, &functions);
+        let resolutions = classify_data_symbols(&graph, &["DAT_140009000".to_string()], &table);
 
         assert_eq!(resolutions[0].kind, DataSymbolKind::StringLiteral("Ghidra's own value".to_string()));
         assert!((resolutions[0].confidence - 0.99).abs() < f64::EPSILON);

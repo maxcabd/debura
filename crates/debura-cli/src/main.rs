@@ -730,7 +730,7 @@ fn main() -> Result<()> {
                 }
                 let data_symbol_names: Vec<String> = data_symbol_names.into_iter().collect();
                 let relevant_data_references: Vec<String> =
-                    debura_recovery::classify_data_symbols(&graph, &data_symbol_names, &symbol_table, &program.functions)
+                    debura_recovery::classify_data_symbols(&graph, &data_symbol_names, &symbol_table)
                         .into_iter()
                         .filter_map(|r| match r.kind {
                             debura_recovery::DataSymbolKind::StringLiteral(value) => {
