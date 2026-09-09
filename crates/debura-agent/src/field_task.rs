@@ -214,17 +214,37 @@ pub struct SemanticRoleResult {
 /// Whether `result`'s own `decisive_sink` actually corresponds to a real
 /// piece of evidence this exact task was given -- `known_sinks` is the
 /// same list the task itself carried, so a proposal can never cite
-/// something that wasn't actually shown to it. A citation is accepted by
-/// substring match in either direction (the model may paraphrase, e.g.
-/// quoting only the label text rather than the full formatted sink
-/// description) -- deliberately loose enough to not punish reasonable
-/// phrasing, deliberately strict in requiring the cited text to overlap
-/// with something real either way.
+/// something that wasn't actually shown to it. First tries whole-string
+/// substring match in either direction; a real run showed that's too
+/// strict on its own (a model paraphrasing a display-association sentence
+/// -- same fact, different words -- failed it outright), so this falls
+/// back to requiring the citation to name one of the same load-bearing
+/// identifiers (a real symbol/function name, e.g. `DAT_14000e0c0` or
+/// `FUN_140001cb0`) that the known sink itself names. That still can't be
+/// satisfied by an invented sink -- the identifier has to be one Debura
+/// actually put in front of the model -- but no longer requires
+/// reproducing the exact sentence around it.
 pub fn verify_decisive_sink(result: &SemanticRoleResult, known_sinks: &[String]) -> bool {
     let Some(sink) = result.decisive_sink.as_deref().map(str::trim).filter(|s| !s.is_empty()) else {
         return false;
     };
-    known_sinks.iter().any(|known| known.contains(sink) || sink.contains(known.as_str()))
+    if known_sinks.iter().any(|known| known.contains(sink) || sink.contains(known.as_str())) {
+        return true;
+    }
+    let sink_tokens: std::collections::HashSet<&str> = significant_tokens(sink).collect();
+    known_sinks
+        .iter()
+        .any(|known| significant_tokens(known).any(|token| sink_tokens.contains(token)))
+}
+
+/// Identifier-shaped tokens (containing a digit or underscore, so
+/// `DAT_14000e0c0`/`FUN_140001cb0`/`param_4`/`local_b8` all qualify but
+/// ordinary English words in the surrounding sentence never do) -- the
+/// only tokens specific enough to actually anchor a citation to one real
+/// piece of evidence rather than any generic phrasing.
+fn significant_tokens(s: &str) -> impl Iterator<Item = &str> {
+    s.split(|c: char| !c.is_alphanumeric() && c != '_')
+        .filter(|t| t.len() >= 4 && (t.contains('_') || t.chars().any(|c| c.is_ascii_digit())))
 }
 
 /// PROJECT.md, "Two-stage semantic reasoning": Debura's own confidence
@@ -313,6 +333,49 @@ mod tests {
         let confidence = debura_confidence_for_role(&result, &known_sinks());
         assert!(confidence.is_some());
         assert!((confidence.unwrap() - 0.42).abs() > 0.01, "must not reuse the model's own self-reported confidence");
+    }
+
+    /// A real `debura semantic --provider openai` run against Snake hit
+    /// this exact case: the model cited `"param_4 + -1 immediately
+    /// adjacent to DAT_14000e0c0 (\"Lives: \")"` -- the same real fact as
+    /// `known_sinks()`'s display-association line, just reworded --
+    /// which the old whole-string-only match rejected outright, silently
+    /// blocking the role from ever being proposed. The shared identifier
+    /// (`DAT_14000e0c0`) must still ground it.
+    #[test]
+    fn a_paraphrased_citation_of_the_real_display_association_still_verifies() {
+        let result = SemanticRoleResult {
+            tracked_value: "param_4".to_string(),
+            propagation_chain: vec!["field +0x4".to_string(), "used as param_4 + -1".to_string()],
+            decisive_sink: Some("param_4 + -1 immediately adjacent to DAT_14000e0c0 (\"Lives: \")".to_string()),
+            semantic_role: Some("remaining_lives".to_string()),
+            evidence: Vec::new(),
+            competing_interpretations: Vec::new(),
+            confidence: 0.95,
+        };
+
+        assert!(verify_decisive_sink(&result, &known_sinks()));
+        assert!(debura_confidence_for_role(&result, &known_sinks()).is_some());
+    }
+
+    /// The fallback must still require a real, shared identifier -- a
+    /// citation that shares no load-bearing token with anything in
+    /// `known_sinks` (the `drawable_count`-shaped failure mode, reworded
+    /// to also dodge whole-string matching) must still be rejected.
+    #[test]
+    fn a_paraphrase_sharing_no_real_identifier_is_still_rejected() {
+        let result = SemanticRoleResult {
+            tracked_value: "param_4".to_string(),
+            propagation_chain: vec!["field +0x4".to_string()],
+            decisive_sink: Some("used to track how many drawable objects currently exist on screen".to_string()),
+            semantic_role: Some("drawable_count".to_string()),
+            evidence: Vec::new(),
+            competing_interpretations: Vec::new(),
+            confidence: 0.95,
+        };
+
+        assert!(!verify_decisive_sink(&result, &known_sinks()));
+        assert_eq!(debura_confidence_for_role(&result, &known_sinks()), None);
     }
 
     /// The real, confirmed failure mode this whole mechanism exists to
