@@ -36,7 +36,7 @@ fn latest<'a>(graph: &'a KnowledgeGraph, subject: &str, predicate: &str) -> Opti
 /// practice. Used directly as a C++ name, that doesn't compile, so it's
 /// treated the same as having no accepted hypothesis at all rather than
 /// emitted as-is.
-fn is_valid_cpp_identifier(s: &str) -> bool {
+pub(crate) fn is_valid_cpp_identifier(s: &str) -> bool {
     let mut chars = s.chars();
     matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
@@ -582,7 +582,7 @@ fn disambiguate_method_names(methods: &mut [RecoveredMethod]) {
 /// internals code the real toolchain already supplies for free" -- only
 /// an actual failed link can).
 pub fn extract(graph: &KnowledgeGraph) -> RecoveredProgram {
-    extract_impl(graph, &BTreeSet::new(), None)
+    extract_impl(graph, &BTreeSet::new(), None, crate::field_naming::NamesMode::Mixed)
 }
 
 /// Same as `extract`, but additionally recovers any address in
@@ -625,13 +625,28 @@ pub fn extract_with_required_runtime_bodies(
     required_runtime_bodies: &BTreeSet<String>,
     entry_wrapper_symbol: Option<&str>,
 ) -> RecoveredProgram {
-    extract_impl(graph, required_runtime_bodies, entry_wrapper_symbol)
+    extract_impl(graph, required_runtime_bodies, entry_wrapper_symbol, crate::field_naming::NamesMode::Mixed)
+}
+
+/// Same as `extract_with_required_runtime_bodies`, with explicit control
+/// over `names_mode` (PROJECT.md, "Field-level semantic naming") -- the
+/// entry point `debura recover --names` uses; every other caller gets
+/// `NamesMode::Mixed` (use an accepted field name when one exists,
+/// mechanical form otherwise) by default.
+pub fn extract_with_options(
+    graph: &KnowledgeGraph,
+    required_runtime_bodies: &BTreeSet<String>,
+    entry_wrapper_symbol: Option<&str>,
+    names_mode: crate::field_naming::NamesMode,
+) -> RecoveredProgram {
+    extract_impl(graph, required_runtime_bodies, entry_wrapper_symbol, names_mode)
 }
 
 fn extract_impl(
     graph: &KnowledgeGraph,
     required_runtime_bodies: &BTreeSet<String>,
     entry_wrapper_symbol: Option<&str>,
+    names_mode: crate::field_naming::NamesMode,
 ) -> RecoveredProgram {
     // PROJECT.md M15: a real run found libstdc++/CRT-internal classes
     // (`_Guard`, `_Vector_impl`, `__class_type_info`) getting the exact
@@ -855,7 +870,7 @@ fn extract_impl(
     // limit" doc comment). Also, like `phantom_local.rs`, must run
     // before call sites are rewritten against the whole-program symbol
     // table, matching every raw `FUN_<addr>` call site by its own text.
-    crate::stack_object::reconstruct_stack_objects(&mut functions);
+    let discovered_fields = crate::stack_object::reconstruct_stack_objects(&mut functions);
 
     // PROJECT.md M18.3/M19: a real Ghidra decompiler bug found by hand
     // (Snake's own self-collision-check loop) generalized into a real
@@ -867,6 +882,13 @@ fn extract_impl(
     // pass's own cross-function evidence-gathering matches call sites by
     // their raw `FUN_<addr>` text.
     crate::phantom_local::generalize_phantom_local_aliases(&mut functions);
+
+    // PROJECT.md, "Field-level semantic naming": renders any ACCEPTED
+    // field name onto the fields `reconstruct_stack_objects` (above)
+    // confirmed evidence for. Must run after `phantom_local.rs`: it
+    // needs the final, fully-resolved offset text, not an intermediate
+    // phantom-local alias still pointing at a not-yet-widened base.
+    crate::field_naming::apply_field_names(&mut functions, &discovered_fields, graph, names_mode);
 
     // PROJECT.md M18: a real compile found a genuinely surprising
     // self-rewrite -- `rewrite_call_sites` used to run on the *whole*
@@ -1029,5 +1051,6 @@ fn extract_impl(
         ghidra_intrinsics: ghidra_intrinsics.into_iter().collect(),
         unresolved_calls: unresolved_calls.into_iter().collect(),
         vtable_trampolines,
+        discovered_fields,
     }
 }

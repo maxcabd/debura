@@ -624,6 +624,37 @@ fn minimum_extent(facts: &[FieldFact]) -> i64 {
     extent
 }
 
+/// One field this module confirmed a real offset+width for while
+/// widening a stack object -- surfaced so a later, separate pass (M20's
+/// field-semantic-naming work: PROJECT.md, "Field-level semantic
+/// naming") can propose a real name for it, using exactly the evidence
+/// already computed here rather than re-deriving it. `subject` is this
+/// field's own identity in the knowledge graph: function-scoped for now
+/// (`"field:{function_raw_name}:{base}+0x{offset:x}"`) -- the same
+/// logical field reached from a *different* function via a differently-
+/// named local (a real, confirmed case: `initializeRandomState`'s
+/// `local_b8+0x4` and `initializeFoodParameters`'s `param_1[1]` are the
+/// same lives counter) gets a separate subject per occurrence; unifying
+/// those into one cross-function object identity is real future work,
+/// not attempted here.
+/// Only ever emitted for a field this pass rewrote with a *known,
+/// concrete* type (the base's own original scalar type, or a merged
+/// sibling's declared type) -- never for a fact whose only evidence is a
+/// width (an external-struct envelope, a cross-function dereference with
+/// no matching sibling local), since naming a field means rendering a
+/// real `TYPE *const NAME = (TYPE *)(base + offset);` alias, and
+/// guessing the wrong primitive type for a real width would be worse
+/// than not naming it at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoveredField {
+    pub subject: String,
+    pub function_raw_name: String,
+    pub base: String,
+    pub offset: i64,
+    pub width: u32,
+    pub declared_type: String,
+}
+
 /// Reconstructs every fragmented stack object this module can safely
 /// resolve, function by function: finds a local whose address is passed
 /// to some other, already-recovered function, collects every field fact
@@ -634,8 +665,10 @@ fn minimum_extent(facts: &[FieldFact]) -> i64 {
 /// fragment into a direct offset access. Must run before
 /// `phantom_local.rs`'s own pass: that pass needs a real, byte-granular
 /// pointer or array in scope to alias against, which this pass is what
-/// actually produces.
-pub fn reconstruct_stack_objects(functions: &mut [RecoveredFunction]) {
+/// actually produces. Returns every field it confirmed evidence for
+/// (deduplicated by offset+width per widened object), for the naming
+/// pass described above.
+pub fn reconstruct_stack_objects(functions: &mut [RecoveredFunction]) -> Vec<DiscoveredField> {
     // Keyed by *both* raw and display name: a real project whose earlier
     // `debura apply` run already renamed some functions in Ghidra itself
     // has call sites that mix the two -- a function renamed at some
@@ -652,6 +685,7 @@ pub fn reconstruct_stack_objects(functions: &mut [RecoveredFunction]) {
     }
 
     let mut rewrites: Vec<(usize, String)> = Vec::new();
+    let mut discovered: Vec<DiscoveredField> = Vec::new();
 
     for (i, f) in functions.iter().enumerate() {
         let Some(brace_open) = f.decompilation.find('{') else { continue };
@@ -703,6 +737,27 @@ pub fn reconstruct_stack_objects(functions: &mut [RecoveredFunction]) {
                 new_stmts_block = replace_whole_identifier(&new_stmts_block, &s.name, &replacement);
             }
             changed = true;
+
+            if !already_array {
+                discovered.push(DiscoveredField {
+                    subject: format!("field:{}:{}+0x0", f.raw_name, base),
+                    function_raw_name: f.raw_name.clone(),
+                    base: base.to_string(),
+                    offset: 0,
+                    width: current_size.min(u32::MAX as i64) as u32,
+                    declared_type: base_type.clone(),
+                });
+            }
+            for s in &siblings {
+                discovered.push(DiscoveredField {
+                    subject: format!("field:{}:{}+0x{:x}", f.raw_name, base, s.offset),
+                    function_raw_name: f.raw_name.clone(),
+                    base: base.to_string(),
+                    offset: s.offset,
+                    width: width_of_declared_type(&s.declared_type).unwrap(),
+                    declared_type: s.declared_type.clone(),
+                });
+            }
         }
 
         if changed {
@@ -720,6 +775,8 @@ pub fn reconstruct_stack_objects(functions: &mut [RecoveredFunction]) {
     for (i, rewritten) in rewrites {
         functions[i].decompilation = rewritten;
     }
+
+    discovered
 }
 
 /// `locals_block`, with `name`'s own scalar declaration replaced by a
@@ -921,7 +978,7 @@ mod tests {
             ),
         ];
 
-        reconstruct_stack_objects(&mut functions);
+        let discovered = reconstruct_stack_objects(&mut functions);
 
         let body = &functions[4].decompilation;
         assert!(body.contains("unsigned char local_b8[40];"), "{body}");
@@ -929,6 +986,20 @@ mod tests {
         assert!(!body.contains("local_ac"), "{body}");
         assert!(body.contains("*(int *)(local_b8 + 0x4)"), "{body}");
         assert!(body.contains("*(char *)(local_b8 + 0xc)"), "{body}");
+
+        // The real evidence this pass confirmed must be surfaced for the
+        // naming pass, keyed by the defining function and offset -- the
+        // `local_b4`-derived field (offset 4, m_lives) in particular,
+        // since that's the field a real hand-edit today confirmed by
+        // actually changing its value and watching the game react.
+        let lives_field = discovered
+            .iter()
+            .find(|f| f.function_raw_name == "FUN_140003476" && f.offset == 4)
+            .unwrap_or_else(|| panic!("no field discovered at offset 4: {discovered:?}"));
+        assert_eq!(lives_field.subject, "field:FUN_140003476:local_b8+0x4");
+        assert_eq!(lives_field.base, "local_b8");
+        assert_eq!(lives_field.width, 4);
+        assert_eq!(lives_field.declared_type, "int");
     }
 
     /// No address-taken evidence at all -- must never touch the local.
@@ -981,13 +1052,23 @@ mod tests {
             "undefined4 FUN_140001bf2(void)\n\n{\n  int iVar1;\n  int local_48 [5];\n  int local_34;\n  undefined4 local_c;\n  \n  local_c = 0xffffffff;\n  while (iVar1 = SDL_PollEvent(local_48), iVar1 != 0) {\n    if (local_48[0] == 0x100) {\n      local_c = 0;\n    }\n    else if (local_34 == 0x40000052) {\n      local_c = 1;\n    }\n  }\n  return local_c;\n}",
         )];
 
-        reconstruct_stack_objects(&mut functions);
+        let discovered = reconstruct_stack_objects(&mut functions);
 
         let body = &functions[0].decompilation;
         assert!(body.contains("unsigned char local_48[56];"), "{body}");
         assert!(!body.contains("local_34"), "{body}");
         assert!(body.contains("SDL_PollEvent(local_48)"), "base's own array-decay use must survive unchanged: {body}");
         assert!(body.contains("*(int *)(local_48 + 0x14)"), "{body}");
+
+        // `local_48` itself (already an array, and its own offset-0
+        // evidence is only a *width* from the SDL_Event envelope fact,
+        // not a concrete primitive type) must never be offered for
+        // naming -- only the real, concretely-typed merged sibling
+        // (`local_34`, a real `int`) should be.
+        assert_eq!(discovered.len(), 1, "{discovered:?}");
+        assert_eq!(discovered[0].subject, "field:FUN_140001bf2:local_48+0x14");
+        assert_eq!(discovered[0].declared_type, "int");
+        assert_eq!(discovered[0].width, 4);
         // The real, confirmed regression: `local_48[0]` used to read a
         // whole `int` (the array's original element type) -- once
         // widened to `unsigned char [56]`, the same text silently reads

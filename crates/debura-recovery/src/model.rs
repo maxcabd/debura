@@ -142,6 +142,12 @@ pub struct RecoveredProgram {
     /// free function in `functions.cpp`; `owner` is why every such
     /// owner's own class is folded into `function_references` too.
     pub vtable_trampolines: Vec<VtableTrampoline>,
+    /// Every stack-object field `stack_object::reconstruct_stack_objects`
+    /// confirmed real evidence for -- raw material for a later, separate
+    /// naming pass (PROJECT.md, "Field-level semantic naming") to propose
+    /// real names against, using the same evidence rather than
+    /// re-deriving it. Never itself read by rendering.
+    pub discovered_fields: Vec<crate::stack_object::DiscoveredField>,
 }
 
 /// See `RecoveredProgram::vtable_trampolines`.
