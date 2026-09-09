@@ -25,30 +25,28 @@
 /// principle throughout); a future pass could still surface it as a
 /// flagged review item, but this one never guesses.
 ///
-/// **Known scope limit, confirmed against a real, fresh regeneration of
-/// Snake**: this pass only ever proposes a replacement of the shape
-/// `PARAMETER + OFFSET`, where `PARAMETER` is a parameter *already
-/// declared as a byte-granular pointer* in the phantom local's own
-/// function. On today's real Snake output, the caller
-/// (`initializeRandomState`) hasn't been split into a smaller function
-/// taking Snake/Food/Wall by pointer at all -- it's still one monolithic
-/// function with no parameters, and the real Snake object is reached as
-/// `&local_b8` (the address of a local, not a parameter), where
-/// `local_b8` itself is still Ghidra's own stale, too-narrow scalar
-/// declaration (a *different*, still-unresolved stack-object-extent bug
-/// -- see PROJECT.md's M18.3/M19 notes). This pass deliberately does NOT
-/// attempt to handle `&LOCAL`-shaped bases: `&local_b8`'s own effective
-/// element type depends on `local_b8`'s *own* declared type being
-/// correctly byte-granular, which today it isn't -- getting this wrong
-/// silently would mean emitting a pointer-arithmetic bug at a *different*
-/// scale than intended, exactly the class of mistake this module exists
-/// to prevent, not reintroduce. So on real Snake today, this pass
-/// correctly stays inert (confirmed: a fresh `debura recover` produces
-/// the same never-fixed `local_a8` it always has, with zero incorrect
-/// rewrites anywhere else in the project) until that other, still-manual
-/// stack-widening fix is *also* generalized -- at which point a real
-/// parameter (or a real, correctly-widened array local) becomes
-/// available for this pass to find and use automatically.
+/// **Scope, and the real dependency this pass had on `stack_object.rs`**:
+/// a replacement base is either a parameter *already declared as a
+/// byte-granular pointer*, or `&LOCAL` where `LOCAL` is confirmed (by
+/// text, never guessed) to be a real `unsigned char LOCAL[N]` array --
+/// exactly what `stack_object.rs` produces once it's reconstructed a
+/// fragmented object. This module first shipped *without* the `&LOCAL`
+/// case: on that same night's real Snake output, `initializeRandomState`
+/// hadn't been split into a smaller function taking Snake by pointer,
+/// so the real Snake object was reached as `&local_b8`, and `local_b8`
+/// itself was still Ghidra's own stale, too-narrow scalar declaration --
+/// accepting `&local_b8` as a base then would have meant trusting an
+/// *unconfirmed* element type, silently risking a pointer-arithmetic bug
+/// at the wrong scale, exactly the class of mistake this module exists
+/// to prevent. Once `stack_object.rs` landed and started correctly
+/// widening `local_b8` into a real byte array first, this pass was
+/// extended to accept `&LOCAL` too -- but only ever when
+/// `caller_local_is_byte_array` can point at the literal, already-
+/// rewritten declaration confirming it, never by inferring it from the
+/// call site alone. Confirmed end-to-end against a real, fresh
+/// regeneration of Snake: with both passes wired in (`stack_object.rs`
+/// running first), `local_a8` -- the exact case that motivated this
+/// whole module -- now resolves automatically.
 use std::collections::HashMap;
 
 use crate::forwarding_thunk::{matching_close, parse_int_literal, parse_param_names, split_top_level_comma};
@@ -64,7 +62,7 @@ use crate::model::RecoveredFunction;
 /// (an identifier immediately followed by `(`) -- harmless, since every
 /// real lookup in this module searches for a specific, real callee name
 /// that keyword text never equals.
-fn find_calls(text: &str) -> Vec<(&str, &str)> {
+pub(crate) fn find_calls(text: &str) -> Vec<(&str, &str)> {
     let mut calls = Vec::new();
     let bytes = text.as_bytes();
     let mut i = 0usize;
@@ -102,7 +100,7 @@ fn find_calls(text: &str) -> Vec<(&str, &str)> {
 /// a cast with nothing after it (which could never be a complete
 /// argument expression anyway) or genuinely redundant grouping around a
 /// real expression (`((longlong)snake)` -> `(longlong)snake` -> `snake`).
-fn strip_casts_and_parens(expr: &str) -> &str {
+pub(crate) fn strip_casts_and_parens(expr: &str) -> &str {
     let mut expr = expr.trim();
     while expr.starts_with('(') {
         let Some(close) = matching_close(expr, 0, b'(', b')') else { break };
@@ -181,7 +179,7 @@ fn param_is_byte_granular(params: &str, name: &str) -> Option<bool> {
 /// instead. `None` if that exact shape isn't found (a function with no
 /// locals at all, or one whose shape this module doesn't recognize)
 /// rather than guessing at a different split point.
-fn split_locals_block(body: &str) -> Option<(&str, &str)> {
+pub(crate) fn split_locals_block(body: &str) -> Option<(&str, &str)> {
     let mut offset = 0usize;
     for line in body.split_inclusive('\n') {
         if line.trim().is_empty() && offset > 0 {
@@ -195,7 +193,7 @@ fn split_locals_block(body: &str) -> Option<(&str, &str)> {
 /// The declared name of each local a locals-declaration block declares,
 /// in order -- the trailing identifier on each line, before a trailing
 /// `;` or an array-bound `[`.
-fn declared_local_names(locals_block: &str) -> Vec<&str> {
+pub(crate) fn declared_local_names(locals_block: &str) -> Vec<&str> {
     locals_block
         .lines()
         .filter_map(|line| {
@@ -218,7 +216,7 @@ fn declared_local_names(locals_block: &str) -> Vec<&str> {
 /// to rule OUT locals that really are used normally, so it must never
 /// under-count a real assignment -- a false "never assigned" here would
 /// mean silently discarding a real value.
-fn is_ever_assigned(name: &str, body: &str) -> bool {
+pub(crate) fn is_ever_assigned(name: &str, body: &str) -> bool {
     for (i, _) in body.match_indices(name) {
         let before_ok = body[..i].chars().next_back().is_none_or(|c| !c.is_alphanumeric() && c != '_');
         let after = &body[i + name.len()..];
@@ -307,7 +305,19 @@ fn build_offset_passthrough_facts(functions: &[RecoveredFunction]) -> HashMap<St
             if param_is_byte_granular(&f.params, ident) != Some(true) {
                 continue;
             }
+            // Recorded under *both* names: a project whose earlier
+            // `debura apply` run already renamed `f` in Ghidra itself
+            // has every one of `f`'s own call sites (system-wide, since
+            // Ghidra's own decompiler always uses a symbol's *current*
+            // name) showing the pretty name, not `f.raw_name` -- and
+            // `find_alias_replacement` below has no way to know which
+            // form a given caller's own text uses. Confirmed against a
+            // real, fresh regeneration of Snake, where this was a real,
+            // silent gap (not merely a hypothetical one).
             facts.entry(callee.to_string()).or_default().push((f.raw_name.clone(), offset));
+            if f.display_name != f.raw_name {
+                facts.entry(callee.to_string()).or_default().push((f.display_name.clone(), offset));
+            }
         }
     }
     facts
@@ -326,6 +336,19 @@ fn build_offset_passthrough_facts(functions: &[RecoveredFunction]) -> HashMap<St
 /// answer at all to agree on the exact same `(identifier, offset)` pair
 /// before accepting it: a real fix is never guessed from a single, weak
 /// signal when the local is used in more than one place.
+/// Whether `caller_decompilation`'s own locals-declaration block
+/// declares `name` as a real `unsigned char name[N]` array -- exactly
+/// the shape `stack_object.rs`'s own reconstruction produces for a
+/// correctly-widened stack object. Confirming this makes a call-site
+/// argument `&name` exactly as safe a base as a byte-granular parameter
+/// already was: `&name`'s own C++ type (pointer-to-array) differs from
+/// the array's own decayed pointer type, but the numeric address is
+/// identical either way, and this module's own replacement always uses
+/// the bare name (relying on that same decay), never the `&` itself.
+fn caller_local_is_byte_array(caller_decompilation: &str, name: &str) -> bool {
+    caller_decompilation.contains(&format!("unsigned char {}[", name))
+}
+
 fn find_alias_replacement(
     caller: &RecoveredFunction,
     callees: &[&str],
@@ -340,14 +363,29 @@ fn find_alias_replacement(
                     continue;
                 }
                 let Some(first_arg) = split_top_level_comma(args_text).into_iter().next() else { continue };
-                let ident = strip_casts_and_parens(first_arg);
+                let raw_ident = strip_casts_and_parens(first_arg);
+                // `&LOCAL`, where `LOCAL` is confirmed (not guessed) to
+                // be a real byte array `stack_object.rs` already
+                // reconstructed -- use the bare name (array decay), not
+                // the `&` itself, as the base for arithmetic. Anything
+                // else starting with `&` (a scalar's address, or a name
+                // this module can't confirm is byte-granular) is
+                // rejected, matching this module's existing "never
+                // guess" discipline -- see this function's own former
+                // "known scope limit" doc note, now narrowed to exactly
+                // this one additional, confirmed-safe case.
+                let ident = match raw_ident.strip_prefix('&') {
+                    Some(bare) if caller_local_is_byte_array(&caller.decompilation, bare) => bare,
+                    Some(_) => continue,
+                    None => raw_ident,
+                };
                 if ident.is_empty() || !ident.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_') {
                     continue;
                 }
                 if !ident.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
                     continue;
                 }
-                if param_is_byte_granular(&caller.params, ident) != Some(true) {
+                if raw_ident == ident && param_is_byte_granular(&caller.params, ident) != Some(true) {
                     continue;
                 }
                 let candidate = (ident.to_string(), *offset);
@@ -367,7 +405,7 @@ fn find_alias_replacement(
 /// `replacement`, parenthesized -- a plain substring replace would also
 /// hit `name` as a prefix of some longer identifier, which whole-word
 /// matching (the same check `is_ever_assigned` uses) rules out.
-fn replace_whole_identifier(text: &str, name: &str, replacement: &str) -> String {
+pub(crate) fn replace_whole_identifier(text: &str, name: &str, replacement: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(pos) = rest.find(name) {
@@ -389,8 +427,8 @@ fn replace_whole_identifier(text: &str, name: &str, replacement: &str) -> String
 /// Removes `name`'s own declaration line from `locals_block` (the exact
 /// line `declared_local_names` attributed it to), trimming the blank
 /// line left behind if removing it empties the block entirely.
-fn remove_declaration(locals_block: &str, name: &str) -> String {
-    locals_block
+pub(crate) fn remove_declaration(locals_block: &str, name: &str) -> String {
+    let kept: String = locals_block
         .lines()
         .filter(|line| {
             let trimmed = line.trim().trim_end_matches(';').trim();
@@ -398,7 +436,24 @@ fn remove_declaration(locals_block: &str, name: &str) -> String {
             before_bracket.rsplit(|c: char| c == ' ' || c == '*').find(|s| !s.is_empty()) != Some(name)
         })
         .collect::<Vec<_>>()
-        .join("\n")
+        .join("\n");
+    // `locals_block` (per `split_locals_block`'s own construction)
+    // always ends with a trailing newline, right before the real blank
+    // separator line that starts `stmts_block`; `.lines().join("\n")`
+    // drops it. Losing it here silently merges the last remaining
+    // declaration onto the same line as that separator once this gets
+    // concatenated back with `stmts_block` -- destroying the only blank
+    // line `split_locals_block` looks for on any *later* pass over this
+    // same body (a real, confirmed regression: `stack_object.rs`
+    // widening `local_b8` and merging its own siblings left
+    // `initializeRandomState`'s own locals block with no blank
+    // separator left at all, so `phantom_local.rs`'s own later pass
+    // over the very same function silently found nothing to do).
+    if kept.is_empty() {
+        kept
+    } else {
+        kept + "\n"
+    }
 }
 
 /// Finds every phantom local (declared, never given a value -- see
