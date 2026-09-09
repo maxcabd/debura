@@ -685,7 +685,12 @@ pub fn reconstruct_stack_objects(functions: &mut [RecoveredFunction]) {
             }
 
             new_locals_block = replace_declaration_with_array(&new_locals_block, base, extent as u64);
-            if !already_array {
+            if already_array {
+                if let Some(element_width) = width_of_declared_type(&base_type) {
+                    new_stmts_block =
+                        rewrite_array_index_accesses(&new_stmts_block, base, &base_type, element_width as i64);
+                }
+            } else {
                 new_stmts_block = replace_bare_identifier_not_address_of(
                     &new_stmts_block,
                     base,
@@ -751,6 +756,58 @@ fn replace_declaration_with_array(locals_block: &str, name: &str, extent: u64) -
     } else {
         rebuilt + "\n"
     }
+}
+
+/// Rewrites every `name[N]`-shaped index access (`N` a literal), from
+/// *before* `name` was widened into a raw byte array, into the
+/// equivalent byte-offset dereference using the array's *original*
+/// element type and width -- `name[N]` decays to the same base address
+/// either way, so a bare, un-indexed use of `name` (already handled by
+/// `replace_declaration_with_array`'s own doc comment) survives
+/// unchanged regardless of element type. Indexing does not: once
+/// `name`'s own declared element type changes from, say, `int` (4 bytes)
+/// to `unsigned char` (1 byte), `name[0]` silently changes meaning from
+/// "the first 4 bytes" to "the first 1 byte" -- a real, confirmed
+/// regression this module itself introduced (`FUN_140001bf2`'s own
+/// `local_48[0] == 0x100`, reading an `SDL_Event`'s 4-byte `type` field,
+/// became a 1-byte read that can never equal 0x100 or 0x300 once
+/// `local_48` widened to `unsigned char [56]` -- the exact reason
+/// keyboard input silently stopped working after this pass ran).
+fn rewrite_array_index_accesses(text: &str, name: &str, element_type: &str, element_width: i64) -> String {
+    let pattern = format!("{name}[");
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(pos) = rest.find(&pattern) {
+        let before_ok = rest[..pos].chars().next_back().is_none_or(|c| !c.is_alphanumeric() && c != '_');
+        out.push_str(&rest[..pos]);
+        if !before_ok {
+            out.push_str(&pattern);
+            rest = &rest[pos + pattern.len()..];
+            continue;
+        }
+        let after_bracket = &rest[pos + pattern.len()..];
+        let Some(close_rel) = after_bracket.find(']') else {
+            out.push_str(&pattern);
+            rest = after_bracket;
+            continue;
+        };
+        let idx_text = after_bracket[..close_rel].trim();
+        let Some(idx) = parse_int_literal(idx_text) else {
+            out.push_str(&pattern);
+            out.push_str(&after_bracket[..=close_rel]);
+            rest = &after_bracket[close_rel + 1..];
+            continue;
+        };
+        let offset = idx as i64 * element_width;
+        if offset == 0 {
+            out.push_str(&format!("*({element_type} *)({name} + 0)"));
+        } else {
+            out.push_str(&format!("*({element_type} *)({name} + 0x{offset:x})"));
+        }
+        rest = &after_bracket[close_rel + 1..];
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Replaces every whole-identifier occurrence of `name` in `text` with
@@ -931,5 +988,31 @@ mod tests {
         assert!(!body.contains("local_34"), "{body}");
         assert!(body.contains("SDL_PollEvent(local_48)"), "base's own array-decay use must survive unchanged: {body}");
         assert!(body.contains("*(int *)(local_48 + 0x14)"), "{body}");
+        // The real, confirmed regression: `local_48[0]` used to read a
+        // whole `int` (the array's original element type) -- once
+        // widened to `unsigned char [56]`, the same text silently reads
+        // only one byte, and `== 0x100` can never be true again. Must be
+        // rewritten to dereference the original 4-byte element width.
+        assert!(!body.contains("local_48[0]"), "{body}");
+        assert!(body.contains("*(int *)(local_48 + 0)"), "{body}");
+    }
+
+    /// A second, non-zero index into the same, already-widened array
+    /// must scale by the *original* element width too, not the literal
+    /// index value -- `local_48[2]` on a former `int [5]` is byte offset
+    /// 8, not 2.
+    #[test]
+    fn a_nonzero_index_into_an_already_widened_array_scales_by_the_original_element_width() {
+        let mut functions = vec![function(
+            "0x140001bf2",
+            "void",
+            "undefined4 FUN_140001bf2(void)\n\n{\n  int local_48 [5];\n  int local_34;\n  \n  while (SDL_PollEvent(local_48) != 0) {\n    if (local_48[2] == 5) {\n      local_34 = 1;\n    }\n    else if (local_34 == 0x40000052) {\n      local_34 = 2;\n    }\n  }\n  return 0;\n}",
+        )];
+
+        reconstruct_stack_objects(&mut functions);
+
+        let body = &functions[0].decompilation;
+        assert!(!body.contains("local_48[2]"), "{body}");
+        assert!(body.contains("*(int *)(local_48 + 0x8)"), "{body}");
     }
 }
