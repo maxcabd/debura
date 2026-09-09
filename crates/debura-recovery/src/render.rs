@@ -13,7 +13,7 @@ use crate::symbols::GHIDRA_SYMBOLS_HEADER_NAME;
 /// actually declared as -- verified by compiling this exact
 /// substitution. Real, observed shape from the Snake fixture; other
 /// pointer-depth variants of the same idiom aren't handled yet.
-fn patch_known_idioms(text: &str) -> String {
+pub(crate) fn patch_known_idioms(text: &str) -> String {
     let prefix = "*(undefined ***)this = ";
     let needle = format!("{prefix}&");
     let text = text.replace(&needle, &format!("{prefix}(undefined **)&"));

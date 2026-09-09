@@ -11,6 +11,7 @@
 mod compat;
 mod crt_boundary;
 mod data_symbols;
+mod display_association;
 mod disposition;
 mod extract;
 mod field_naming;
@@ -31,6 +32,7 @@ pub use data_symbols::{
     classify_data_symbols, find_constructor_string_literals, DataResolution, DataSymbolKind, VtableSlotTarget,
 };
 pub use disposition::{classify_recovery_disposition, DispositionEntry, RecoveryDisposition};
+pub use display_association::{find_display_associations, DisplayAssociation};
 pub use extract::{extract, extract_with_options, extract_with_required_runtime_bodies};
 pub use field_naming::NamesMode;
 pub use frontier::{classify_frontier, parse_undefined_symbols, reachable_from, FrontierBucket, FrontierEntry, UnresolvedSymbol};
