@@ -107,7 +107,21 @@ fn parse_signature(signature: &str, raw_name: &str, is_method: bool) -> (ParsedS
     let close = signature.rfind(')').unwrap_or(signature.len());
 
     let prefix = signature[..open].trim();
-    let return_type = prefix.strip_suffix(raw_name).unwrap_or(prefix).trim();
+    // A real run against a binary with several tiny, tail-merged
+    // exception-throwing stubs found `has_signature` observations that
+    // don't actually describe `raw_name` at all -- a data-integrity bug
+    // upstream attached a DIFFERENT function's whole signature (name
+    // included) to this subject. `strip_suffix` alone can't tell "my own
+    // name, with no return type before it" apart from "a stranger's name
+    // entirely" -- both fail to strip -- so when the prefix doesn't even
+    // end with this function's own name, the entire signature is
+    // untrustworthy, not just its return type: treat it as absent rather
+    // than rendering a garbled `<wrong prefix> <real name>(...)`, which
+    // isn't valid C++ at all.
+    let return_type = match prefix.strip_suffix(raw_name) {
+        Some(rest) => rest.trim(),
+        None => "",
+    };
 
     let inner = if close > open {
         &signature[open + 1..close]

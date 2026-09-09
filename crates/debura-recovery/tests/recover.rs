@@ -389,6 +389,54 @@ fn a_later_degenerate_decompilation_does_not_override_an_earlier_real_one() {
     assert!(function.decompilation.contains("FUN_2(param_1);"), "{}", function.decompilation);
 }
 
+/// PROJECT.md M17/M18 (cross-program regression, found reversing a second,
+/// unrelated binary): the same "a second Ghidra pass can add a corrupted
+/// fact for a subject that already had a correct one" class the previous
+/// test defends against, for `has_signature` instead of `decompiles_to`.
+/// A real run had a subject's *second* `has_signature` observation carry
+/// an entirely different function's whole signature (name included) --
+/// stripping this function's own real name off that prefix silently failed
+/// (the prefix doesn't end with this function's name at all, since it
+/// belongs to someone else), so the unmatched prefix's text -- containing
+/// the WRONG function's own name -- was used as this function's "return
+/// type" verbatim, rendering `<wrong prefix> <this function's real
+/// name>(...)`: two names back to back, not valid C++ at all. The fix
+/// must recognize a signature that doesn't even mention its own subject's
+/// name as entirely untrustworthy, not just for its return type.
+#[test]
+fn a_has_signature_naming_a_different_function_does_not_corrupt_the_return_type() {
+    let mut graph = KnowledgeGraph::new();
+    graph.add_observation("0x1", "has_name", "FUN_1", 0.95, "ghidra:function", None);
+    graph.add_observation("0x1", "has_signature", "undefined FUN_1(void)", 0.95, "ghidra:function", None);
+    // A later, corrupted re-analysis pass attached FUN_2's own signature
+    // to this subject instead of FUN_1's.
+    graph.add_observation(
+        "0x1",
+        "has_signature",
+        "longlong * FUN_2(longlong * param_1, ulonglong param_2)",
+        0.95,
+        "ghidra:function",
+        None,
+    );
+    graph.add_observation(
+        "0x1",
+        "decompiles_to",
+        "void FUN_1(void)\n\n{\n  FUN_2();\n  return;\n}",
+        0.95,
+        "ghidra:decompiler",
+        None,
+    );
+    anchor_as_application(&mut graph, "0x1", "0xa1");
+    let h = graph.propose_hypothesis("0x1", "semantic_role", "throwOnBadGuess", 0.9, None);
+    graph.mark_verified(h, Utc::now()).unwrap();
+    graph.set_status(h, HypothesisStatus::Accepted).unwrap();
+
+    let program = extract(&graph);
+    let function = program.functions.iter().find(|f| f.address == "0x1").unwrap();
+
+    assert!(!function.return_type.contains("FUN_2"), "{}", function.return_type);
+}
+
 #[test]
 fn functions_without_an_accepted_hypothesis_are_not_recovered() {
     // No `decompiles_to` at all -- not a real, structurally-complete
