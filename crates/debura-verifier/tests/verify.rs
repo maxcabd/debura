@@ -1,9 +1,10 @@
 use std::cell::RefCell;
 
 use debura_agent::{
-    AgentProvider, AnalyzeFunctionTask, ChallengeFieldSemanticRoleTask, ChallengeHypothesisTask,
-    ChallengeResult, InvestigationResult, ProposeFieldSemanticRoleTask, ProposedHypothesis,
-    Resolution, ResolutionResult, ResolveContradictionTask, SemanticRoleResult,
+    AgentProvider, AnalyzeFunctionTask, ChallengeFieldSemanticNameTask,
+    ChallengeFieldSemanticRoleTask, ChallengeHypothesisTask, ChallengeResult, InvestigationResult,
+    ProposeFieldNameTask, ProposeFieldSemanticRoleTask, ProposedHypothesis, Resolution,
+    ResolutionResult, ResolveContradictionTask, SemanticRoleResult,
 };
 use debura_knowledge::{DependencyKind, HypothesisStatus, KnowledgeGraph};
 use debura_verifier::{challenge_hypothesis, reevaluate_hypothesis, resolve_contradiction, VerificationPolicy};
@@ -325,6 +326,74 @@ fn field_semantic_role_challenge_reaches_accepted_without_caller_context() {
         &VerificationPolicy::default(),
     )
     .unwrap();
+
+    let committed = graph.hypothesis(id).unwrap();
+    assert_eq!(
+        committed.status,
+        HypothesisStatus::Accepted,
+        "must not be rejected for absent function-caller evidence a field subject never has"
+    );
+}
+
+/// PROJECT.md, "Predicate-aware challenge": the naming-stage half of the
+/// same regression, once `remaining_lives` is ACCEPTED -- `m_remainingLives`
+/// must reach ACCEPTED through `ChallengeFieldSemanticNameTask`'s own
+/// narrower evidence contract (established role + proposed spelling),
+/// never rejected for lacking caller/API context either.
+#[test]
+fn field_semantic_name_challenge_reaches_accepted_without_caller_context() {
+    let mut graph = KnowledgeGraph::new();
+    let role_id = graph.propose_hypothesis(
+        "field:FUN_140003476:local_b8+0x4",
+        "field_semantic_role",
+        "remaining_lives",
+        0.9,
+        None,
+    );
+    graph.set_status(role_id, HypothesisStatus::Accepted).unwrap();
+
+    let name_task = ProposeFieldNameTask::build(
+        &graph,
+        "field:FUN_140003476:local_b8+0x4",
+        "0x140003476",
+        "initializeRandomState",
+        "undefined8 initializeRandomState(void) { ... }",
+        "local_b8",
+        4,
+        4,
+        "int",
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        "remaining_lives",
+    );
+    let proposed_name = "m_remainingLives";
+    let hypothesis = ProposedHypothesis {
+        predicate: "field_semantic_name".to_string(),
+        value: proposed_name.to_string(),
+        confidence: 0.95,
+        depends_on: Vec::new(),
+    };
+    let id = debura_agent::commit_hypothesis(&mut graph, &name_task.subject, &hypothesis, None);
+
+    let challenge_task = ChallengeFieldSemanticNameTask::build(&name_task, proposed_name);
+    assert_eq!(challenge_task.established_role, "remaining_lives");
+    // Standing in for a correct, predicate-aware challenger's verdict: the
+    // spelling faithfully encodes the already-accepted role, so there's
+    // no genuine contradiction to report -- specifically not a rejection
+    // for lacking caller/API context, which this task type never carries.
+    let result = ChallengeResult {
+        reasoning: "m_remainingLives faithfully spells the accepted remaining_lives role".to_string(),
+        ..Default::default()
+    };
+    let context_snapshot = format!(
+        "established role {:?}, {} sibling fields",
+        challenge_task.established_role,
+        challenge_task.sibling_fields.len()
+    );
+
+    debura_verifier::commit_challenge(&mut graph, id, &context_snapshot, result, &VerificationPolicy::default())
+        .unwrap();
 
     let committed = graph.hypothesis(id).unwrap();
     assert_eq!(

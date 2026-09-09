@@ -890,7 +890,19 @@ fn main() -> Result<()> {
                     }
                     names_proposed += 1;
                     let id = debura_agent::commit_hypothesis(&mut graph, &field.subject, hypothesis, None);
-                    debura_verifier::challenge_hypothesis(&mut graph, provider.as_ref(), id, &policy)?;
+                    // PROJECT.md, "Predicate-aware challenge": a proposed
+                    // name has an already-ACCEPTED role to be judged
+                    // against, not caller/API context -- the same
+                    // predicate-specific dispatch as the role stage above.
+                    let challenge_task = debura_agent::ChallengeFieldSemanticNameTask::build(&task, &hypothesis.value);
+                    let challenge_result = provider.challenge_field_semantic_name(&challenge_task)?;
+                    let context_snapshot = format!(
+                        "established role {:?}, {} sibling fields, {} value consumers",
+                        challenge_task.established_role,
+                        challenge_task.sibling_fields.len(),
+                        challenge_task.value_consumers.len()
+                    );
+                    debura_verifier::commit_challenge(&mut graph, id, &context_snapshot, challenge_result, &policy)?;
                     if graph.hypothesis(id).map(|h| h.status) == Some(debura_knowledge::HypothesisStatus::Contested) {
                         debura_verifier::resolve_contradiction(&mut graph, provider.as_ref(), id, &policy)?;
                     }

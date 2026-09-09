@@ -13,7 +13,10 @@ use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::challenge::{ChallengeFieldSemanticRoleTask, ChallengeHypothesisTask, ChallengeResult};
+use crate::challenge::{
+    ChallengeFieldSemanticNameTask, ChallengeFieldSemanticRoleTask, ChallengeHypothesisTask,
+    ChallengeResult,
+};
 use crate::field_task::{ProposeFieldNameTask, ProposeFieldSemanticRoleTask, SemanticRoleResult};
 use crate::resolution::{Resolution, ResolutionResult, ResolveContradictionTask};
 use crate::result::InvestigationResult;
@@ -512,6 +515,16 @@ impl AgentProvider for OpenAiProvider {
         )?;
         serde_json::from_value(value).context("mapping OpenAI output to ChallengeResult")
     }
+
+    fn challenge_field_semantic_name(&self, task: &ChallengeFieldSemanticNameTask) -> Result<ChallengeResult> {
+        let value = self.complete(
+            FIELD_SEMANTIC_NAME_CHALLENGE_SYSTEM,
+            &render_challenge_field_semantic_name_task(task),
+            "challenge_result",
+            challenge_result_schema(),
+        )?;
+        serde_json::from_value(value).context("mapping OpenAI output to ChallengeResult")
+    }
 }
 
 const FIELD_SEMANTIC_ROLE_CHALLENGE_SYSTEM: &str = "You are Debura's field-semantic-role \
@@ -544,6 +557,46 @@ const FIELD_SEMANTIC_ROLE_CHALLENGE_SYSTEM: &str = "You are Debura's field-seman
     manufacturing a finding -- report no contradiction. If your alternative is itself a better \
     role, its predicate must be the literal string \"field_semantic_role\" (matching the \
     convention the original proposal used).";
+
+const FIELD_SEMANTIC_NAME_CHALLENGE_SYSTEM: &str = "You are Debura's field-semantic-name \
+    adversarial verification step. The semantic QUESTION for this field is already settled: an \
+    established_role below was independently proposed and ACCEPTED through its own adversarial \
+    challenge (a separate, earlier task -- not this one). Do NOT re-open that question. Do NOT \
+    reject this proposal for lacking \"caller context\" or \"API context\" either -- that critique \
+    belongs to a semantic *role* challenge (which this field already passed), not a naming \
+    challenge, and re-litigating it here is exactly the mistake this task exists to prevent. Your \
+    only job is judging whether the proposed spelling still faithfully expresses the role that is \
+    already accepted as true. \
+    \n\n\
+    Check, specifically: \
+    \n\
+    1. Does the proposed name accurately encode the established role, or something recognizably \
+    close to it (canonicalization to idiomatic C++ member style is expected and fine -- \
+    \"remaining_lives\" -> \"m_remainingLives\" or \"m_lives\" are both faithful; exact token \
+    preservation is not required)? \
+    \n\
+    2. Does the name introduce meaning the established role does not actually support -- claiming \
+    something more specific, more general, or simply different from what was accepted (a role of \
+    \"remaining_lives\" spelled as \"m_drawableCount\" fails this outright: the spelling doesn't \
+    just fail to match, it actively claims something the role never established)? \
+    \n\
+    3. Is the name misleading relative to the field's own real behavior shown below (its declared \
+    type, sibling fields, and value consumers), even if it superficially matches the role's words? \
+    \n\
+    4. Is there a clearly better, more conventional equivalent spelling of the *same* established \
+    role -- not a different concept, just a cleaner name for this one? \
+    \n\
+    5. Does it conform to real C++ member-naming style, consistent with any sibling field names \
+    already accepted below (a bare word or snake_case concept name with no member-style marking, \
+    when siblings all use one, is a real style mismatch worth flagging)? \
+    \n\n\
+    A name that only weakly restates the role, or is stylistically awkward, is not by itself a \
+    contradiction -- reserve contradiction for a name that actually conflicts with, overclaims \
+    beyond, or misrepresents the established role or the field's own shown behavior. If a genuine, \
+    careful attempt at all five finds nothing wrong, say so honestly rather than manufacturing a \
+    finding -- report no contradiction. If your alternative is itself a better name, its predicate \
+    must be the literal string \"field_semantic_name\" (matching the convention the original \
+    proposal used).";
 
 const SEMANTIC_ROLE_SYSTEM: &str = "You are Debura's field-semantic-role reasoning step, stage \
     one of two. Your ONLY job here is determining what CONCEPT a field's value represents -- \
@@ -715,6 +768,49 @@ fn render_challenge_field_semantic_role_task(task: &ChallengeFieldSemanticRoleTa
     } else {
         for assoc in &task.display_associations {
             out.push_str(&format!("- {assoc}\n"));
+        }
+    }
+
+    out.push_str("\nRelevant data references:\n");
+    if task.relevant_data_references.is_empty() {
+        out.push_str("(none found)\n");
+    } else {
+        for reference in &task.relevant_data_references {
+            out.push_str(&format!("- {reference}\n"));
+        }
+    }
+
+    out
+}
+
+fn render_challenge_field_semantic_name_task(task: &ChallengeFieldSemanticNameTask) -> String {
+    let mut out = format!(
+        "Field subject: {}\nESTABLISHED SEMANTIC ROLE (already accepted, not open for re-debate here): {}\nProposed name: {}\n\n",
+        task.subject, task.established_role, task.proposed_name
+    );
+
+    out.push_str(&format!(
+        "Field: byte offset 0x{:x}, width {} bytes, accessed as `{} {} *const)({} + 0x{:x})`\nDefining function: {}\n\n",
+        task.offset, task.width, task.declared_type, task.declared_type, task.base, task.offset, task.function_display_name
+    ));
+
+    out.push_str("Other confirmed fields on the same object (a real style signal for naming convention):\n");
+    if task.sibling_fields.is_empty() {
+        out.push_str("(none)\n");
+    } else {
+        for sibling in &task.sibling_fields {
+            out.push_str(&format!("- {sibling}\n"));
+        }
+    }
+
+    out.push_str(&format!("\nDefining function's own decompiled body:\n{}\n", task.function_decompilation));
+
+    out.push_str("\nOther functions this field's own VALUE flows into, each with its own decompiled body:\n");
+    if task.value_consumers.is_empty() {
+        out.push_str("(none found)\n");
+    } else {
+        for consumer in &task.value_consumers {
+            out.push_str(&format!("- {consumer}\n"));
         }
     }
 

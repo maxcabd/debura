@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::call_context::{self, CallSequenceNeighbor};
 use crate::evidence_view;
-use crate::field_task::{ProposeFieldSemanticRoleTask, SemanticRoleResult};
+use crate::field_task::{ProposeFieldNameTask, ProposeFieldSemanticRoleTask, SemanticRoleResult};
 use crate::result::ProposedHypothesis;
 
 /// PROJECT.md S12: an adversarial pass. The objective is not to find more
@@ -123,6 +123,58 @@ impl ChallengeFieldSemanticRoleTask {
             relevant_data_references: proposal_task.relevant_data_references.clone(),
             display_associations: proposal_task.display_associations.clone(),
             known_sinks: proposal_task.known_sinks.clone(),
+        }
+    }
+}
+
+/// PROJECT.md, "Predicate-aware challenge": the field-semantic-name
+/// analog, for the exact same reason `ChallengeFieldSemanticRoleTask`
+/// exists -- a real run showed the generic challenger applies the same
+/// "no caller/API context" critique to a proposed *name* too, even
+/// though by this stage the semantic question is already settled
+/// (`established_role` is an ACCEPTED hypothesis). This task's job is
+/// narrower than the role challenge's: not "is this concept right" (that
+/// was already adversarially checked), but "does this spelling still
+/// faithfully express the already-accepted concept" -- a downstream
+/// predicate inheriting upstream accepted semantics rather than
+/// re-proving them from raw evidence.
+#[derive(Debug, Clone)]
+pub struct ChallengeFieldSemanticNameTask {
+    pub subject: String,
+    pub established_role: String,
+    pub proposed_name: String,
+    pub function_display_name: String,
+    pub function_decompilation: String,
+    pub base: String,
+    pub offset: i64,
+    pub width: u32,
+    pub declared_type: String,
+    pub sibling_fields: Vec<String>,
+    pub value_consumers: Vec<String>,
+    pub relevant_data_references: Vec<String>,
+}
+
+impl ChallengeFieldSemanticNameTask {
+    /// Built from the same task the naming proposal itself used, plus the
+    /// name it actually proposed -- there is no separate structured
+    /// result type for field naming the way `SemanticRoleResult` exists
+    /// for roles (`propose_field_name` reuses the flat
+    /// `InvestigationResult`/`ProposedHypothesis` shape), so the proposed
+    /// value is passed directly.
+    pub fn build(proposal_task: &ProposeFieldNameTask, proposed_name: &str) -> Self {
+        Self {
+            subject: proposal_task.subject.clone(),
+            established_role: proposal_task.established_role.clone(),
+            proposed_name: proposed_name.to_string(),
+            function_display_name: proposal_task.function_display_name.clone(),
+            function_decompilation: proposal_task.function_decompilation.clone(),
+            base: proposal_task.base.clone(),
+            offset: proposal_task.offset,
+            width: proposal_task.width,
+            declared_type: proposal_task.declared_type.clone(),
+            sibling_fields: proposal_task.sibling_fields.clone(),
+            value_consumers: proposal_task.value_consumers.clone(),
+            relevant_data_references: proposal_task.relevant_data_references.clone(),
         }
     }
 }

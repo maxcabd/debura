@@ -1,6 +1,9 @@
 use anyhow::Result;
 
-use crate::challenge::{ChallengeFieldSemanticRoleTask, ChallengeHypothesisTask, ChallengeResult};
+use crate::challenge::{
+    ChallengeFieldSemanticNameTask, ChallengeFieldSemanticRoleTask, ChallengeHypothesisTask,
+    ChallengeResult,
+};
 use crate::field_task::{ProposeFieldNameTask, ProposeFieldSemanticRoleTask, SemanticRoleResult};
 use crate::resolution::{ResolutionResult, ResolveContradictionTask};
 use crate::result::InvestigationResult;
@@ -51,6 +54,15 @@ pub trait AgentProvider {
     /// `propose_field_name`'s own default.
     fn challenge_field_semantic_role(&self, _task: &ChallengeFieldSemanticRoleTask) -> Result<ChallengeResult> {
         Err(anyhow::anyhow!("this provider does not support field-semantic-role challenges"))
+    }
+
+    /// PROJECT.md, "Predicate-aware challenge": the field-semantic-name
+    /// analog, using `ChallengeFieldSemanticNameTask`'s narrower evidence
+    /// contract (an already-accepted role plus the proposed spelling)
+    /// instead of the generic task's caller/API context. Defaults to a
+    /// clear error, same reasoning as the other field-predicate defaults.
+    fn challenge_field_semantic_name(&self, _task: &ChallengeFieldSemanticNameTask) -> Result<ChallengeResult> {
+        Err(anyhow::anyhow!("this provider does not support field-semantic-name challenges"))
     }
 
     /// PROJECT.md M10: every task type here reasons about strictly
