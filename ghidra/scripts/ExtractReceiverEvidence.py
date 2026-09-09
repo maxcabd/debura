@@ -175,6 +175,107 @@ def resolve_unique_within_instruction(instr, varnode, seen=None):
     return None
 
 
+def stack_offset_of_address(instr, addr_vn):
+    """If `addr_vn` (a LOAD/STORE's own address operand) resolves to
+    exactly `RSP + const` -- directly, or via a same-instruction
+    `unique` temp computed by an `INT_ADD` (the `[RSP+0xNN]` addressing
+    idiom, the same shape `trace_receiver`'s own LEA handling already
+    resolves) -- returns that constant offset. `RSP` itself (a bare
+    `[RSP]` access, PUSH/POP's own shape) resolves to offset 0. `None`
+    for any other address expression (a computed pointer, another
+    register, `[RDI]`-style field access, ...) -- deliberately not
+    guessed at."""
+    if addr_vn is None:
+        return None
+    if addr_vn.isRegister():
+        r = currentProgram.getLanguage().getRegister(addr_vn.getAddress(), addr_vn.getSize())
+        if r is not None and r.getName() in ("RSP", "ESP"):
+            return 0
+        return None
+    if addr_vn.isUnique():
+        defining = resolve_unique_within_instruction(instr, addr_vn)
+        if defining is None or defining.getMnemonic() != "INT_ADD":
+            return None
+        a, b = defining.getInput(0), defining.getInput(1)
+        reg_operand, const_operand = None, None
+        for cand in (a, b):
+            if cand is not None and cand.isRegister() and reg_operand is None:
+                reg_operand = cand
+            elif cand is not None and cand.isConstant() and const_operand is None:
+                const_operand = cand
+        if reg_operand is None or const_operand is None:
+            return None
+        base_reg = currentProgram.getLanguage().getRegister(reg_operand.getAddress(), reg_operand.getSize())
+        if base_reg is None or base_reg.getName() not in ("RSP", "ESP"):
+            return None
+        offset = const_operand.getOffset()
+        if offset >= 0x8000000000000000:
+            offset -= 0x10000000000000000
+        return offset
+    return None
+
+
+def find_matching_store(load_instr, load_offset, containing_func, max_back=400):
+    """PROJECT.md M20 Round C: real spill/restore correlation, not
+    proximity. For a LOAD reading `RSP + load_offset`, walks backward
+    for the NEAREST instruction whose own STORE writes that identical
+    normalized offset -- by construction (the nearest match wins,
+    straight-line), nothing else touches that offset in between on
+    this same walked path, which is the "no intervening conflicting
+    store" requirement for THIS bounded, single-path search. Does NOT
+    fan out across CFG predecessors (same, already-named limitation as
+    `find_last_write`'s own straight-line walk) -- a load whose real
+    definition sits down a different control-flow path than this
+    backward address-order walk happens to take is reported as
+    unresolved, not guessed at."""
+    instr = listing.getInstructionBefore(load_instr.getMinAddress())
+    steps = 0
+    while instr is not None and steps < max_back:
+        owner = func_manager.getFunctionContaining(instr.getMinAddress())
+        if owner is None:
+            return None, None
+        for op in instr.getPcode():
+            if op.getMnemonic() != "STORE":
+                continue
+            off = stack_offset_of_address(instr, op.getInput(1))
+            if off == load_offset:
+                return instr, op
+        instr = listing.getInstructionBefore(instr.getMinAddress())
+        steps += 1
+    return None, None
+
+
+def find_matching_push(pop_instr, containing_func, max_back=400):
+    """The PUSH/POP-specific case of the same spill/restore
+    correlation: PUSH/POP always address the CURRENT top of stack, so
+    `RSP + 0` alone can't distinguish one save/restore pair from
+    another the way a `[RSP+const]` spill's own fixed offset can.
+    Balances real stack depth instead -- walking backward, every POP
+    seen adds one slot back, every PUSH removes one; the PUSH where
+    that running count first reaches zero is the one THIS pop restores,
+    because everything between them (any other, already-balanced
+    push/pop pairs) nets to zero depth change by construction, the
+    same 'nothing else could have touched this exact slot' guarantee
+    `find_matching_store` gets from a literal matching offset instead."""
+    depth = 1
+    instr = listing.getInstructionBefore(pop_instr.getMinAddress())
+    steps = 0
+    while instr is not None and steps < max_back:
+        owner = func_manager.getFunctionContaining(instr.getMinAddress())
+        if owner is None:
+            return None
+        mnem = instr.getMnemonicString().upper()
+        if mnem.startswith("POP"):
+            depth += 1
+        elif mnem.startswith("PUSH"):
+            depth -= 1
+            if depth == 0:
+                return instr
+        instr = listing.getInstructionBefore(instr.getMinAddress())
+        steps += 1
+    return None
+
+
 def trace_receiver(call_instr, containing_func, max_hops=15):
     """Backward def-use chain for the receiver register, starting at
     the call site. Each hop records the defining instruction's own real
@@ -267,7 +368,66 @@ def trace_receiver(call_instr, containing_func, max_hops=15):
             chain[-1]["reason"] = "COPY from a non-register source (constant/unique)"
             break
         if mnem == "LOAD":
-            chain[-1]["reason"] = "register restored from memory (spill slot or real field load) -- not traced further"
+            addr_vn = op.getInput(1)
+            load_offset = stack_offset_of_address(defining, addr_vn)
+            if load_offset is None:
+                chain[-1]["reason"] = (
+                    "loaded through a non-stack-relative address (e.g. a pointer register like "
+                    "[RDI]) -- a field/alias access, not a stack spill; different problem, not traced further"
+                )
+                break
+            is_pop = defining.getMnemonicString().upper().startswith("POP")
+            if is_pop:
+                match_instr = find_matching_push(defining, containing_func)
+                match_kind = "push/pop depth-balanced"
+            else:
+                match_instr, _ = find_matching_store(defining, load_offset, containing_func)
+                match_kind = "matching-offset store"
+            if match_instr is None:
+                chain[-1]["reason"] = (
+                    "spill/restore correlation attempted (%s) but no matching earlier write was "
+                    "found within the search window -- not traced further" % match_kind
+                )
+                break
+            # The matching write's own STORE op -- for both PUSH and a
+            # plain `[RSP+const] = reg` spill, this is simply "the
+            # STORE op this instruction's own Pcode contains" (STORE has
+            # no register output, so `defining_op_for`'s own
+            # output-matching search doesn't apply here at all).
+            store_op = None
+            for cand_op in match_instr.getPcode():
+                if cand_op.getMnemonic() == "STORE":
+                    store_op = cand_op
+                    break
+            if store_op is None or store_op.getNumInputs() < 3:
+                chain[-1]["reason"] = "matching write found (%s @ %s) but its stored value could not be read" % (
+                    match_kind, match_instr.getMinAddress().toString(),
+                )
+                break
+            stored_value = store_op.getInput(2)
+            chain[-1]["reason"] = "resolved via spill/restore correlation (%s) to the write at %s" % (
+                match_kind, match_instr.getMinAddress().toString(),
+            )
+            if stored_value is not None and stored_value.isRegister():
+                cur_reg = currentProgram.getLanguage().getRegister(stored_value.getAddress(), stored_value.getSize())
+                cur_addr = match_instr.getMinAddress()
+                continue
+            if stored_value is not None and stored_value.isUnique():
+                # `resolve_unique_within_instruction` finds the op that
+                # DEFINES this temp (e.g. `PUSH RBX`'s own `COPY(RBX) ->
+                # tmp` feeding its `STORE(tmp)`) -- that op's OUTPUT is
+                # tautologically the same temp we started from; the real
+                # value is its INPUT (an earlier version of this code
+                # checked the output instead, which can never be a
+                # register by construction, and always fell through here).
+                deeper = resolve_unique_within_instruction(match_instr, stored_value)
+                if deeper is not None and deeper.getMnemonic() == "COPY":
+                    src = deeper.getInput(0)
+                    if src is not None and src.isRegister():
+                        cur_reg = currentProgram.getLanguage().getRegister(src.getAddress(), src.getSize())
+                        cur_addr = match_instr.getMinAddress()
+                        continue
+            chain[-1]["reason"] += " (stored value itself is not a simple register -- not traced further)"
             break
         chain[-1]["reason"] = "unhandled defining opcode %s" % mnem
         break
