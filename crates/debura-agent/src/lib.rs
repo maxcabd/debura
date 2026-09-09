@@ -21,7 +21,7 @@ pub mod mock;
 pub mod openai;
 
 pub use call_context::{call_sequence_neighbors, CallSequenceNeighbor, SequencedCall};
-pub use challenge::{ChallengeHypothesisTask, ChallengeResult};
+pub use challenge::{ChallengeFieldSemanticRoleTask, ChallengeHypothesisTask, ChallengeResult};
 pub use harness::{
     analyze_function, commit_contradiction, commit_hypothesis, commit_investigation, investigate,
 };

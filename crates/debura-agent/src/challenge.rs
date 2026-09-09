@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::call_context::{self, CallSequenceNeighbor};
 use crate::evidence_view;
+use crate::field_task::{ProposeFieldSemanticRoleTask, SemanticRoleResult};
 use crate::result::ProposedHypothesis;
 
 /// PROJECT.md S12: an adversarial pass. The objective is not to find more
@@ -55,6 +56,73 @@ impl ChallengeHypothesisTask {
             call_sequence: call_context::call_sequence_neighbors(graph, &hypothesis.subject),
             reachable_api_hints: call_context::reachable_api_hints(graph, &hypothesis.subject),
             hypothesis: hypothesis.clone(),
+        }
+    }
+}
+
+/// PROJECT.md, "Predicate-aware challenge": the field-semantic-role
+/// analog of `ChallengeHypothesisTask` -- a real, confirmed gap found
+/// while verifying the previous round: the generic task above carries
+/// `call_sequence`/`reachable_api_hints`, both naturally, permanently
+/// empty for a field subject (those are function-only concepts), and
+/// `other_observations`/`supporting_evidence` are *also* empty for a
+/// field hypothesis, since `commit_hypothesis` never attaches Evidence
+/// records to it. The generic challenger, given nothing else to reason
+/// from, said so honestly -- *"no API context or caller information to
+/// support what role this field plays"* -- and rejected a hypothesis
+/// that was, in fact, correctly evidence-backed. This task instead
+/// carries the exact same rich field context
+/// `ProposeFieldSemanticRoleTask` itself was given, plus the proposal's
+/// own claimed trace/sink/evidence, so the challenger can actually
+/// re-derive whether the citation holds up -- never just "was there
+/// anything here at all."
+#[derive(Debug, Clone)]
+pub struct ChallengeFieldSemanticRoleTask {
+    pub subject: String,
+    pub proposed_role: String,
+    pub decisive_sink: Option<String>,
+    pub propagation_chain: Vec<String>,
+    pub evidence: Vec<String>,
+    pub competing_interpretations: Vec<String>,
+    pub function_display_name: String,
+    pub function_decompilation: String,
+    pub base: String,
+    pub offset: i64,
+    pub width: u32,
+    pub declared_type: String,
+    pub sibling_fields: Vec<String>,
+    pub value_consumers: Vec<String>,
+    pub relevant_data_references: Vec<String>,
+    pub display_associations: Vec<String>,
+    pub known_sinks: Vec<String>,
+}
+
+impl ChallengeFieldSemanticRoleTask {
+    /// Built directly from the same task and result the proposal stage
+    /// already produced -- nothing here is re-derived or re-fetched from
+    /// the graph, since none of it was ever stored there as durable
+    /// observations in the first place (a real, separate gap; the
+    /// proposal's own evidence lives only in this one request's memory
+    /// today).
+    pub fn build(proposal_task: &ProposeFieldSemanticRoleTask, proposal_result: &SemanticRoleResult) -> Self {
+        Self {
+            subject: proposal_task.subject.clone(),
+            proposed_role: proposal_result.semantic_role.clone().unwrap_or_default(),
+            decisive_sink: proposal_result.decisive_sink.clone(),
+            propagation_chain: proposal_result.propagation_chain.clone(),
+            evidence: proposal_result.evidence.clone(),
+            competing_interpretations: proposal_result.competing_interpretations.clone(),
+            function_display_name: proposal_task.function_display_name.clone(),
+            function_decompilation: proposal_task.function_decompilation.clone(),
+            base: proposal_task.base.clone(),
+            offset: proposal_task.offset,
+            width: proposal_task.width,
+            declared_type: proposal_task.declared_type.clone(),
+            sibling_fields: proposal_task.sibling_fields.clone(),
+            value_consumers: proposal_task.value_consumers.clone(),
+            relevant_data_references: proposal_task.relevant_data_references.clone(),
+            display_associations: proposal_task.display_associations.clone(),
+            known_sinks: proposal_task.known_sinks.clone(),
         }
     }
 }

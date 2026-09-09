@@ -6,7 +6,7 @@
 
 use anyhow::Result;
 
-use crate::challenge::{ChallengeHypothesisTask, ChallengeResult};
+use crate::challenge::{ChallengeFieldSemanticRoleTask, ChallengeHypothesisTask, ChallengeResult};
 use crate::field_task::{ProposeFieldNameTask, ProposeFieldSemanticRoleTask, SemanticRoleResult};
 use crate::resolution::{Resolution, ResolutionResult, ResolveContradictionTask};
 use crate::result::{InvestigationResult, ProposedHypothesis};
@@ -90,6 +90,13 @@ impl AgentProvider for EchoProvider {
     /// rejects it before anything gets committed. That's the correct,
     /// honest behavior for a provider that does no real reasoning, not a
     /// bug in the gate.
+    fn challenge_field_semantic_role(&self, _task: &ChallengeFieldSemanticRoleTask) -> Result<ChallengeResult> {
+        Ok(ChallengeResult {
+            reasoning: "EchoProvider performs no real adversarial reasoning".to_string(),
+            ..Default::default()
+        })
+    }
+
     fn propose_field_semantic_role(&self, task: &ProposeFieldSemanticRoleTask) -> Result<SemanticRoleResult> {
         Ok(SemanticRoleResult {
             tracked_value: format!("{} + 0x{:x}", task.base, task.offset),

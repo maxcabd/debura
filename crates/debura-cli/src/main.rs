@@ -829,7 +829,20 @@ fn main() -> Result<()> {
                                     depends_on: Vec::new(),
                                 };
                                 let id = debura_agent::commit_hypothesis(&mut graph, &field.subject, &hypothesis, None);
-                                debura_verifier::challenge_hypothesis(&mut graph, provider.as_ref(), id, &policy)?;
+                                // PROJECT.md, "Predicate-aware challenge": a
+                                // field's semantic *role* has no caller/API
+                                // context to speak of -- it's not a
+                                // function -- so it's challenged through its
+                                // own predicate-specific task, never the
+                                // generic function-shaped one.
+                                let challenge_task = debura_agent::ChallengeFieldSemanticRoleTask::build(&role_task, &role_result);
+                                let challenge_result = provider.challenge_field_semantic_role(&challenge_task)?;
+                                let context_snapshot = format!(
+                                    "{} display associations, {} known sinks",
+                                    challenge_task.display_associations.len(),
+                                    challenge_task.known_sinks.len()
+                                );
+                                debura_verifier::commit_challenge(&mut graph, id, &context_snapshot, challenge_result, &policy)?;
                                 if graph.hypothesis(id).map(|h| h.status) == Some(debura_knowledge::HypothesisStatus::Contested) {
                                     debura_verifier::resolve_contradiction(&mut graph, provider.as_ref(), id, &policy)?;
                                 }

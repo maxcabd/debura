@@ -42,11 +42,17 @@ pub fn build_challenge_task(
 }
 
 /// The mutating half of `challenge_hypothesis` -- call with exclusive
-/// access after `challenge` returns (from any thread).
+/// access after `challenge` returns (from any thread). `context_snapshot`
+/// is a short, human-readable summary of what the challenger actually
+/// saw -- previously always `&ChallengeHypothesisTask` itself, generalized
+/// (PROJECT.md, "Predicate-aware challenge") to a plain string so this
+/// same commit/reevaluate logic works for `ChallengeFieldSemanticRoleTask`'s
+/// own, differently-shaped evidence too, without this function needing to
+/// know about every task shape that might ever challenge a hypothesis.
 pub fn commit_challenge(
     graph: &mut KnowledgeGraph,
     hypothesis: HypothesisId,
-    task: &ChallengeHypothesisTask,
+    context_snapshot: &str,
     result: ChallengeResult,
     policy: &VerificationPolicy,
 ) -> Result<InvestigationId> {
@@ -54,11 +60,7 @@ pub fn commit_challenge(
         id: InvestigationId(0),
         task: "ChallengeHypothesis".to_string(),
         target: hypothesis.to_string(),
-        context_snapshot: format!(
-            "{} supporting evidence, {} other observations",
-            task.supporting_evidence.len(),
-            task.other_observations.len()
-        ),
+        context_snapshot: context_snapshot.to_string(),
         tool_calls: Vec::new(),
         observations: Vec::new(),
         hypotheses_created: Vec::new(),
@@ -122,7 +124,9 @@ pub fn challenge_hypothesis(
     policy: &VerificationPolicy,
 ) -> Result<InvestigationId> {
     let (task, result) = challenge(graph, provider, hypothesis)?;
-    commit_challenge(graph, hypothesis, &task, result, policy)
+    let context_snapshot =
+        format!("{} supporting evidence, {} other observations", task.supporting_evidence.len(), task.other_observations.len());
+    commit_challenge(graph, hypothesis, &context_snapshot, result, policy)
 }
 
 /// The non-mutating half of `resolve_contradiction`. See `challenge` --

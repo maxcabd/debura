@@ -1,6 +1,6 @@
 use anyhow::Result;
 
-use crate::challenge::{ChallengeHypothesisTask, ChallengeResult};
+use crate::challenge::{ChallengeFieldSemanticRoleTask, ChallengeHypothesisTask, ChallengeResult};
 use crate::field_task::{ProposeFieldNameTask, ProposeFieldSemanticRoleTask, SemanticRoleResult};
 use crate::resolution::{ResolutionResult, ResolveContradictionTask};
 use crate::result::InvestigationResult;
@@ -41,6 +41,16 @@ pub trait AgentProvider {
     /// clear error, same reasoning as `propose_field_name`'s own default.
     fn propose_field_semantic_role(&self, _task: &ProposeFieldSemanticRoleTask) -> Result<SemanticRoleResult> {
         Err(anyhow::anyhow!("this provider does not support field-semantic-role proposals"))
+    }
+
+    /// PROJECT.md, "Predicate-aware challenge": the field-semantic-role
+    /// analog of `challenge`, using `ChallengeFieldSemanticRoleTask`'s own
+    /// richer, field-appropriate evidence instead of the generic task's
+    /// (naturally, permanently empty for a field subject) caller/API
+    /// context. Defaults to a clear error, same reasoning as
+    /// `propose_field_name`'s own default.
+    fn challenge_field_semantic_role(&self, _task: &ChallengeFieldSemanticRoleTask) -> Result<ChallengeResult> {
+        Err(anyhow::anyhow!("this provider does not support field-semantic-role challenges"))
     }
 
     /// PROJECT.md M10: every task type here reasons about strictly

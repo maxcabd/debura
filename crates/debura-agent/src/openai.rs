@@ -13,7 +13,7 @@ use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::challenge::{ChallengeHypothesisTask, ChallengeResult};
+use crate::challenge::{ChallengeFieldSemanticRoleTask, ChallengeHypothesisTask, ChallengeResult};
 use crate::field_task::{ProposeFieldNameTask, ProposeFieldSemanticRoleTask, SemanticRoleResult};
 use crate::resolution::{Resolution, ResolutionResult, ResolveContradictionTask};
 use crate::result::InvestigationResult;
@@ -502,7 +502,48 @@ impl AgentProvider for OpenAiProvider {
         )?;
         serde_json::from_value(value).context("mapping OpenAI output to SemanticRoleResult")
     }
+
+    fn challenge_field_semantic_role(&self, task: &ChallengeFieldSemanticRoleTask) -> Result<ChallengeResult> {
+        let value = self.complete(
+            FIELD_SEMANTIC_ROLE_CHALLENGE_SYSTEM,
+            &render_challenge_field_semantic_role_task(task),
+            "challenge_result",
+            challenge_result_schema(),
+        )?;
+        serde_json::from_value(value).context("mapping OpenAI output to ChallengeResult")
+    }
 }
+
+const FIELD_SEMANTIC_ROLE_CHALLENGE_SYSTEM: &str = "You are Debura's field-semantic-role \
+    adversarial verification step. Your objective is NOT to find more evidence that the proposed \
+    role is right -- it is to actively try to prove it wrong. But a field subject is not a \
+    function: it has no callers, no reachable-API-call-tree, no call-sequence context of its own \
+    -- those are function-only concepts, and their ABSENCE here is normal and expected, never \
+    itself a reason to doubt anything. Do NOT reject a field-role proposal for lacking \"caller \
+    context\" or \"API context\" -- that critique belongs to function semantic_role challenges, \
+    not this predicate, and citing it here is itself a mistake this task exists to prevent. \
+    \n\n\
+    Instead, actually check, against the real evidence given below: \
+    \n\
+    1. Does the proposed role actually explain the cited decisive_sink? Re-derive that \
+    relationship yourself from the evidence given -- don't just trust the proposal's own claim \
+    that it does. \
+    \n\
+    2. Is there a genuinely CONFLICTING sink or usage in the evidence below -- the tracked value \
+    displayed adjacent to a different, contradictory label, or used in a way inconsistent with \
+    the proposed role? A mere absence of *additional* evidence is not itself a contradiction. \
+    \n\
+    3. Is propagation_chain an actual, unbroken chain from the field itself to the cited sink, or \
+    does it skip a step, or involve a value that was never actually shown to be derived from this \
+    field? \
+    \n\
+    4. Is there a more plausible competing role that explains the same decisive_sink at least as \
+    well? \
+    \n\n\
+    If a genuine, careful attempt at all four finds nothing wrong, say so honestly rather than \
+    manufacturing a finding -- report no contradiction. If your alternative is itself a better \
+    role, its predicate must be the literal string \"field_semantic_role\" (matching the \
+    convention the original proposal used).";
 
 const SEMANTIC_ROLE_SYSTEM: &str = "You are Debura's field-semantic-role reasoning step, stage \
     one of two. Your ONLY job here is determining what CONCEPT a field's value represents -- \
@@ -603,6 +644,87 @@ fn render_propose_field_semantic_role_task(task: &ProposeFieldSemanticRoleTask) 
             "- {}: {} = {} (confidence {:.2}, status {:?})\n",
             h.id, h.predicate, h.value, h.confidence, h.status
         ));
+    }
+
+    out
+}
+
+fn render_challenge_field_semantic_role_task(task: &ChallengeFieldSemanticRoleTask) -> String {
+    let mut out = format!(
+        "Field subject: {}\nProposed semantic role: {}\n\n",
+        task.subject, task.proposed_role
+    );
+
+    out.push_str(&format!("Decisive sink cited by the proposal: {}\n\n", task.decisive_sink.as_deref().unwrap_or("(none cited)")));
+
+    out.push_str("Propagation chain claimed by the proposal:\n");
+    if task.propagation_chain.is_empty() {
+        out.push_str("(none given)\n");
+    } else {
+        for step in &task.propagation_chain {
+            out.push_str(&format!("- {step}\n"));
+        }
+    }
+
+    out.push_str("\nEvidence cited by the proposal:\n");
+    if task.evidence.is_empty() {
+        out.push_str("(none given)\n");
+    } else {
+        for e in &task.evidence {
+            out.push_str(&format!("- {e}\n"));
+        }
+    }
+
+    out.push_str("\nCompeting interpretations the proposal already considered:\n");
+    if task.competing_interpretations.is_empty() {
+        out.push_str("(none given)\n");
+    } else {
+        for c in &task.competing_interpretations {
+            out.push_str(&format!("- {c}\n"));
+        }
+    }
+
+    out.push_str(&format!(
+        "\nField: byte offset 0x{:x}, width {} bytes, declared type {}\nDefining function: {}\n\n",
+        task.offset, task.width, task.declared_type, task.function_display_name
+    ));
+
+    out.push_str("Other confirmed fields on the same object:\n");
+    if task.sibling_fields.is_empty() {
+        out.push_str("(none)\n");
+    } else {
+        for sibling in &task.sibling_fields {
+            out.push_str(&format!("- {sibling}\n"));
+        }
+    }
+
+    out.push_str(&format!("\nDefining function's own decompiled body:\n{}\n", task.function_decompilation));
+
+    out.push_str("\nOther functions this field's own VALUE flows into, each with its own decompiled body -- re-verify the proposal's own trace against these directly, don't just trust it:\n");
+    if task.value_consumers.is_empty() {
+        out.push_str("(none found)\n");
+    } else {
+        for consumer in &task.value_consumers {
+            out.push_str(&format!("- {consumer}\n"));
+        }
+    }
+
+    out.push_str("\nDisplay associations -- real, deterministic, machine-verified facts (never model-guessed):\n");
+    if task.display_associations.is_empty() {
+        out.push_str("(none found)\n");
+    } else {
+        for assoc in &task.display_associations {
+            out.push_str(&format!("- {assoc}\n"));
+        }
+    }
+
+    out.push_str("\nRelevant data references:\n");
+    if task.relevant_data_references.is_empty() {
+        out.push_str("(none found)\n");
+    } else {
+        for reference in &task.relevant_data_references {
+            out.push_str(&format!("- {reference}\n"));
+        }
     }
 
     out

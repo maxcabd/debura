@@ -1,8 +1,9 @@
 use std::cell::RefCell;
 
 use debura_agent::{
-    AgentProvider, AnalyzeFunctionTask, ChallengeHypothesisTask, ChallengeResult,
-    InvestigationResult, ProposedHypothesis, Resolution, ResolutionResult, ResolveContradictionTask,
+    AgentProvider, AnalyzeFunctionTask, ChallengeFieldSemanticRoleTask, ChallengeHypothesisTask,
+    ChallengeResult, InvestigationResult, ProposeFieldSemanticRoleTask, ProposedHypothesis,
+    Resolution, ResolutionResult, ResolveContradictionTask, SemanticRoleResult,
 };
 use debura_knowledge::{DependencyKind, HypothesisStatus, KnowledgeGraph};
 use debura_verifier::{challenge_hypothesis, reevaluate_hypothesis, resolve_contradiction, VerificationPolicy};
@@ -244,4 +245,91 @@ fn build_challenge_task_excludes_superseded_observations() {
         task.other_observations
     );
     assert!(task.other_observations.iter().any(|o| o.id == new));
+}
+
+/// PROJECT.md, "Predicate-aware challenge": the exact real Snake case the
+/// user specified as the regression -- `field_semantic_role =
+/// remaining_lives`, verified decisive sink = the Lives display
+/// association -- must reach ACCEPTED through `commit_challenge`'s
+/// generalized signature via `ChallengeFieldSemanticRoleTask`, whose shape
+/// carries no caller/API-context fields at all (no `reachable_api_hints`,
+/// `caller_context`, `call_sequence`) for a challenger to wrongly treat as
+/// suspiciously empty -- unlike the generic, function-shaped
+/// `ChallengeHypothesisTask` this field hypothesis is deliberately never
+/// routed through.
+#[test]
+fn field_semantic_role_challenge_reaches_accepted_without_caller_context() {
+    let mut graph = KnowledgeGraph::new();
+    let known_sink = "tracked value, as \"param_4 + -1\", is displayed immediately \
+        adjacent to DAT_14000e0c0 (\"Lives: \") in FUN_14000205a"
+        .to_string();
+    let known_sinks = vec![known_sink.clone(), "FUN_140001cb0".to_string()];
+
+    let role_task = ProposeFieldSemanticRoleTask::build(
+        &graph,
+        "field:FUN_140003476:local_b8+0x4",
+        "0x140003476",
+        "initializeRandomState",
+        "undefined8 initializeRandomState(void) { ... }",
+        "local_b8",
+        4,
+        4,
+        "int",
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        vec![known_sink.clone()],
+        known_sinks.clone(),
+    );
+    let role_result = SemanticRoleResult {
+        tracked_value: "param_4".to_string(),
+        propagation_chain: vec!["field +0x4".to_string(), "used as param_4 + -1".to_string()],
+        decisive_sink: Some(known_sink.clone()),
+        semantic_role: Some("remaining_lives".to_string()),
+        evidence: vec!["displayed immediately after the \"Lives: \" label".to_string()],
+        competing_interpretations: Vec::new(),
+        confidence: 0.95,
+    };
+
+    let confidence = debura_agent::debura_confidence_for_role(&role_result, &known_sinks)
+        .expect("a real, verified sink must yield a real confidence");
+    let hypothesis = ProposedHypothesis {
+        predicate: "field_semantic_role".to_string(),
+        value: role_result.semantic_role.clone().unwrap(),
+        confidence,
+        depends_on: Vec::new(),
+    };
+    let id = debura_agent::commit_hypothesis(&mut graph, &role_task.subject, &hypothesis, None);
+
+    let challenge_task = ChallengeFieldSemanticRoleTask::build(&role_task, &role_result);
+    // Standing in for a correct, predicate-aware challenger's verdict: no
+    // genuine contradiction (a real conflicting sink, a broken
+    // propagation chain, a more plausible competing role) -- specifically
+    // not a rejection for lacking caller/API context, which this task
+    // type has no field for in the first place.
+    let context_snapshot = format!(
+        "{} display associations, {} known sinks",
+        challenge_task.display_associations.len(),
+        challenge_task.known_sinks.len()
+    );
+    let result = ChallengeResult {
+        reasoning: "role explains the decisive sink; no conflicting usage found".to_string(),
+        ..Default::default()
+    };
+
+    debura_verifier::commit_challenge(
+        &mut graph,
+        id,
+        &context_snapshot,
+        result,
+        &VerificationPolicy::default(),
+    )
+    .unwrap();
+
+    let committed = graph.hypothesis(id).unwrap();
+    assert_eq!(
+        committed.status,
+        HypothesisStatus::Accepted,
+        "must not be rejected for absent function-caller evidence a field subject never has"
+    );
 }

@@ -465,7 +465,12 @@ fn commit_one(graph: &mut KnowledgeGraph, policy: &VerificationPolicy, outcome: 
 
         PendingOutcome::ChallengeHypothesis { hypothesis, outcome } => match outcome {
             Ok((task, result)) => {
-                match debura_verifier::commit_challenge(graph, hypothesis, &task, result, policy) {
+                let context_snapshot = format!(
+                    "{} supporting evidence, {} other observations",
+                    task.supporting_evidence.len(),
+                    task.other_observations.len()
+                );
+                match debura_verifier::commit_challenge(graph, hypothesis, &context_snapshot, result, policy) {
                     Ok(investigation_id) => {
                         let mut followups: Vec<Task> = graph
                             .investigation(investigation_id)
