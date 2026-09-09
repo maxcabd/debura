@@ -504,11 +504,25 @@ const FIELD_NAMING_SYSTEM: &str = "You are Debura's field-naming reasoning step.
     used -- what it's compared against, what modifies it, what nearby sibling fields on the same \
     object suggest about the object's overall purpose, and what the defining function's own \
     reachable API calls suggest about its domain (a function that calls SDL_RenderCopy is \
-    probably rendering-related, for instance). A real case this covers: a 4-byte field that's \
-    read in a loop condition as \"greater than zero keep going\", decremented somewhere on a \
-    collision path, and displayed next to a \"Lives: \" label is well-evidenced as \"m_lives\"; a \
-    field with no comparison, no clear write pattern, and no naming sibling fields is not -- leave \
-    it unproposed rather than guess. Never propose a generic placeholder (\"field\", \"value\", \
+    probably rendering-related, for instance). \
+    \n\n\
+    Give the heaviest weight to the \"other functions this field's own value flows into\" section \
+    below, when it's non-empty -- a field is frequently only *set* where it's declared, while the \
+    evidence that actually explains what it means lives in a completely different function that \
+    receives its value as a plain argument (not its address). A real, confirmed case: a lives \
+    counter's own defining function only decrements and compares it -- nothing there says \
+    \"lives\" -- but a function two calls away, reached exactly through this section, builds and \
+    renders a \"Lives: \" label using that same value. Read every listed consumer's own body for \
+    exactly this kind of clinching evidence before deciding the defining function's own body is \
+    all there is to go on. A real run without this section available proposed \
+    \"m_counter\"/\"m_isActive\" for fields like this and, correctly, had them rejected for lacking \
+    exactly this kind of evidence -- don't repeat that mistake when the section is available and \
+    actually says something. A 4-byte field that's read in a loop condition as \"greater than \
+    zero keep going\", decremented somewhere on a collision path, and displayed next to a \
+    \"Lives: \" label (whether found in the defining function or a value consumer) is \
+    well-evidenced as \"m_lives\"; a field with no comparison, no clear write pattern, no naming \
+    sibling fields, and no clinching value-consumer evidence is not -- leave it unproposed rather \
+    than guess. Never propose a generic placeholder (\"field\", \"value\", \
     \"data\", \"state\", \"flag\" alone) -- that conveys nothing beyond the mechanical name \
     already available, and is exactly as useless as no name at all while looking like real \
     recovered knowledge. The value must be a valid C++ identifier, conventionally member-style \
@@ -712,6 +726,15 @@ fn render_propose_field_name_task(task: &ProposeFieldNameTask) -> String {
     }
 
     out.push_str(&format!("\nDefining function's own decompiled body:\n{}\n", task.function_decompilation));
+
+    out.push_str("\nOther functions this field's own VALUE (not just its address) flows into, each with its own decompiled body -- often where this field's real meaning actually becomes clear, since a field is frequently set in one place but only displayed or acted on somewhere else entirely:\n");
+    if task.value_consumers.is_empty() {
+        out.push_str("(none found)\n");
+    } else {
+        for consumer in &task.value_consumers {
+            out.push_str(&format!("- {consumer}\n"));
+        }
+    }
 
     out.push_str("\nAPI names reachable from the defining function's own callee tree:\n");
     if task.reachable_api_hints.is_empty() {

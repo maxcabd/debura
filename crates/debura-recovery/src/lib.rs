@@ -37,7 +37,7 @@ pub use model::{
     RecoveredProgram, VtableTrampoline,
 };
 pub use render::{render_functions_source, render_header, render_source};
-pub use stack_object::DiscoveredField;
+pub use stack_object::{find_field_value_consumers, DiscoveredField, FieldValueConsumer};
 pub use symbols::{
     render_function_declarations, render_ghidra_symbols_header, render_ghidra_symbols_header_resolved,
     GHIDRA_SYMBOLS_HEADER_NAME,

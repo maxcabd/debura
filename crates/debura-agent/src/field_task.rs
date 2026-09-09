@@ -32,6 +32,17 @@ pub struct ProposeFieldNameTask {
     /// e.g. a function that calls `SDL_RenderCopy` is probably part of
     /// rendering, useful context even when naming one of its fields.
     pub reachable_api_hints: Vec<String>,
+    /// Other functions (not the defining one) this field's own *value*
+    /// -- not merely its address -- flows into, as human-readable facts
+    /// pairing each callee's name with its own decompiled body. A real,
+    /// confirmed reason this exists: Snake's own lives counter is only
+    /// ever *set* where it's declared, but the evidence that actually
+    /// justifies its name -- displayed next to "Lives: " -- lives two
+    /// calls away, in a function that has nothing else to do with where
+    /// the field itself is stored. Without this, a real run proposed
+    /// `m_counter`/`m_isActive` instead and correctly had them rejected
+    /// for lacking exactly this kind of evidence.
+    pub value_consumers: Vec<String>,
     /// Any hypothesis already proposed for this exact field subject (a
     /// retry after a REJECTED/CONTESTED name), mirroring
     /// `AnalyzeFunctionTask::rejection_reasons`'s own purpose.
@@ -51,6 +62,7 @@ impl ProposeFieldNameTask {
         width: u32,
         declared_type: &str,
         sibling_fields: Vec<String>,
+        value_consumers: Vec<String>,
     ) -> Self {
         Self {
             subject: subject.to_string(),
@@ -62,6 +74,7 @@ impl ProposeFieldNameTask {
             declared_type: declared_type.to_string(),
             sibling_fields,
             reachable_api_hints: call_context::reachable_api_hints(graph, function_address),
+            value_consumers,
             existing_hypotheses: graph.hypotheses().filter(|h| h.subject == subject).cloned().collect(),
         }
     }
@@ -88,6 +101,7 @@ mod tests {
             4,
             "int",
             vec!["offset 0xc, width 1, type char".to_string()],
+            Vec::new(),
         );
 
         assert_eq!(task.existing_hypotheses.len(), 1);

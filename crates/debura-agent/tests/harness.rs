@@ -293,6 +293,7 @@ fn a_proposed_field_name_commits_through_the_existing_hypothesis_machinery() {
         4,
         "int",
         Vec::new(),
+        Vec::new(),
     );
 
     let result = EchoProvider.propose_field_name(&task).unwrap();

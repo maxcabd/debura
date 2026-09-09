@@ -655,6 +655,118 @@ pub struct DiscoveredField {
     pub declared_type: String,
 }
 
+/// The exact mechanical dereference text this module renders for
+/// `field` -- must match its own formatting byte for byte (`"+ 0"`, not
+/// `"+ 0x0"`, at offset zero) since every caller of this treats it as a
+/// literal substring search, not a parse. Shared by `field_naming.rs`
+/// (finding the text to replace with a named alias) and
+/// `find_field_value_consumers` below (finding where this exact value,
+/// not just its address, flows into another function's own call).
+pub(crate) fn mechanical_dereference_text(field: &DiscoveredField) -> String {
+    if field.offset == 0 {
+        format!("*({} *)({} + 0)", field.declared_type, field.base)
+    } else {
+        format!("*({} *)({} + 0x{:x})", field.declared_type, field.base, field.offset)
+    }
+}
+
+pub(crate) fn offset_text(offset: i64) -> String {
+    if offset == 0 {
+        "0".to_string()
+    } else {
+        format!("0x{offset:x}")
+    }
+}
+
+/// One place `field`'s own *value* (not its address) flows into another,
+/// already-recovered function's call -- real, discoverable cross-
+/// function context a naming task couldn't see from the field's own
+/// defining function alone: a real, confirmed case (Snake's own lives
+/// counter) is *set* where it's declared, but only *displayed* --
+/// "Lives: N" -- several calls away, in a function that has nothing
+/// else to do with where the field itself lives.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FieldValueConsumer {
+    pub callee_raw_name: String,
+    pub callee_decompilation: String,
+    pub parameter_position: usize,
+}
+
+/// Every place `field`'s own value flows into another function's call,
+/// starting from its defining function's own body and followed forward
+/// up to `MAX_HOPS` times -- bounded the same way `stack_object.rs`'s
+/// own cross-function fact-gathering already is (a real, finite call
+/// graph never needs unbounded depth). A real, confirmed case needs
+/// exactly three hops, not two: `initializeRandomState` passes the
+/// lives value to `FUN_140001cb0`, which forwards it to `FUN_14000213e`
+/// (`drawText`), which forwards it again to `FUN_14000205a`
+/// (`createText`) -- the actual helper that concatenates it into a
+/// displayed string. Stopping at two hops (confirmed against a real
+/// run: the field's own consumer list showed `FUN_140001cb0` and
+/// `FUN_14000213e`, but not `FUN_14000205a`) leaves out exactly the
+/// function whose own body shows the field being streamed together with
+/// literal text, the strongest evidence this whole mechanism exists to
+/// surface. Never follows into a callee this program didn't itself
+/// recover -- an external library call can't be inspected this way.
+pub fn find_field_value_consumers(functions: &[RecoveredFunction], field: &DiscoveredField) -> Vec<FieldValueConsumer> {
+    const MAX_HOPS: u32 = 3;
+
+    let mut functions_by_name: HashMap<&str, &RecoveredFunction> = HashMap::new();
+    for f in functions {
+        functions_by_name.insert(f.raw_name.as_str(), f);
+        functions_by_name.insert(f.display_name.as_str(), f);
+    }
+    let Some(&defining) = functions_by_name.get(field.function_raw_name.as_str()) else {
+        return Vec::new();
+    };
+
+    let mechanical = mechanical_dereference_text(field);
+    let mut consumers = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    collect_value_consumers(&functions_by_name, defining, &mechanical, MAX_HOPS, &mut consumers, &mut seen);
+    consumers
+}
+
+fn collect_value_consumers<'a>(
+    functions_by_name: &HashMap<&str, &'a RecoveredFunction>,
+    caller: &RecoveredFunction,
+    value_text: &str,
+    hops_remaining: u32,
+    consumers: &mut Vec<FieldValueConsumer>,
+    seen: &mut std::collections::HashSet<String>,
+) {
+    if hops_remaining == 0 {
+        return;
+    }
+    for (callee_name, args_text) in find_calls(&caller.decompilation) {
+        if callee_name == caller.raw_name {
+            continue;
+        }
+        for (position, arg) in split_top_level_comma(args_text).into_iter().enumerate() {
+            if strip_casts_and_parens(arg) != value_text {
+                continue;
+            }
+            let Some(&callee) = functions_by_name.get(callee_name) else { continue };
+            if !seen.insert(format!("{}#{position}", callee.raw_name)) {
+                continue;
+            }
+            consumers.push(FieldValueConsumer {
+                callee_raw_name: callee.raw_name.clone(),
+                callee_decompilation: callee.decompilation.clone(),
+                parameter_position: position,
+            });
+
+            // Follow one more hop: if the callee forwards its own
+            // corresponding parameter onward bare, that parameter's own
+            // name becomes the new value text to search for.
+            let Some(brace_open) = callee.decompilation.find('{') else { continue };
+            let Some(params) = parse_param_names(&callee.decompilation[..brace_open + 1]) else { continue };
+            let Some(param_name) = params.get(position) else { continue };
+            collect_value_consumers(functions_by_name, callee, param_name, hops_remaining - 1, consumers, seen);
+        }
+    }
+}
+
 /// Reconstructs every fragmented stack object this module can safely
 /// resolve, function by function: finds a local whose address is passed
 /// to some other, already-recovered function, collects every field fact
@@ -1095,5 +1207,87 @@ mod tests {
         let body = &functions[0].decompilation;
         assert!(!body.contains("local_48[2]"), "{body}");
         assert!(body.contains("*(int *)(local_48 + 0x8)"), "{body}");
+    }
+
+    /// The real, confirmed case this whole discovery exists for: Snake's
+    /// own lives counter (`local_b8 + 0x4`) is only ever *set* where it's
+    /// declared (`initializeRandomState`), but the evidence that
+    /// actually explains what it means -- displayed next to "Lives: " --
+    /// lives two calls away, in `FUN_14000213e` (`drawText`), reached
+    /// through `FUN_140001cb0` forwarding its own third parameter. Must
+    /// follow exactly that chain, and never revisit a callee already
+    /// recorded.
+    #[test]
+    fn finds_the_real_three_hop_value_consumer_chain_for_the_lives_field() {
+        let mut functions = vec![
+            function(
+                "0x1400025b0",
+                "undefined4 *param_1",
+                "undefined FUN_1400025b0(undefined4 *param_1)\n\n{\n  \n  *param_1 = 1;\n  param_1[1] = 3;\n  param_1[2] = 3;\n  *(undefined *)(param_1 + 3) = 0;\n  return;\n}",
+            ),
+            function(
+                "0x140002784",
+                "longlong param_1, int param_2",
+                "undefined FUN_140002784(longlong param_1, int param_2)\n\n{\n  \n  *(int *)(param_1 + 8) = param_2;\n  *(undefined *)(param_1 + 0xc) = 1;\n  return;\n}",
+            ),
+            function(
+                "0x14000205a",
+                "undefined8 param_1, undefined8 param_2, int param_3, int param_4",
+                "undefined8 FUN_14000205a(undefined8 param_1, undefined8 param_2, int param_3, int param_4)\n\n{\n  return param_1;\n}",
+            ),
+            function(
+                "0x14000213e",
+                "longlong param_1, int param_2, int param_3",
+                "undefined FUN_14000213e(longlong param_1, int param_2, int param_3)\n\n{\n  FUN_14000205a((undefined8)(0),(undefined8)(param_1),(int)(param_2),(int)(param_3));\n  return;\n}",
+            ),
+            function(
+                "0x140001cb0",
+                "longlong param_1, int param_2, int param_3, char param_4",
+                "undefined FUN_140001cb0(longlong param_1, int param_2, int param_3, char param_4)\n\n{\n  FUN_14000213e((longlong)(param_1),(int)(param_2),(int)(param_3));\n  return;\n}",
+            ),
+            function(
+                "0x140003476",
+                "void",
+                "undefined8 initializeRandomState(void)\n\n{\n  undefined4 local_b8;\n  int local_b4;\n  char local_ac;\n  int local_1c;\n  \n  FUN_1400025b0((undefined4 *)(&local_b8));\n  local_1c = 0;\n  while (0 < local_b4) {\n    FUN_140001cb0((longlong)(0),(int)(local_1c),(int)(local_b4),(char)('\\0'));\n    if (local_ac != '\\x01') {\n      FUN_140002784((longlong)((longlong)&local_b8),(int)(0));\n    }\n    local_1c = local_1c + 1;\n  }\n  return 0;\n}",
+            ),
+        ];
+
+        let discovered = reconstruct_stack_objects(&mut functions);
+        let lives_field = discovered
+            .iter()
+            .find(|f| f.function_raw_name == "FUN_140003476" && f.offset == 4)
+            .unwrap();
+
+        let consumers = find_field_value_consumers(&functions, lives_field);
+
+        assert_eq!(consumers.len(), 3, "{consumers:?}");
+        assert_eq!(consumers[0].callee_raw_name, "FUN_140001cb0");
+        assert_eq!(consumers[0].parameter_position, 2);
+        assert_eq!(consumers[1].callee_raw_name, "FUN_14000213e");
+        assert_eq!(consumers[1].parameter_position, 2);
+        assert_eq!(consumers[2].callee_raw_name, "FUN_14000205a");
+        assert_eq!(consumers[2].parameter_position, 3);
+    }
+
+    /// A field passed to nothing at all must simply have no consumers --
+    /// never an error, never a guess.
+    #[test]
+    fn a_field_never_passed_onward_has_no_value_consumers() {
+        let functions = vec![function(
+            "0x1",
+            "void",
+            "undefined8 FUN_1(void)\n\n{\n  undefined4 local_8;\n  \n  *(int *)(&local_8) = 5;\n  return 0;\n}",
+        )];
+        let field = DiscoveredField {
+            subject: "field:FUN_1:local_8+0x0".to_string(),
+            function_raw_name: "FUN_1".to_string(),
+            base: "local_8".to_string(),
+            offset: 0,
+            width: 4,
+            declared_type: "int".to_string(),
+        };
+
+        let consumers = find_field_value_consumers(&functions, &field);
+        assert!(consumers.is_empty(), "{consumers:?}");
     }
 }

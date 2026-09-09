@@ -18,7 +18,7 @@ use crate::extract::is_valid_cpp_identifier;
 use crate::forwarding_thunk::matching_close;
 use crate::model::RecoveredFunction;
 use crate::phantom_local::split_locals_block;
-use crate::stack_object::DiscoveredField;
+use crate::stack_object::{mechanical_dereference_text, offset_text, DiscoveredField};
 
 /// How field names render, mirroring `debura recover`'s own `--names`
 /// flag. `Mechanical` never looks at the graph at all -- every field
@@ -50,26 +50,6 @@ fn accepted_field_name<'a>(graph: &'a KnowledgeGraph, subject: &str) -> Option<&
                 && is_valid_cpp_identifier(&h.value)
         })
         .max_by_key(|h| h.id.0)
-}
-
-/// The exact mechanical dereference text `stack_object.rs` itself
-/// produces for `field` -- must match its own formatting byte for byte
-/// (`"+ 0"`, not `"+ 0x0"`, at offset zero) since this is a literal
-/// substring search, not a parse.
-fn mechanical_dereference_text(field: &DiscoveredField) -> String {
-    if field.offset == 0 {
-        format!("*({} *)({} + 0)", field.declared_type, field.base)
-    } else {
-        format!("*({} *)({} + 0x{:x})", field.declared_type, field.base, field.offset)
-    }
-}
-
-fn offset_text(offset: i64) -> String {
-    if offset == 0 {
-        "0".to_string()
-    } else {
-        format!("0x{offset:x}")
-    }
 }
 
 /// Renders every ACCEPTED field name this project's knowledge graph has

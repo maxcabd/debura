@@ -687,6 +687,16 @@ fn main() -> Result<()> {
                     .map(|other| format!("offset 0x{:x}, width {}, type {}", other.offset, other.width, other.declared_type))
                     .collect();
 
+                let value_consumers: Vec<String> = debura_recovery::find_field_value_consumers(&program.functions, field)
+                    .iter()
+                    .map(|c| {
+                        format!(
+                            "value passed to {} (parameter {}), whose own body is:\n{}",
+                            c.callee_raw_name, c.parameter_position, c.callee_decompilation
+                        )
+                    })
+                    .collect();
+
                 let task = debura_agent::ProposeFieldNameTask::build(
                     &graph,
                     &field.subject,
@@ -698,6 +708,7 @@ fn main() -> Result<()> {
                     field.width,
                     &field.declared_type,
                     sibling_fields,
+                    value_consumers,
                 );
 
                 let result = provider.propose_field_name(&task)?;
