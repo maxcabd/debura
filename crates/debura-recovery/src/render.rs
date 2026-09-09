@@ -37,19 +37,12 @@ fn patch_known_idioms(text: &str) -> String {
     // really is a *member* of basic_ostream in the real ABI, unlike the
     // free-function overloads for ordinary values -- decompiles as a
     // qualified call to this exact class-scoped name, not
-    // `std::operator<<`. `compat.rs`'s `debura_stream_manip` takes over
-    // from here (and declares the function-pointer typedef this call's
-    // own argument cast needs).
-    // No trailing `(` in the needle: Ghidra sometimes wraps a long call
-    // expression across lines, with the open paren on its own line --
-    // a real case had exactly this, which an earlier version of this
-    // replace (requiring an immediately-following `(`) silently missed.
-    // Whitespace/a newline between a function name and its `(` is valid
-    // C++ regardless, so dropping it from the needle is enough.
-    let text = text.replace(
-        "std::basic_ostream<char,std::char_traits<char>>::operator<<",
-        "debura_stream_manip",
-    );
+    // `std::operator<<`. But this is also the identical qualified-call
+    // shape Ghidra's decompiler uses for basic_ostream's *other* member
+    // overloads (`operator<<(int)`, `operator<<(double)`, ...) -- nothing
+    // in the call syntax tells them apart, so it has to be routed by
+    // argument, not blindly. See `patch_ostream_operator_shift` below.
+    let text = patch_ostream_operator_shift(&text);
     // Ghidra's decompiler occasionally names a local variable holding an
     // intermediate value literally `this` -- unrelated to the enclosing
     // function's own implicit `this`, but a hard conflict regardless,
@@ -141,6 +134,68 @@ fn patch_known_idioms(text: &str) -> String {
     // Must run last: looks for the bare `receiver->method()` shape the
     // fixes above just produced.
     patch_hidden_return_slot_construction(&text)
+}
+
+/// `std::basic_ostream<...>::operator<<` is Ghidra's identical qualified-
+/// call shape for two real, distinct member overloads: the one that
+/// accepts a manipulator function pointer (the chained-`std::endl`
+/// idiom) and the ordinary built-in-value overloads (`operator<<(int)`,
+/// `operator<<(double)`, ...) -- nothing in the call syntax itself tells
+/// them apart. A real compile initially routed every occurrence to
+/// `debura_stream_manip` (whose second parameter really is a function
+/// pointer); under `-fpermissive` that doesn't fail to compile when the
+/// argument is an ordinary `int` -- it silently "converts" the int value
+/// into a function pointer instead, and a real run crashed calling
+/// through it (`FUN_14000205a` streaming a plain `int` score value
+/// segfaulted jumping through a null/garbage function pointer). Routed
+/// by argument instead: only when it's the one manipulator this codebase
+/// declares (`debura_stream_endl`, itself only ever produced by the
+/// `std::endl` rewrite above) does this go to `debura_stream_manip`;
+/// every other argument goes through `debura_stream_output`'s generic
+/// by-value overload instead, exactly like the free-function
+/// `std::operator<<` case already does. No trailing `(` required before
+/// parsing the call: Ghidra sometimes wraps a long call expression
+/// across lines, with the open paren on its own line -- a real case had
+/// exactly this, so the whitespace between the name and `(` is skipped
+/// when looking for the call, but preserved verbatim in the output.
+fn patch_ostream_operator_shift(text: &str) -> String {
+    let prefix = "std::basic_ostream<char,std::char_traits<char>>::operator<<";
+    if !text.contains(prefix) {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(pos) = rest.find(prefix) {
+        out.push_str(&rest[..pos]);
+        let after_prefix = &rest[pos + prefix.len()..];
+        let ws_len = after_prefix.len() - after_prefix.trim_start().len();
+        let (whitespace, after_ws) = after_prefix.split_at(ws_len);
+        let Some(after_open) = after_ws.strip_prefix('(') else {
+            out.push_str(prefix);
+            rest = after_prefix;
+            continue;
+        };
+        let Some(close) = find_matching_close_paren(after_open) else {
+            out.push_str(prefix);
+            rest = after_prefix;
+            continue;
+        };
+        let args = &after_open[..close];
+        let (_, arg) = split_first_arg(args);
+        let target = if arg.trim() == "debura_stream_endl" {
+            "debura_stream_manip"
+        } else {
+            "debura_stream_output"
+        };
+        out.push_str(target);
+        out.push_str(whitespace);
+        out.push('(');
+        out.push_str(args);
+        out.push(')');
+        rest = &after_open[close + 1..];
+    }
+    out.push_str(rest);
+    out
 }
 
 /// STL methods that return a non-trivial type by value, keyed by the
@@ -430,16 +485,31 @@ fn find_matching_close_paren(text: &str) -> Option<usize> {
 /// "protected within this context". A real case had this because
 /// Ghidra's own stack-frame analysis split a single `basic_stringstream`
 /// object's raw bytes into two separately-named locals -- one correctly
-/// typed `basic_stringstream` (handled above), the rest of the same
-/// object's storage separately guessed to be its own `basic_ostream`,
-/// which was never actually true; it's just more of the same object's
-/// raw bytes. Declaring it as plain, always-constructible bytes instead,
-/// and casting its own use site(s) to the pointer type they actually
-/// need, preserves the exact address value Ghidra's own code already
-/// relies on without ever trying to construct a type that can't be.
-/// Handles one such local per body -- the only shape a real compile has
-/// shown so far; a second one in the same body would need a second pass,
-/// not attempted here since nothing yet demonstrates it happens.
+/// typed `basic_stringstream`, the rest of the same object's storage
+/// separately guessed to be its own `basic_ostream`, which was never
+/// actually true; it's just more of the same object's raw bytes.
+///
+/// Two different fixes, tried in order: when the real sibling
+/// `basic_stringstream` local can be identified (`find_stringstream_base_sibling`
+/// below), alias every use to a real upcast of *that* object's own
+/// address instead -- correct, not just compiling, since it's an
+/// ordinary base-class pointer conversion onto a real, already-
+/// constructed object, and the compiler adjusts the pointer for
+/// multiple inheritance automatically. A real run initially shipped only
+/// the fallback below (declare plain, always-constructible bytes, and
+/// cast its own use site(s) to the pointer type they actually need,
+/// preserving the exact address value Ghidra's own code already relies
+/// on) -- it compiles, but a real g++ build that got far enough to
+/// actually *run* this code segfaulted deep inside libstdc++: a
+/// polymorphic stream type has a vtable pointer at offset 0, and raw,
+/// never-constructed stack bytes reinterpreted as one has a garbage
+/// vtable pointer, crashing the instant any virtual call happens.
+/// Kept as a fallback for the case the real sibling can't be identified,
+/// since a syntactically valid, if potentially still-unsafe-if-actually-
+/// used, program beats a compile error. Handles one such local per body
+/// -- the only shape a real compile has shown so far; a second one in
+/// the same body would need a second pass, not attempted here since
+/// nothing yet demonstrates it happens.
 fn fix_bare_ostream_array_locals(text: &str) -> String {
     let needle = "basic_ostream ";
     let mut out = String::with_capacity(text.len());
@@ -469,16 +539,66 @@ fn fix_bare_ostream_array_locals(text: &str) -> String {
             rest = after;
             continue;
         };
+        let after_decl = &after_bracket[semi + 1..];
+
+        if let Some(sibling) = find_stringstream_base_sibling(text, name) {
+            out.push_str(&rest[..pos]);
+            let replacement = format!("(::basic_ostream *)(&{sibling})");
+            out.push_str(&replace_whole_word(after_decl, name, &replacement));
+            return out;
+        }
 
         out.push_str(&rest[..pos]);
         out.push_str(&format!("unsigned char {name} [{size}];"));
         let name = name.to_string();
-        let after_decl = &after_bracket[semi + 1..];
         out.push_str(&replace_whole_word(after_decl, &name, &format!("(basic_ostream *){name}")));
         return out;
     }
     out.push_str(rest);
     out
+}
+
+/// Whether `ostream_name` (a `basic_ostream NAME [N];` local Ghidra
+/// declared) is really just more of some *other*, already-declared
+/// `basic_stringstream<...> OTHER [M];` local's own storage -- not a
+/// guess: Ghidra's own `local_XXX`/`abStack_XXX` naming already encodes
+/// each local's real stack offset (`ghidra_stack_offset`, the same
+/// technique `stack_object.rs` uses for scalar fields), so the ostream
+/// local is the stringstream's own base subobject if and only if its
+/// offset sits exactly `M` bytes past the stringstream local's own
+/// offset -- immediately adjacent, not merely nearby, which is what a
+/// derived object laying its base subobject right after its own header
+/// bytes actually looks like on the stack. `M` here is Ghidra's
+/// placeholder unit count for the stringstream's own declared extent
+/// (`basic_stringstream<...> local_1a8 [16];`), not a real byte size in
+/// general, but it's exactly the byte count that matters for this
+/// specific adjacency check regardless of what it means elsewhere.
+fn find_stringstream_base_sibling<'a>(text: &'a str, ostream_name: &str) -> Option<&'a str> {
+    let ostream_offset = crate::stack_object::ghidra_stack_offset(ostream_name)?;
+    let decl_needle = "basic_stringstream<char,std::char_traits<char>,std::allocator<char>> ";
+    for candidate in find_declared_local_names(text, decl_needle) {
+        let Some(stream_offset) = crate::stack_object::ghidra_stack_offset(candidate) else {
+            continue;
+        };
+        let Some(unit_count) = declared_array_extent(text, decl_needle, candidate) else {
+            continue;
+        };
+        if stream_offset - ostream_offset == unit_count {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// The `[N]` extent Ghidra declared for `{decl_needle}{name} [N];`,
+/// parsed as an integer -- only ever consulted by
+/// `find_stringstream_base_sibling` above.
+fn declared_array_extent(text: &str, decl_needle: &str, name: &str) -> Option<i64> {
+    let needle = format!("{decl_needle}{name} [");
+    let pos = text.find(&needle)?;
+    let after = &text[pos + needle.len()..];
+    let close = after.find(']')?;
+    after[..close].trim().parse().ok()
 }
 
 /// Every local variable declared `{decl_needle}NAME [N];` -- the shape
@@ -654,6 +774,40 @@ mod idiom_tests {
         assert!(!patched.contains("basic_ostream abStack_198"), "{patched}");
     }
 
+    /// The real, confirmed case: `abStack_198`'s raw-byte fallback above
+    /// compiles, but a real g++ build that got far enough to actually
+    /// *run* it segfaulted inside libstdc++ the instant `operator<<`
+    /// made a virtual call through its garbage, never-constructed vtable
+    /// pointer. `abStack_198` (offset 0x198) sits exactly 0x10 bytes past
+    /// `local_1a8` (offset 0x1a8) -- exactly `local_1a8`'s own declared
+    /// `[16]` extent -- so it's really just the same, already-
+    /// constructed `basic_stringstream` object's own base subobject, and
+    /// should be an upcast onto it instead of independent, uninitialized
+    /// storage.
+    #[test]
+    fn an_ostream_array_local_adjacent_to_a_real_stringstream_is_aliased_to_it_instead() {
+        let text = "basic_stringstream<char,std::char_traits<char>,std::allocator<char>> local_1a8 [16];\n  basic_ostream abStack_198 [392];\n  pbVar1 = debura_stream_output(abStack_198,x);";
+        let patched = patch_known_idioms(text);
+        assert!(
+            patched.contains("debura_stream_output((::basic_ostream *)(&local_1a8),x)"),
+            "{patched}"
+        );
+        assert!(!patched.contains("basic_ostream abStack_198"), "{patched}");
+        assert!(!patched.contains("unsigned char abStack_198"), "{patched}");
+    }
+
+    /// A `basic_stringstream` local that happens to also exist in the
+    /// same body, but isn't actually adjacent to the ostream local (its
+    /// own offset/extent don't line up), must never be aliased to by
+    /// coincidence -- the raw-byte fallback is still correct here.
+    #[test]
+    fn an_unrelated_stringstream_local_is_never_mistaken_for_the_real_sibling() {
+        let text = "basic_stringstream<char,std::char_traits<char>,std::allocator<char>> local_50 [16];\n  basic_ostream abStack_198 [392];\n  pbVar1 = debura_stream_output(abStack_198,x);";
+        let patched = patch_known_idioms(text);
+        assert!(patched.contains("unsigned char abStack_198 [392];"), "{patched}");
+        assert!(patched.contains("(basic_ostream *)abStack_198"), "{patched}");
+    }
+
     /// PROJECT.md M18: `TTF_RenderText_Solid`'s real third parameter is
     /// an `SDL_Color` *value*, but Ghidra decompiles the packed color as
     /// a plain `undefined4` local -- the exact same 4 bytes, just the
@@ -721,10 +875,14 @@ mod idiom_tests {
     /// basic_ostream's own `operator<<`, not `std::operator<<` -- a real
     /// compile found this call form entirely unhandled ("not declared in
     /// this scope" for the argument's own function-pointer cast target).
+    /// Only a real manipulator argument (`debura_stream_endl`, itself
+    /// only ever produced by the `std::endl` rewrite) routes here --
+    /// see the ordinary-value case below for why this can't be
+    /// unconditional.
     #[test]
     fn qualified_ostream_operator_shift_becomes_debura_stream_manip() {
-        let text = "std::basic_ostream<char,std::char_traits<char>>::operator<<(x, y);";
-        assert_eq!(patch_known_idioms(text), "debura_stream_manip(x, y);");
+        let text = "std::basic_ostream<char,std::char_traits<char>>::operator<<(x, debura_stream_endl);";
+        assert_eq!(patch_known_idioms(text), "debura_stream_manip(x, debura_stream_endl);");
     }
 
     /// A real compile hit this: Ghidra wrapped a long call expression
@@ -733,8 +891,25 @@ mod idiom_tests {
     /// immediately-following `(` and silently missed it.
     #[test]
     fn qualified_ostream_operator_shift_is_replaced_even_when_line_wrapped() {
-        let text = "std::basic_ostream<char,std::char_traits<char>>::operator<<\n          (x, y);";
-        assert_eq!(patch_known_idioms(text), "debura_stream_manip\n          (x, y);");
+        let text = "std::basic_ostream<char,std::char_traits<char>>::operator<<\n          (x, debura_stream_endl);";
+        assert_eq!(
+            patch_known_idioms(text),
+            "debura_stream_manip\n          (x, debura_stream_endl);"
+        );
+    }
+
+    /// The real, confirmed case: this exact qualified-call shape is also
+    /// how Ghidra decompiles basic_ostream's *other* member overloads --
+    /// `operator<<(int)` here -- which take an ordinary value, not a
+    /// function pointer. Routing every occurrence to
+    /// `debura_stream_manip` compiled under `-fpermissive` (silently
+    /// "converting" the int to a function pointer) but crashed at
+    /// runtime calling through it. Must go to `debura_stream_output`'s
+    /// generic by-value overload instead.
+    #[test]
+    fn qualified_ostream_operator_shift_with_an_ordinary_value_becomes_debura_stream_output() {
+        let text = "std::basic_ostream<char,std::char_traits<char>>::operator<<(pbVar1, param_3);";
+        assert_eq!(patch_known_idioms(text), "debura_stream_output(pbVar1, param_3);");
     }
 
     /// The exact real case: a local variable Ghidra's decompiler named

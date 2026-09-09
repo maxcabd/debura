@@ -541,7 +541,7 @@ fn width_of_declared_type(declared_type: &str) -> Option<u32> {
 /// `SDL_Event`'s `key.keysym.sym` field). `None` for a name that
 /// doesn't end in a hex suffix at all (a real semantic name already
 /// applied, or some other naming shape entirely).
-fn ghidra_stack_offset(name: &str) -> Option<i64> {
+pub(crate) fn ghidra_stack_offset(name: &str) -> Option<i64> {
     let hex = name.rsplit('_').next()?;
     if hex.is_empty() || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
         return None;
