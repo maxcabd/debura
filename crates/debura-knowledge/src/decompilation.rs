@@ -51,9 +51,122 @@ pub fn is_degenerate_decompilation(text: &str) -> bool {
         return true;
     }
     match remainder.strip_prefix('{').and_then(|s| s.strip_suffix('}')) {
-        Some(body) => body_has_only_comments_or_whitespace(body),
+        Some(body) => body_has_only_comments_or_whitespace(body) || has_uninitialized_pointer_dereference(body),
         None => true,
     }
+}
+
+/// A body that declares a local pointer, never assigns it a value anywhere,
+/// and dereferences it anyway -- real, observed Ghidra output from a stale
+/// re-analysis pass (`FUN_140006750`'s two real observations for the same
+/// address: an earlier, complete body computes a real value through
+/// `puVar1`; a later pass produced just `ulonglong *puVar1; return
+/// *puVar1;`, syntactically valid C that can only ever read garbage off the
+/// stack). Not caught by the comment-only check above -- this is real code,
+/// just code no real computation ever produces. `latest_decompilation`'s
+/// "prefer substantive" contract only holds if this shape is recognized as
+/// degenerate too, so a later stale pass never silently outranks an
+/// earlier, real body for the same address.
+fn has_uninitialized_pointer_dereference(body: &str) -> bool {
+    for (decl_line_no, line) in body.lines().enumerate() {
+        let Some(name) = declared_pointer_local_name(line) else {
+            continue;
+        };
+        let mut assigned = false;
+        let mut dereferenced = false;
+        for (line_no, other) in body.lines().enumerate() {
+            if line_no == decl_line_no {
+                continue;
+            }
+            if is_bare_assignment(other, name) {
+                assigned = true;
+            }
+            if is_dereferenced(other, name) {
+                dereferenced = true;
+            }
+        }
+        if !assigned && dereferenced {
+            return true;
+        }
+    }
+    false
+}
+
+/// Ghidra keywords that can legitimately precede a `*expr` in a statement
+/// without that statement being a pointer declaration -- excluded so
+/// `return *puVar1;` is never mistaken for a declaration of a local named
+/// `puVar1` with type `return`.
+const NOT_A_TYPE: &[&str] = &["return", "if", "while", "for", "switch", "case", "break", "continue", "else", "do", "goto"];
+
+/// Whether `line` is a simple, single-declarator pointer-local declaration
+/// (`TYPE *name;`), and if so, the declared name. Deliberately narrow: no
+/// `=` (an initialized declaration already has its value), no `(` (rules
+/// out both function declarations and any statement with a call in it), no
+/// `,` (rules out multi-declarator lines this pass doesn't need to
+/// handle).
+fn declared_pointer_local_name(line: &str) -> Option<&str> {
+    let trimmed = line.trim();
+    let inner = trimmed.strip_suffix(';')?;
+    if inner.contains('=') || inner.contains('(') || inner.contains(',') {
+        return None;
+    }
+    let star_pos = inner.rfind('*')?;
+    let name = inner[star_pos + 1..].trim();
+    if name.is_empty() || !name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+        return None;
+    }
+    if name.chars().next()?.is_ascii_digit() {
+        return None;
+    }
+    let type_part = inner[..star_pos].trim();
+    if type_part.is_empty() || NOT_A_TYPE.contains(&type_part.rsplit(char::is_whitespace).next().unwrap_or(type_part)) {
+        return None;
+    }
+    Some(name)
+}
+
+/// Whether `line` contains a bare `name = ...` (not `==`, and not `*name =
+/// ...`, which assigns through the pointer rather than to it).
+fn is_bare_assignment(line: &str, name: &str) -> bool {
+    for (i, _) in line.match_indices(name) {
+        if !is_identifier_boundary(line, i, name.len()) {
+            continue;
+        }
+        if line[..i].trim_end().ends_with('*') {
+            continue;
+        }
+        let after = line[i + name.len()..].trim_start();
+        if after.starts_with('=') && !after.starts_with("==") {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether `line` dereferences `name` (`*name` or `name->`).
+fn is_dereferenced(line: &str, name: &str) -> bool {
+    for (i, _) in line.match_indices(name) {
+        if !is_identifier_boundary(line, i, name.len()) {
+            continue;
+        }
+        if line[..i].trim_end().ends_with('*') {
+            return true;
+        }
+        if line[i + name.len()..].starts_with("->") {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether the occurrence of a `len`-byte identifier starting at byte
+/// offset `start` in `line` is a whole identifier, not a substring of a
+/// longer one (`puVar1` inside `puVar10`).
+fn is_identifier_boundary(line: &str, start: usize, len: usize) -> bool {
+    let before_ok = line[..start].chars().next_back().is_none_or(|c| !c.is_alphanumeric() && c != '_');
+    let end = start + len;
+    let after_ok = line[end..].chars().next().is_none_or(|c| !c.is_alphanumeric() && c != '_');
+    before_ok && after_ok
 }
 
 /// Whether `body` (the text strictly between a decompilation's own outer
@@ -191,5 +304,62 @@ mod tests {
         assert!(!is_degenerate_decompilation(
             "void FUN_1(void)\n\n{\n  /* WARNING: unknown */\n  real_call();\n  return;\n}"
         ));
+    }
+
+    /// The real, confirmed case: `FUN_140006750`'s later observation, a
+    /// stale re-analysis pass that declared `puVar1` and dereferenced it
+    /// without ever assigning it a value.
+    #[test]
+    fn a_body_that_dereferences_an_unassigned_pointer_local_is_degenerate() {
+        assert!(is_degenerate_decompilation(
+            "ulonglong FUN_140006750(undefined8 param_1)\n{\n ulonglong *puVar1;\n return *puVar1;\n}"
+        ));
+    }
+
+    /// The same address's earlier, real observation -- `puVar1` is declared,
+    /// assigned from a real call, and only then dereferenced -- must not be
+    /// mistaken for the degenerate shape above.
+    #[test]
+    fn a_body_that_assigns_a_pointer_local_before_dereferencing_it_is_not_degenerate() {
+        assert!(!is_degenerate_decompilation(
+            "ulonglong FUN_140006750(undefined8 param_1)\n\n{\n  ulonglong *puVar1;\n  ulonglong local_30;\n  \n  local_30 = param_1;\n  puVar1 = FUN_140007800(&local_30);\n  return *puVar1;\n}"
+        ));
+    }
+
+    /// `return *ptr;` must never be mistaken for a declaration of a local
+    /// named `ptr` with type `return` -- `NOT_A_TYPE` exists specifically
+    /// to keep control-flow keywords from being parsed as pointer types.
+    #[test]
+    fn a_bare_return_of_a_dereference_is_not_mistaken_for_a_declaration() {
+        assert!(!is_degenerate_decompilation(
+            "int FUN_1(int *ptr)\n\n{\n  return *ptr;\n}"
+        ));
+    }
+
+    /// `latest_decompilation` itself must prefer the earlier, real body
+    /// over this specific degenerate shape, end to end -- the real
+    /// regression `FUN_140006750` exhibited before this fix.
+    #[test]
+    fn latest_decompilation_prefers_the_real_body_over_a_stale_uninitialized_read() {
+        let mut graph = KnowledgeGraph::new();
+        graph.add_observation(
+            "0x140006750",
+            "decompiles_to",
+            "ulonglong FUN_140006750(undefined8 param_1)\n\n{\n  ulonglong *puVar1;\n  ulonglong local_30;\n  \n  local_30 = param_1;\n  puVar1 = FUN_140007800(&local_30);\n  return *puVar1;\n}",
+            0.95,
+            "ghidra:decompiler",
+            None,
+        );
+        graph.add_observation(
+            "0x140006750",
+            "decompiles_to",
+            "ulonglong FUN_140006750(undefined8 param_1)\n{\n ulonglong *puVar1;\n return *puVar1;\n}",
+            0.95,
+            "ghidra:decompiler",
+            None,
+        );
+
+        let latest = latest_decompilation(&graph, "0x140006750").unwrap();
+        assert!(latest.value.contains("FUN_140007800"), "{}", latest.value);
     }
 }
