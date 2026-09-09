@@ -43,6 +43,19 @@ pub struct ProposeFieldNameTask {
     /// `m_counter`/`m_isActive` instead and correctly had them rejected
     /// for lacking exactly this kind of evidence.
     pub value_consumers: Vec<String>,
+    /// Real, decoded content for `DAT_*`/`PTR_*` data symbols referenced
+    /// anywhere in the defining function or a value consumer's own body,
+    /// as human-readable facts (e.g. `"DAT_14000e0c0 (section .bss):
+    /// string \"Lives: \""`). PROJECT.md, "Deterministic string-literal
+    /// extraction": the confirmed reason this exists -- Snake's own
+    /// `createText` concatenates the lives field's value together with
+    /// exactly this symbol's real content, but until this existed the
+    /// symbol rendered as a completely opaque name, and a real run
+    /// proposed `m_drawableInstances` instead of `m_lives` for lack of
+    /// it. Deliberately narrow to symbols that actually resolved to a
+    /// real string (never every data reference regardless of relevance)
+    /// -- strings are the highest-value piece of this evidence class.
+    pub relevant_data_references: Vec<String>,
     /// Any hypothesis already proposed for this exact field subject (a
     /// retry after a REJECTED/CONTESTED name), mirroring
     /// `AnalyzeFunctionTask::rejection_reasons`'s own purpose.
@@ -63,6 +76,7 @@ impl ProposeFieldNameTask {
         declared_type: &str,
         sibling_fields: Vec<String>,
         value_consumers: Vec<String>,
+        relevant_data_references: Vec<String>,
     ) -> Self {
         Self {
             subject: subject.to_string(),
@@ -75,6 +89,7 @@ impl ProposeFieldNameTask {
             sibling_fields,
             reachable_api_hints: call_context::reachable_api_hints(graph, function_address),
             value_consumers,
+            relevant_data_references,
             existing_hypotheses: graph.hypotheses().filter(|h| h.subject == subject).cloned().collect(),
         }
     }
@@ -101,6 +116,7 @@ mod tests {
             4,
             "int",
             vec!["offset 0xc, width 1, type char".to_string()],
+            Vec::new(),
             Vec::new(),
         );
 

@@ -27,7 +27,9 @@ mod write;
 
 pub use compat::{render_ghidra_compat_header, GHIDRA_COMPAT_HEADER_NAME};
 pub use crt_boundary::{crt_startup_only_addresses, find_main_equivalent};
-pub use data_symbols::{classify_data_symbols, DataResolution, DataSymbolKind, VtableSlotTarget};
+pub use data_symbols::{
+    classify_data_symbols, find_constructor_string_literals, DataResolution, DataSymbolKind, VtableSlotTarget,
+};
 pub use disposition::{classify_recovery_disposition, DispositionEntry, RecoveryDisposition};
 pub use extract::{extract, extract_with_options, extract_with_required_runtime_bodies};
 pub use field_naming::NamesMode;
@@ -38,6 +40,7 @@ pub use model::{
 };
 pub use render::{render_functions_source, render_header, render_source};
 pub use stack_object::{find_field_value_consumers, DiscoveredField, FieldValueConsumer};
+pub use symtab::{build_symbol_table, SymbolTable};
 pub use symbols::{
     render_function_declarations, render_ghidra_symbols_header, render_ghidra_symbols_header_resolved,
     GHIDRA_SYMBOLS_HEADER_NAME,

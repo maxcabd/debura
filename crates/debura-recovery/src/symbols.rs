@@ -164,6 +164,19 @@ pub fn render_ghidra_symbols_header_resolved(
         // (`ExternalGlobalAlias`, `RuntimeData`, `CodeAddressAlias`,
         // `UnknownData`), or no resolution at all: the same bare `extern`
         // placeholder as before M18.2 existed.
+        //
+        // PROJECT.md, "Deterministic string-literal extraction":
+        // `StringLiteral` gets the same placeholder declaration, not a
+        // real definition -- recovering the address's own real,
+        // constructed *value* at program startup (the confirmed real
+        // case: a global `std::string` built by a static initializer
+        // this pass doesn't attempt to reproduce) is a separate, larger
+        // correctness question this round doesn't take on. The literal
+        // itself is still worth a human a glance, so it's noted as a
+        // comment -- never binding, never read by anything downstream.
+        if let Some(DataSymbolKind::StringLiteral(value)) = resolution.map(|r| &r.kind) {
+            out.push_str(&format!("// likely: {value:?}\n"));
+        }
         if symbol.starts_with("_refptr_") || symbol.starts_with("PTR_") {
             out.push_str(&format!("extern unsigned char *{symbol};\n"));
         } else {
@@ -697,5 +710,27 @@ mod tests {
         assert!(header.contains("inline const unsigned char DAT_CONST[1]"), "{header}");
         assert!(header.contains("inline unsigned char DAT_MUTABLE[1]"), "{header}");
         assert!(header.contains("inline unsigned char *PTR_ALIAS ="), "{header}");
+    }
+
+    /// PROJECT.md, "Deterministic string-literal extraction": a
+    /// `StringLiteral` resolution still gets the same safe bare `extern`
+    /// placeholder as `UnknownData` always has (recovering the object's
+    /// own real runtime construction is a separate question this round
+    /// doesn't attempt) -- but now with the real literal noted as a
+    /// human-readable comment right above it.
+    #[test]
+    fn a_string_literal_resolution_keeps_the_placeholder_and_adds_a_comment() {
+        let symbols = vec!["DAT_14000e0c0".to_string()];
+        let resolutions = vec![DataResolution {
+            address: "0x14000e0c0".to_string(),
+            symbol_name: "DAT_14000e0c0".to_string(),
+            kind: DataSymbolKind::StringLiteral("Lives: ".to_string()),
+            source_facts: vec![],
+            confidence: 0.9,
+        }];
+
+        let header = render_ghidra_symbols_header_resolved(&symbols, &resolutions, &[], "");
+
+        assert!(header.contains("// likely: \"Lives: \"\nextern unsigned char DAT_14000e0c0;"), "{header}");
     }
 }

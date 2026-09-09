@@ -43,6 +43,31 @@ enum NamesChoice {
     Mixed,
 }
 
+/// Every distinct `DAT_*`/`PTR_*`-shaped identifier mentioned in `text`
+/// (PROJECT.md, "Deterministic string-literal extraction") -- a plain
+/// byte scan, not a parse, since Ghidra's own naming convention is
+/// exactly this fixed prefix followed by ordinary identifier characters.
+fn extract_data_symbol_references(text: &str) -> std::collections::BTreeSet<String> {
+    let mut found = std::collections::BTreeSet::new();
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let is_boundary = i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
+        if is_boundary && (text[i..].starts_with("DAT_") || text[i..].starts_with("PTR_")) {
+            let start = i;
+            let mut j = i;
+            while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
+                j += 1;
+            }
+            found.insert(text[start..j].to_string());
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+    found
+}
+
 impl From<NamesChoice> for debura_recovery::NamesMode {
     fn from(choice: NamesChoice) -> Self {
         match choice {
@@ -658,6 +683,7 @@ fn main() -> Result<()> {
             let program = debura_recovery::extract(&graph);
             let functions_by_raw_name: std::collections::HashMap<&str, &debura_recovery::RecoveredFunction> =
                 program.functions.iter().map(|f| (f.raw_name.as_str(), f)).collect();
+            let symbol_table = debura_recovery::build_symbol_table(&program.classes, &program.functions);
 
             let (mut proposed, mut accepted, mut skipped_existing, mut skipped_no_function) = (0u32, 0u32, 0u32, 0u32);
 
@@ -687,7 +713,8 @@ fn main() -> Result<()> {
                     .map(|other| format!("offset 0x{:x}, width {}, type {}", other.offset, other.width, other.declared_type))
                     .collect();
 
-                let value_consumers: Vec<String> = debura_recovery::find_field_value_consumers(&program.functions, field)
+                let value_consumer_list = debura_recovery::find_field_value_consumers(&program.functions, field);
+                let value_consumers: Vec<String> = value_consumer_list
                     .iter()
                     .map(|c| {
                         format!(
@@ -696,6 +723,22 @@ fn main() -> Result<()> {
                         )
                     })
                     .collect();
+
+                let mut data_symbol_names = extract_data_symbol_references(&function.decompilation);
+                for c in &value_consumer_list {
+                    data_symbol_names.extend(extract_data_symbol_references(&c.callee_decompilation));
+                }
+                let data_symbol_names: Vec<String> = data_symbol_names.into_iter().collect();
+                let relevant_data_references: Vec<String> =
+                    debura_recovery::classify_data_symbols(&graph, &data_symbol_names, &symbol_table, &program.functions)
+                        .into_iter()
+                        .filter_map(|r| match r.kind {
+                            debura_recovery::DataSymbolKind::StringLiteral(value) => {
+                                Some(format!("{}: string {:?}", r.symbol_name, value))
+                            }
+                            _ => None,
+                        })
+                        .collect();
 
                 let task = debura_agent::ProposeFieldNameTask::build(
                     &graph,
@@ -709,6 +752,7 @@ fn main() -> Result<()> {
                     &field.declared_type,
                     sibling_fields,
                     value_consumers,
+                    relevant_data_references,
                 );
 
                 let result = provider.propose_field_name(&task)?;

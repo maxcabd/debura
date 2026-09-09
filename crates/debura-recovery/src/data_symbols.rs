@@ -1,5 +1,10 @@
+use std::collections::HashMap;
+
 use debura_knowledge::KnowledgeGraph;
 
+use crate::forwarding_thunk::split_top_level_comma;
+use crate::model::RecoveredFunction;
+use crate::phantom_local::{find_calls, strip_casts_and_parens};
 use crate::symtab::{SymbolKind, SymbolTable};
 
 /// What a `DAT_*`/`PTR_*`/`LAB_*`/`_refptr_*` linker placeholder actually
@@ -110,6 +115,20 @@ pub enum DataSymbolKind {
     /// applies to global data exactly the way it already does to
     /// semantic naming.
     UnknownData,
+    /// PROJECT.md, "Deterministic string-literal extraction": this
+    /// address's own real content is a string, from one of two real,
+    /// deterministic sources -- Ghidra's own `contains_string` typing (a
+    /// genuine `.rdata`/`.data` string constant), or a literal argument
+    /// found in a real constructor call this address's own address is
+    /// passed to (the confirmed real case: a global `std::string` like
+    /// Snake's own `DAT_14000e0c0`, which has no static content of its
+    /// own at all -- `.bss`, uninitialized -- but whose real value
+    /// (`"Lives: "`) is already sitting, unused until now, in the
+    /// decompiled text of the static initializer that constructs it).
+    /// Never a raw-bytes decode guess (a real `contains_string` fact or a
+    /// real literal argument, nothing heuristic). See
+    /// `find_constructor_string_literals` below for the second source.
+    StringLiteral(String),
 }
 
 /// A vtable slot's real value, once resolved (PROJECT.md M18.3). Itanium
@@ -535,11 +554,118 @@ pub fn classify_data_symbol(graph: &KnowledgeGraph, symbol_name: &str, table: &S
     }
 }
 
+/// Ghidra's own `contains_string` observation for `address`, if any,
+/// unquoted for display -- `debura-analysis::ingest` stores Ghidra's own
+/// quoted display representation verbatim (`"Lives: "`, quote marks
+/// included), so the surrounding quotes (never internal escapes: a real
+/// check found this project's own strings never need any) are stripped
+/// here once rather than by every caller.
+fn contains_string_value(graph: &KnowledgeGraph, address: &str) -> Option<String> {
+    let raw = single_value(graph, address, "contains_string")?;
+    Some(raw.strip_prefix('"').and_then(|s| s.strip_suffix('"')).unwrap_or(&raw).to_string())
+}
+
+/// Whether `arg` (already stripped of casts/parens) is a plain
+/// double-quoted string literal -- Ghidra always renders one as ordinary
+/// C string syntax, so this is a direct strip, not a parse. `None` for
+/// anything else (an identifier, a cast expression, a numeric literal, a
+/// nested call, ...).
+fn quoted_string_literal(arg: &str) -> Option<String> {
+    let arg = arg.trim();
+    let inner = arg.strip_prefix('"')?.strip_suffix('"')?;
+    Some(inner.to_string())
+}
+
+/// PROJECT.md, "Deterministic string-literal extraction": every
+/// `DAT_*`/`PTR_*` symbol name whose own address is passed as the first
+/// argument to some call, somewhere in `functions`' own already-
+/// decompiled bodies, where another argument to that *same* call is a
+/// plain quoted string literal -- real, structural evidence a global
+/// C++ object (a `std::string`, most commonly) is being constructed
+/// from that literal, confirmed against the real, confirmed case: Snake's
+/// own static initializer, `FUN_14000227e`, decompiles as
+/// `FUN_1400073b0((ulonglong *)&DAT_14000e0c0,"Lives: ",&local_29);` --
+/// `DAT_14000e0c0` itself has no static content at all (`.bss`,
+/// uninitialized, Ghidra never typed it a string), but the literal that
+/// actually belongs to it is sitting right there, unused until this
+/// pass reads it. Deliberately narrow: only the symbol's address as the
+/// *first* argument (the real ABI shape for a constructor's own
+/// receiver/hidden-return-slot parameter, the same convention
+/// `render.rs`'s `patch_hidden_return_slot_construction` already
+/// recognizes elsewhere) -- a symbol merely mentioned somewhere else in
+/// a call's argument list is not this pattern, and guessing so would
+/// attribute an unrelated literal to the wrong object.
+pub fn find_constructor_string_literals(functions: &[RecoveredFunction]) -> HashMap<String, String> {
+    let mut literals = HashMap::new();
+    for f in functions {
+        for (_, args_text) in find_calls(&f.decompilation) {
+            let args = split_top_level_comma(args_text);
+            let Some(first) = args.first() else { continue };
+            let first = strip_casts_and_parens(first);
+            let Some(symbol) = first.strip_prefix('&') else { continue };
+            if !(symbol.starts_with("DAT_") || symbol.starts_with("PTR_")) {
+                continue;
+            }
+            let Some(literal) = args.iter().skip(1).find_map(|arg| quoted_string_literal(strip_casts_and_parens(arg))) else {
+                continue;
+            };
+            literals.entry(symbol.to_string()).or_insert(literal);
+        }
+    }
+    literals
+}
+
+/// `symbol_name`'s own `StringLiteral` resolution, if either real source
+/// applies -- `None` means the caller falls through to
+/// `classify_data_symbol`'s existing, unrelated classification logic
+/// unchanged. Checked ahead of everything else in `classify_data_symbols`
+/// (never inside `classify_data_symbol` itself, which stays exactly as
+/// every one of its own existing unit tests already exercises it).
+fn classify_string_literal(
+    graph: &KnowledgeGraph,
+    symbol_name: &str,
+    constructor_literals: &HashMap<String, String>,
+) -> Option<DataResolution> {
+    let address = address_from_symbol_name(symbol_name)?;
+    if let Some(value) = contains_string_value(graph, &address) {
+        return Some(DataResolution {
+            address,
+            symbol_name: symbol_name.to_string(),
+            kind: DataSymbolKind::StringLiteral(value),
+            source_facts: vec!["contains_string (Ghidra's own string typing)".to_string()],
+            confidence: 0.99,
+        });
+    }
+    if let Some(value) = constructor_literals.get(symbol_name) {
+        return Some(DataResolution {
+            address,
+            symbol_name: symbol_name.to_string(),
+            kind: DataSymbolKind::StringLiteral(value.clone()),
+            source_facts: vec!["real literal argument to a constructor call receiving this address".to_string()],
+            confidence: 0.9,
+        });
+    }
+    None
+}
+
 /// Classifies every symbol in `symbol_names` (PROJECT.md M18.2) --
 /// `extract()`'s own convenience entry point, called once per recovery
 /// pass with the same symbol set `ghidra_data_symbols` already collects.
-pub fn classify_data_symbols(graph: &KnowledgeGraph, symbol_names: &[String], table: &SymbolTable) -> Vec<DataResolution> {
-    symbol_names.iter().map(|name| classify_data_symbol(graph, name, table)).collect()
+/// `functions` is the same whole-program function list `extract()`
+/// already has in scope -- consulted only for
+/// `find_constructor_string_literals` above; every other classification
+/// path is unaffected and still reads purely from `graph`/`table`.
+pub fn classify_data_symbols(
+    graph: &KnowledgeGraph,
+    symbol_names: &[String],
+    table: &SymbolTable,
+    functions: &[RecoveredFunction],
+) -> Vec<DataResolution> {
+    let constructor_literals = find_constructor_string_literals(functions);
+    symbol_names
+        .iter()
+        .map(|name| classify_string_literal(graph, name, &constructor_literals).unwrap_or_else(|| classify_data_symbol(graph, name, table)))
+        .collect()
 }
 
 #[cfg(test)]
@@ -964,5 +1090,92 @@ mod tests {
         let resolution = classify_data_symbol(&graph, "DAT_140009070", &table);
 
         assert!(matches!(resolution.kind, DataSymbolKind::ConstantData { size: 8, .. }), "{:?}", resolution.kind);
+    }
+
+    fn function(raw_name: &str, decompilation: &str) -> RecoveredFunction {
+        RecoveredFunction {
+            address: "0x1".to_string(),
+            raw_name: raw_name.to_string(),
+            display_name: raw_name.to_string(),
+            name_source: NameSource::Raw,
+            return_type: "void".to_string(),
+            params: String::new(),
+            decompilation: decompilation.to_string(),
+        }
+    }
+
+    /// The real, confirmed case: Snake's own static initializer,
+    /// `FUN_14000227e`, constructs two global `std::string`s from real
+    /// literal arguments -- `DAT_14000e0a0` from `"Score: "`,
+    /// `DAT_14000e0c0` from `"Lives: "`. Neither symbol has any static
+    /// content of its own (`.bss`, uninitialized); the literals are only
+    /// ever visible in this constructor's own decompiled text.
+    #[test]
+    fn finds_the_real_constructor_string_literals() {
+        let functions = vec![function(
+            "FUN_14000227e",
+            "void FUN_14000227e(void)\n\n{\n  allocator local_2a;\n  allocator local_29;\n  \n  FUN_1400073b0((ulonglong *)&DAT_14000e0a0,\"Score: \",&local_2a);\n  FUN_140006740();\n  FUN_1400073b0((ulonglong *)&DAT_14000e0c0,\"Lives: \",&local_29);\n  FUN_140006740();\n  return;\n}",
+        )];
+
+        let literals = find_constructor_string_literals(&functions);
+
+        assert_eq!(literals.get("DAT_14000e0a0").map(String::as_str), Some("Score: "));
+        assert_eq!(literals.get("DAT_14000e0c0").map(String::as_str), Some("Lives: "));
+    }
+
+    /// A symbol merely appearing somewhere in a call's own argument list
+    /// -- not as the call's *first* argument -- must never be attributed
+    /// a nearby literal: that's not the real constructor-receiver shape,
+    /// and guessing so risks pairing a literal with the wrong object.
+    #[test]
+    fn a_symbol_that_is_not_the_first_argument_gets_no_literal() {
+        let functions = vec![function(
+            "FUN_1",
+            "void FUN_1(void)\n\n{\n  FUN_2(local_1,\"unrelated\",&DAT_140009000);\n  return;\n}",
+        )];
+
+        let literals = find_constructor_string_literals(&functions);
+
+        assert!(literals.get("DAT_140009000").is_none(), "{literals:?}");
+    }
+
+    /// End-to-end through `classify_data_symbols`: the real Snake case --
+    /// no `contains_string` observation at all (Ghidra never typed
+    /// `DAT_14000e0c0` as a string, since it's an uninitialized `.bss`
+    /// object), but the constructor-literal source still resolves it.
+    #[test]
+    fn classify_data_symbols_resolves_a_constructor_literal_with_no_contains_string_observation() {
+        let graph = KnowledgeGraph::new();
+        let table = SymbolTable::new();
+        let functions = vec![function(
+            "FUN_14000227e",
+            "void FUN_14000227e(void)\n\n{\n  FUN_1400073b0((ulonglong *)&DAT_14000e0c0,\"Lives: \",&local_29);\n  return;\n}",
+        )];
+
+        let resolutions = classify_data_symbols(&graph, &["DAT_14000e0c0".to_string()], &table, &functions);
+
+        assert_eq!(resolutions.len(), 1);
+        assert_eq!(resolutions[0].kind, DataSymbolKind::StringLiteral("Lives: ".to_string()));
+        assert!((resolutions[0].confidence - 0.9).abs() < f64::EPSILON);
+    }
+
+    /// A real `contains_string` observation (Ghidra's own string typing)
+    /// must be preferred over a constructor-literal match when both
+    /// exist -- a deliberate precedence, not an accident of which check
+    /// happens to run first.
+    #[test]
+    fn a_real_contains_string_observation_is_preferred_over_a_constructor_literal() {
+        let mut graph = KnowledgeGraph::new();
+        graph.add_observation("0x140009000", "contains_string", "\"Ghidra's own value\"", 0.95, "ghidra:data", None);
+        let table = SymbolTable::new();
+        let functions = vec![function(
+            "FUN_1",
+            "void FUN_1(void)\n\n{\n  FUN_2((ulonglong *)&DAT_140009000,\"a different literal\",0);\n  return;\n}",
+        )];
+
+        let resolutions = classify_data_symbols(&graph, &["DAT_140009000".to_string()], &table, &functions);
+
+        assert_eq!(resolutions[0].kind, DataSymbolKind::StringLiteral("Ghidra's own value".to_string()));
+        assert!((resolutions[0].confidence - 0.99).abs() < f64::EPSILON);
     }
 }

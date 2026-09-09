@@ -522,7 +522,21 @@ const FIELD_NAMING_SYSTEM: &str = "You are Debura's field-naming reasoning step.
     \"Lives: \" label (whether found in the defining function or a value consumer) is \
     well-evidenced as \"m_lives\"; a field with no comparison, no clear write pattern, no naming \
     sibling fields, and no clinching value-consumer evidence is not -- leave it unproposed rather \
-    than guess. Never propose a generic placeholder (\"field\", \"value\", \
+    than guess. \
+    \n\n\
+    Weight the \"relevant data references\" section above that: it is the single strongest signal \
+    available when it applies. Every DAT_*/PTR_* symbol listed there has a real, deterministic, \
+    decoded string value (never a guess -- either Ghidra's own type system already confirmed it, \
+    or Debura found the exact literal argument passed to the real constructor call that builds \
+    that object). When a value consumer's own body both receives this field's value *and* \
+    references one of these resolved symbols -- the real, confirmed case: a function builds a \
+    display string by streaming this field's value together with a symbol that resolves to \
+    \"Lives: \" -- that symbol's own decoded text is direct, textual evidence for the field's real \
+    name, not merely structural inference from control flow. Prefer a name drawn straight from a \
+    resolved string that's actually adjacent to this field's own value (\"Lives: \" -> \"lives\" / \
+    \"m_lives\") over one inferred only from comparisons or a generic API domain -- text the \
+    program itself displays next to this exact value is stronger evidence than any structural \
+    pattern this evidence bar's earlier paragraphs describe. Never propose a generic placeholder (\"field\", \"value\", \
     \"data\", \"state\", \"flag\" alone) -- that conveys nothing beyond the mechanical name \
     already available, and is exactly as useless as no name at all while looking like real \
     recovered knowledge. The value must be a valid C++ identifier, conventionally member-style \
@@ -733,6 +747,15 @@ fn render_propose_field_name_task(task: &ProposeFieldNameTask) -> String {
     } else {
         for consumer in &task.value_consumers {
             out.push_str(&format!("- {consumer}\n"));
+        }
+    }
+
+    out.push_str("\nRelevant data references -- real, deterministic content for DAT_*/PTR_* symbols mentioned above (never guessed: Ghidra's own string typing, or a real literal argument found in the exact constructor call that builds that object):\n");
+    if task.relevant_data_references.is_empty() {
+        out.push_str("(none found)\n");
+    } else {
+        for reference in &task.relevant_data_references {
+            out.push_str(&format!("- {reference}\n"));
         }
     }
 

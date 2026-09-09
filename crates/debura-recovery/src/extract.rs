@@ -974,7 +974,7 @@ fn extract_impl(
     let mut data_resolutions;
     loop {
         let current: Vec<String> = ghidra_data_symbols.iter().cloned().collect();
-        data_resolutions = crate::data_symbols::classify_data_symbols(graph, &current, &symbol_table);
+        data_resolutions = crate::data_symbols::classify_data_symbols(graph, &current, &symbol_table, &functions);
         let discovered: Vec<String> = data_resolutions
             .iter()
             .filter_map(|r| match &r.kind {
