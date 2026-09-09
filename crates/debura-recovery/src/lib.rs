@@ -16,6 +16,7 @@ mod extract;
 mod forwarding_thunk;
 mod frontier;
 mod model;
+mod phantom_local;
 mod render;
 mod return_forwarding;
 mod symbols;

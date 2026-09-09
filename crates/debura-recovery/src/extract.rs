@@ -843,6 +843,17 @@ fn extract_impl(
     // trampoline signatures, call-site casting) reads either.
     crate::return_forwarding::propagate_forwarded_return_types(&mut functions);
 
+    // PROJECT.md M18.3/M19: a real Ghidra decompiler bug found by hand
+    // (Snake's own self-collision-check loop) generalized into a real
+    // pass -- a declared-but-never-assigned local passed to a
+    // vector-accessor pair the rest of the program reaches through a
+    // known field offset off some other in-scope object. Must run before
+    // call sites are rewritten against the whole-program symbol table
+    // (same reasoning as `propagate_forwarded_return_types` above): this
+    // pass's own cross-function evidence-gathering matches call sites by
+    // their raw `FUN_<addr>` text.
+    crate::phantom_local::generalize_phantom_local_aliases(&mut functions);
+
     // PROJECT.md M18: a real compile found a genuinely surprising
     // self-rewrite -- `rewrite_call_sites` used to run on the *whole*
     // decompilation text, header included, and a method's own signature

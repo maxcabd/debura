@@ -88,8 +88,10 @@ pub(crate) fn matching_close(text: &str, open: usize, open_ch: u8, close_ch: u8)
 /// Splits `s` on its own top-level commas (parens/brackets balanced) --
 /// no string-literal handling, unlike `symtab.rs`'s own `split_args`:
 /// neither a declared parameter list nor this module's own narrow,
-/// identifier/literal-only argument shapes ever contain one.
-fn split_top_level_comma(s: &str) -> Vec<&str> {
+/// identifier/literal-only argument shapes ever contain one. `pub(crate)`:
+/// `phantom_local.rs` needs the exact same top-level comma splitting for
+/// its own call-argument scanning.
+pub(crate) fn split_top_level_comma(s: &str) -> Vec<&str> {
     let mut parts = Vec::new();
     let mut depth = 0i32;
     let mut start = 0usize;
@@ -218,7 +220,9 @@ fn is_pure_throw_guard(inner: &str) -> bool {
         })
 }
 
-fn parse_param_names(signature: &str) -> Option<Vec<String>> {
+/// `pub(crate)`: `phantom_local.rs` needs the same declared-parameter-name
+/// extraction from a raw signature line.
+pub(crate) fn parse_param_names(signature: &str) -> Option<Vec<String>> {
     let open = signature.find('(')?;
     let close = matching_close(signature, open, b'(', b')')?;
     let params = signature[open + 1..close].trim();
@@ -233,7 +237,9 @@ fn parse_param_names(signature: &str) -> Option<Vec<String>> {
         .collect()
 }
 
-fn parse_int_literal(s: &str) -> Option<u64> {
+/// `pub(crate)`: `phantom_local.rs` needs the same hex/decimal literal
+/// parsing for offset constants.
+pub(crate) fn parse_int_literal(s: &str) -> Option<u64> {
     match s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
         Some(hex) => u64::from_str_radix(hex, 16).ok(),
         None => s.parse::<u64>().ok(),
