@@ -43,6 +43,17 @@ pub(crate) fn patch_known_idioms(text: &str) -> String {
     // in the call syntax tells them apart, so it has to be routed by
     // argument, not blindly. See `patch_ostream_operator_shift` below.
     let text = patch_ostream_operator_shift(&text);
+    // PROJECT.md M20 (cross-program generalization): a second, unrelated
+    // binary compiled with a different optimization level inlined
+    // `std::endl`'s own body (`flush(os.put(os.widen('\n')))`) directly
+    // at every call site instead of leaving a call to `std::endl<char,
+    // ...>` the way the idiom `patch_ostream_operator_shift` above
+    // handles was built against. Must run before the qualified-member-
+    // call fixes below, which would otherwise try (and fail, since
+    // `put`/`flush`'s own receiver is collapsed away here) to route
+    // these through the generic path instead.
+    let text = patch_inlined_stream_endl(&text);
+    let text = strip_widen_init_guards(&text);
     // Ghidra's decompiler occasionally names a local variable holding an
     // intermediate value literally `this` -- unrelated to the enclosing
     // function's own implicit `this`, but a hard conflict regardless,
@@ -196,6 +207,252 @@ fn patch_ostream_operator_shift(text: &str) -> String {
     }
     out.push_str(rest);
     out
+}
+
+/// libstdc++'s real `std::endl` is exactly `flush(os.put(os.widen('\n')))`.
+/// A real second binary's build inlined that body directly at every call
+/// site instead of leaving a call to `std::endl<char,...>` itself (the
+/// shape `patch_ostream_operator_shift` above recognizes). Ghidra's
+/// decompiled `put` call shows only ONE argument where the real ABI
+/// needs two (receiver, char value) -- ghidra collapsed them, losing
+/// the real char value in the process, since there's nowhere left for
+/// it. That collapse -- `put` called with exactly one argument,
+/// immediately followed by a bare, argument-less `flush()` -- is
+/// `std::endl`'s own specific shape and nothing else's (an ordinary
+/// `os.put(c)` not immediately flushed is left untouched, still a
+/// normal two-argument call once `basic_ostream` is also registered
+/// with `fix_qualified_member_calls`), so this recognizes the semantic
+/// sequence -- not the exact three statements by their literal text --
+/// and still matches it across whatever temporaries/variable names a
+/// different compile assigns.
+///
+/// The real output character is unrecoverable from a decompilation this
+/// corrupted either way -- Ghidra never captured it -- but rewriting to
+/// a real `debura_stream_endl` call, using `put`'s own one surviving
+/// argument as the real receiver (after stripping Ghidra's own wrong
+/// `(char)`-shaped cast on it), reconstructs it correctly rather than
+/// guessing: `'\n'` is the one character `std::endl` always writes,
+/// exactly what the real `<<` operator inside `debura_stream_endl`
+/// writes too.
+fn patch_inlined_stream_endl(text: &str) -> String {
+    let put_prefix = "std::basic_ostream<char,std::char_traits<char>>::put(";
+    let flush_prefix = "std::basic_ostream<char,std::char_traits<char>>::flush(";
+    if !text.contains(put_prefix) {
+        return text.to_string();
+    }
+
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(pos) = rest.find(put_prefix) {
+        out.push_str(&rest[..pos]);
+        let after_open = &rest[pos + put_prefix.len()..];
+        let Some(close) = find_matching_close_paren(after_open) else {
+            out.push_str(put_prefix);
+            rest = after_open;
+            continue;
+        };
+        let put_args = after_open[..close].trim();
+        let after_put_call = &after_open[close + 1..];
+        let (first_arg, second_arg) = split_first_arg(put_args);
+
+        let matched = (|| {
+            if first_arg.is_empty() || !second_arg.is_empty() {
+                return None;
+            }
+            let receiver = resolve_receiver_alias(text, strip_leading_cast(first_arg));
+            let after_semi = after_put_call.trim_start().strip_prefix(';')?;
+            let trimmed = after_semi.trim_start();
+            // A real case had a plain, unassigned `flush();` immediately
+            // followed by an `if (... != ...)` -- searching `trimmed`
+            // for `=` unbounded found the `=` inside that *later*
+            // `!=`, mistaking everything up to it for a (nonsense)
+            // assignment target and missing the real flush() call
+            // entirely. Bounded to this one statement's own terminating
+            // `;` -- correct either way, since an assigned flush's own
+            // call+semicolon always sits within its own one statement
+            // too -- and excludes `==`/`!=`/`<=`/`>=` by checking the
+            // character *before* `=` as well as after.
+            let stmt_end = trimmed.find(';').unwrap_or(trimmed.len());
+            let stmt = &trimmed[..stmt_end];
+            let eq_pos = stmt.as_bytes().iter().enumerate().position(|(i, &b)| {
+                b == b'='
+                    && stmt.as_bytes().get(i + 1) != Some(&b'=')
+                    && !matches!(i.checked_sub(1).and_then(|j| stmt.as_bytes().get(j)), Some(b'=' | b'!' | b'<' | b'>'))
+            });
+            let (assign_target, after_assign) = match eq_pos {
+                Some(eq) if !stmt[..eq].trim().is_empty() => (Some(stmt[..eq].trim()), &trimmed[eq + 1..]),
+                _ => (None, trimmed),
+            };
+            let after_cast = strip_leading_cast(after_assign.trim_start());
+            let after_flush_prefix = after_cast.strip_prefix(flush_prefix)?;
+            let flush_close = find_matching_close_paren(after_flush_prefix)?;
+            if !after_flush_prefix[..flush_close].trim().is_empty() {
+                // A real argument on flush() is a different, already
+                // well-formed shape -- not this collapsed idiom.
+                return None;
+            }
+            let after_flush_call = &after_flush_prefix[flush_close + 1..];
+            let after_flush_semi = after_flush_call.trim_start().strip_prefix(';')?;
+            Some((assign_target, receiver, after_flush_semi))
+        })();
+
+        match matched {
+            Some((assign_target, receiver, remainder)) => {
+                if let Some(target) = assign_target {
+                    out.push_str(target);
+                    out.push_str(" = ");
+                }
+                out.push_str("debura_stream_endl(");
+                out.push_str(receiver);
+                out.push_str(");");
+                rest = remainder;
+            }
+            None => {
+                out.push_str(put_prefix);
+                rest = after_open;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// A real case had Ghidra apply the exact same wrong `(char)` cast on
+/// the real receiver one step *earlier*, through a separate assignment
+/// (`cVar6 = (char)PTR_PTR_cout_140008df0;`), instead of inline at the
+/// `put()` call site itself (`put((char)puVar1)`, the shape
+/// `strip_leading_cast` alone already handles) -- `put`'s own visible
+/// argument was then just the already-mis-cast local's bare name, with
+/// no cast left to see at the call site at all. Left unresolved, this
+/// silently emitted *wrong*, still-compiling code (`debura_stream_endl
+/// (cVar6)`, streaming a `char` value where a stream pointer belongs) --
+/// worse than a visible compile error. Recognizes that one-hop-removed
+/// shape too: if `name` is itself assigned from exactly one `(TYPE)EXPR`
+/// cast anywhere earlier in the function, the real receiver is `EXPR`,
+/// not `name` -- `name`'s own real declared type is never a real stream
+/// pointer when this shape applies (`char` is exactly what's cast to
+/// here), so trusting it literally would misidentify the receiver
+/// entirely rather than merely fail to find one.
+fn resolve_receiver_alias<'a>(text: &'a str, name: &'a str) -> &'a str {
+    let needle = format!("{name} = (");
+    let Some(pos) = text.find(&needle) else { return name };
+    let after_open = &text[pos + needle.len()..];
+    let Some(close) = after_open.find(')') else { return name };
+    let inside = after_open[..close].trim();
+    if inside.is_empty() || !inside.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ' ' || c == '*') {
+        return name; // not a bare-type cast -- leave `name` as-is
+    }
+    let after_cast = after_open[close + 1..].trim_start();
+    let Some(semi) = after_cast.find(';') else { return name };
+    let expr = after_cast[..semi].trim();
+    if expr.is_empty() {
+        name
+    } else {
+        expr
+    }
+}
+
+/// Strips one leading `(TYPE)`-shaped cast from `expr`, if present --
+/// distinguished from a parenthesized sub-expression (`(a + b)`) by
+/// requiring everything inside the parens to look like a type name
+/// (identifier/whitespace/`*` characters only, never an operator).
+fn strip_leading_cast(expr: &str) -> &str {
+    let expr = expr.trim();
+    let Some(rest) = expr.strip_prefix('(') else { return expr };
+    let Some(close) = rest.find(')') else { return expr };
+    let inside = rest[..close].trim();
+    if inside.is_empty() || !inside.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ' ' || c == '*') {
+        return expr;
+    }
+    rest[close + 1..].trim()
+}
+
+/// libstdc++'s ostream sentry construction guards a one-time locale-
+/// facet-cache population (`ctype<char>::_M_widen_init`) behind a
+/// cached-flag check -- real, but entirely redundant once a call site is
+/// rewritten to go through a real `<<`/`debura_stream_endl` call instead
+/// (both perform this exact same sentry/widen work themselves,
+/// correctly, every time they run). `_M_widen_init()` is also always
+/// uncompilable exactly as decompiled -- Ghidra drops its receiver, the
+/// same collapse `put` suffers in `patch_inlined_stream_endl` above --
+/// so leaving the guard in place isn't a safe, inert no-op either way;
+/// removing the whole block is required, not just an optimization.
+/// `_M_widen_init` is libstdc++-internal (never called directly by real
+/// user code), so any occurrence found this way is safe to assume is
+/// exactly this sentry idiom, regardless of which specific stream call
+/// originally followed it or whether `patch_inlined_stream_endl` already
+/// rewrote that part.
+fn strip_widen_init_guards(text: &str) -> String {
+    let marker = "ctype<char>::_M_widen_init(";
+    if !text.contains(marker) {
+        return text.to_string();
+    }
+
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    'outer: loop {
+        let mut search_from = 0usize;
+        loop {
+            let Some(if_rel) = rest[search_from..].find("if") else {
+                break 'outer;
+            };
+            let if_pos = search_from + if_rel;
+            let preceded_by_word = rest[..if_pos].as_bytes().last().is_some_and(|&b| b.is_ascii_alphanumeric() || b == b'_');
+            let after_kw = &rest[if_pos + 2..];
+            let after_ws = after_kw.trim_start();
+            if preceded_by_word || !after_ws.starts_with('(') {
+                search_from = if_pos + 2;
+                continue;
+            }
+            let cond_open = if_pos + 2 + (after_kw.len() - after_ws.len());
+            let Some(cond_close_off) = find_matching_close_paren(&rest[cond_open + 1..]) else {
+                search_from = if_pos + 2;
+                continue;
+            };
+            let after_cond = &rest[cond_open + 1 + cond_close_off + 1..];
+            let after_cond_ws = after_cond.trim_start();
+            if !after_cond_ws.starts_with('{') {
+                search_from = if_pos + 2;
+                continue;
+            }
+            let brace_open = cond_open + 1 + cond_close_off + 1 + (after_cond.len() - after_cond_ws.len());
+            let Some(brace_close_off) = find_matching_close_brace(&rest[brace_open + 1..]) else {
+                search_from = if_pos + 2;
+                continue;
+            };
+            let block_end = brace_open + 1 + brace_close_off + 1;
+            let body = &rest[brace_open + 1..brace_open + 1 + brace_close_off];
+            if !body.contains(marker) {
+                search_from = if_pos + 2;
+                continue;
+            }
+            out.push_str(&rest[..if_pos]);
+            rest = &rest[block_end..];
+            continue 'outer;
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// `find_matching_close_paren`'s own brace-matching twin -- assumes the
+/// opening `{` has already been consumed, same as that function assumes
+/// for `(`.
+fn find_matching_close_brace(text: &str) -> Option<usize> {
+    let mut depth = 1;
+    for (i, c) in text.char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// STL methods that return a non-trivial type by value, keyed by the
@@ -365,11 +622,21 @@ fn fix_qualified_member_calls(text: &str, qualified_type: &str, decl_type: &str,
         let (mut receiver, remaining_args) = split_first_arg(args_text);
         if receiver.is_empty() {
             let decl_matches: Vec<&str> = find_declared_local_names(text, &decl_needle);
-            match decl_matches.as_slice() {
-                [name] => {
-                    receiver = name;
+            let resolved = match decl_matches.as_slice() {
+                [] => None,
+                [name] => Some(*name),
+                many => {
+                    // `text` is the whole function body `rest` is always
+                    // sliced from, so pointer offsets from it give this
+                    // call's real byte position for the proximity search
+                    // below.
+                    let call_pos = (rest.as_ptr() as usize - text.as_ptr() as usize) + pos;
+                    nearest_receiver_before(text, call_pos, many)
                 }
-                _ => {
+            };
+            match resolved {
+                Some(name) => receiver = name,
+                None => {
                     out.push_str(&prefix);
                     rest = after_prefix;
                     continue;
@@ -620,6 +887,68 @@ fn find_declared_local_names<'a>(text: &'a str, decl_needle: &str) -> Vec<&'a st
     names
 }
 
+/// PROJECT.md M20 (cross-program generalization: a real second binary,
+/// heavier on locally-declared `std::string`s per function than the one
+/// this whole file was first built against, had several functions where
+/// more than one same-typed local made `fix_qualified_member_calls`'s
+/// receiverless-call case above give up outright). Picks whichever
+/// candidate's *nearest* prior mention (a declaration, an argument, or
+/// already being some other call's own resolved receiver -- any real
+/// occurrence of its name at all, textually) sits closest before the
+/// call site, on the reasoning that Ghidra's decompiled bodies stay
+/// close to real control-flow order, so "most recently touched
+/// matching-typed local" is a real, if approximate, stand-in for "still
+/// live and actually in scope here" -- the closest this text-level pass
+/// can get to real dataflow/liveness without becoming a real compiler.
+/// Only trusted when the nearest candidate is unambiguously closer than
+/// every other one by at least `NEARBY_MARGIN` bytes -- a genuine tie,
+/// or two candidates close enough together to plausibly be either, is
+/// left unresolved rather than guessed (the same "more than one
+/// candidate, no way to tell" outcome the old exactly-one-local rule
+/// already had for these), so a wrong guess never silently compiles;
+/// the next real compile's own error is what drives a later pass
+/// instead.
+fn nearest_receiver_before<'a>(text: &str, call_pos: usize, candidates: &[&'a str]) -> Option<&'a str> {
+    const NEARBY_MARGIN: usize = 40;
+    let before = &text[..call_pos];
+    let mut distances: Vec<(usize, &str)> = candidates
+        .iter()
+        .filter_map(|&name| nearest_whole_word_distance(before, name).map(|d| (d, name)))
+        .collect();
+    distances.sort_by_key(|(distance, _)| *distance);
+    match distances.as_slice() {
+        [] => None,
+        [(_, only)] => Some(only),
+        [(best_distance, best_name), (second_distance, _), ..] => {
+            (*second_distance >= best_distance + NEARBY_MARGIN).then_some(*best_name)
+        }
+    }
+}
+
+/// Byte distance from the end of the *last* whole-word occurrence of
+/// `name` in `before` to the end of `before` -- `None` if `name` never
+/// appears. Whole-word only, so a candidate named `os` doesn't spuriously
+/// match inside an unrelated `cost`/`post`.
+fn nearest_whole_word_distance(before: &str, name: &str) -> Option<usize> {
+    fn is_word_byte(b: u8) -> bool {
+        b.is_ascii_alphanumeric() || b == b'_'
+    }
+
+    let mut last_end = None;
+    let mut search_from = 0usize;
+    while let Some(rel) = before[search_from..].find(name) {
+        let pos = search_from + rel;
+        let end = pos + name.len();
+        let starts_word = before.as_bytes().get(pos.wrapping_sub(1)).is_some_and(|&b| is_word_byte(b));
+        let ends_word = before.as_bytes().get(end).is_some_and(|&b| is_word_byte(b));
+        if !starts_word && !ends_word {
+            last_end = Some(end);
+        }
+        search_from = pos + 1;
+    }
+    last_end.map(|end| before.len() - end)
+}
+
 /// Replaces every whole-word occurrence of `word` with `replacement` --
 /// unlike a plain substring replace, doesn't also match `word` as part of
 /// a longer identifier.
@@ -684,12 +1013,28 @@ mod idiom_tests {
         assert!(!patched.contains("::~basic_string("), "{patched}");
     }
 
-    /// Guessing wrong is worse than a visible compile error: with two
-    /// candidate locals, a missing `c_str()` receiver is left alone
-    /// rather than picking one arbitrarily.
+    /// PROJECT.md M20 (cross-program generalization): with two candidate
+    /// locals, the old rule gave up outright. `local_58`'s own
+    /// declaration sits unambiguously closer (textually) to the call
+    /// than `local_38`'s does, so `nearest_receiver_before` resolves it
+    /// with real confidence instead of leaving a real error unfixed.
     #[test]
-    fn a_bare_c_str_call_is_left_alone_when_more_than_one_basic_string_local_exists() {
+    fn a_bare_c_str_call_resolves_to_the_nearer_of_two_basic_string_locals() {
         let text = "basic_string<char,std::char_traits<char>,std::allocator<char>> local_38 [40]; basic_string<char,std::char_traits<char>,std::allocator<char>> local_58 [40]; uVar1 = std::__cxx11::basic_string<char,std::char_traits<char>,std::allocator<char>>::c_str();";
+        let patched = patch_known_idioms(text);
+        assert!(patched.contains("local_58->c_str()"), "{patched}");
+        assert!(!patched.contains("local_38->c_str()"), "{patched}");
+    }
+
+    /// Guessing wrong is worse than a visible compile error: when two
+    /// candidates are genuinely close together (here, referenced right
+    /// next to each other immediately before the ambiguous call), neither
+    /// is confidently nearer -- left unresolved rather than picking one
+    /// arbitrarily, exactly like the old exactly-one-local rule already
+    /// did for every multi-candidate case.
+    #[test]
+    fn a_bare_c_str_call_is_left_alone_when_two_candidates_are_equally_close() {
+        let text = "basic_string<char,std::char_traits<char>,std::allocator<char>> local_38 [40];\nbasic_string<char,std::char_traits<char>,std::allocator<char>> local_58 [40];\nfoo(local_38, local_58);\nuVar1 = std::__cxx11::basic_string<char,std::char_traits<char>,std::allocator<char>>::c_str();";
         let patched = patch_known_idioms(text);
         assert!(patched.contains("::c_str();"), "{patched}");
     }
@@ -942,6 +1287,90 @@ mod idiom_tests {
     fn an_assignment_from_a_genuine_this_is_not_mistaken_for_a_declaration() {
         let text = "basic_ostream *pbVar1;\npbVar1 = this;\n";
         assert_eq!(patch_known_idioms(text), text);
+    }
+
+    /// PROJECT.md M20: the real, confirmed shape from a second, unrelated
+    /// binary -- `std::endl` inlined at the call site instead of left as
+    /// a call to `std::endl<char,...>` (the shape the tests above cover).
+    /// `put`'s own collapsed one-argument call is the real receiver;
+    /// `flush`'s result assignment and cast must survive the rewrite
+    /// unchanged, and the whole preceding widen-init sentry guard (a
+    /// separate pass, `strip_widen_init_guards`) is dropped too.
+    #[test]
+    fn an_inlined_endl_sequence_becomes_a_single_debura_stream_endl_call() {
+        let text = "if (*(char *)(plVar7 + 7) == '\\0') {\n\
+      std::ctype<char>::_M_widen_init();\n\
+      if (*(code **)(*plVar7 + 0x30) != (code *)&LAB_140004e00) {\n\
+        (**(code **)(*plVar7 + 0x30))(plVar7,10);\n\
+      }\n\
+    }\n\
+    std::basic_ostream<char,std::char_traits<char>>::put((char)puVar4);\n\
+    pbVar6 = (basic_ostream *)std::basic_ostream<char,std::char_traits<char>>::flush();\n";
+        let patched = patch_known_idioms(text);
+        assert!(patched.contains("pbVar6 = debura_stream_endl(puVar4);"), "{patched}");
+        assert!(!patched.contains("_M_widen_init"), "{patched}");
+        assert!(!patched.contains("::put("), "{patched}");
+        assert!(!patched.contains("::flush("), "{patched}");
+    }
+
+    /// An ordinary `put(c)` NOT immediately followed by `flush()` is a
+    /// real, different call -- once `basic_ostream` is registered with
+    /// `fix_qualified_member_calls`, this stays a normal two-argument
+    /// member call, never mistaken for the collapsed `std::endl` idiom.
+    #[test]
+    fn a_put_call_not_immediately_flushed_is_left_for_the_generic_path() {
+        let text = "std::basic_ostream<char,std::char_traits<char>>::put(pbVar1,c);\ndoSomethingElse();\n";
+        assert_eq!(patch_known_idioms(text), text);
+    }
+
+    /// PROJECT.md M20: the real, confirmed bug this whole rewrite almost
+    /// shipped -- a real case had Ghidra apply `put`'s own wrong `(char)`
+    /// cast one statement *earlier*, via a separate assignment
+    /// (`cVar6 = (char)puVar1;`), rather than inline at the call site.
+    /// Trusting `put`'s bare `cVar6` argument literally would silently
+    /// rewrite to `debura_stream_endl(cVar6)` -- streaming a genuinely
+    /// `char`-typed value where a stream pointer belongs, which still
+    /// compiles (implicit `char` -> pointer isn't allowed, so this would
+    /// actually fail differently in a real case, but the *principle* --
+    /// trusting an already-mis-cast alias instead of tracing through it
+    /// -- is what a real run caught: wrong code that still runs is worse
+    /// than a compile error). Must resolve through the assignment to the
+    /// real `puVar1` receiver instead.
+    #[test]
+    fn a_put_receiver_aliased_through_an_earlier_cast_assignment_is_traced_through() {
+        let text = "cVar6 = (char)puVar1;\nstd::basic_ostream<char,std::char_traits<char>>::put(cVar6);\nstd::basic_ostream<char,std::char_traits<char>>::flush();\n";
+        let patched = patch_known_idioms(text);
+        assert!(patched.contains("debura_stream_endl(puVar1)"), "{patched}");
+        assert!(!patched.contains("debura_stream_endl(cVar6)"), "{patched}");
+    }
+
+    /// PROJECT.md M20: a real case had a plain, unassigned `flush();`
+    /// immediately followed by an `if (... != 'H')` -- searching
+    /// unbounded past the statement for an assignment operator found the
+    /// `=` inside that *later* `!=` first, mistaking a huge, nonsense
+    /// span for an assignment target and missing the real flush() call
+    /// (and therefore the whole idiom) entirely. Must stay bounded to
+    /// the one statement actually being checked.
+    #[test]
+    fn an_unassigned_flush_followed_by_a_not_equal_comparison_still_matches() {
+        let text = "std::basic_ostream<char,std::char_traits<char>>::put(puVar1);\nstd::basic_ostream<char,std::char_traits<char>>::flush();\nif (*param_3 != 'H') {\n  *param_3 = 'H';\n}\n";
+        let patched = patch_known_idioms(text);
+        assert!(patched.contains("debura_stream_endl(puVar1);"), "{patched}");
+        assert!(patched.contains("if (*param_3 != 'H')"), "{patched}");
+        assert!(!patched.contains("::flush("), "{patched}");
+    }
+
+    /// A widen-init guard is dropped wherever it appears, independent of
+    /// whether the stream call right after it was itself rewritten --
+    /// its own real purpose (populating a locale-facet cache) is fully
+    /// subsumed by whatever real `<<`/`debura_stream_endl` call follows,
+    /// and `_M_widen_init()` is uncompilable as decompiled either way.
+    #[test]
+    fn a_widen_init_guard_with_no_following_stream_call_is_still_dropped() {
+        let text = "if (*(char *)(plVar7 + 7) == '\\0') {\n\
+      std::ctype<char>::_M_widen_init();\n\
+    }\nnoop();\n";
+        assert_eq!(patch_known_idioms(text), "\nnoop();\n");
     }
 }
 
