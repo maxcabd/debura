@@ -36,6 +36,23 @@ fn make_provider(choice: ProviderChoice) -> Result<Box<dyn AgentProvider + Sync>
     })
 }
 
+#[derive(Clone, Copy, ValueEnum)]
+enum NamesChoice {
+    Mechanical,
+    Semantic,
+    Mixed,
+}
+
+impl From<NamesChoice> for debura_recovery::NamesMode {
+    fn from(choice: NamesChoice) -> Self {
+        match choice {
+            NamesChoice::Mechanical => debura_recovery::NamesMode::Mechanical,
+            NamesChoice::Semantic => debura_recovery::NamesMode::Semantic,
+            NamesChoice::Mixed => debura_recovery::NamesMode::Mixed,
+        }
+    }
+}
+
 #[derive(Subcommand)]
 enum Command {
     /// Create a new Debura project from a binary
@@ -111,6 +128,33 @@ enum Command {
         /// unchanged.
         #[arg(long)]
         linker_log: Option<PathBuf>,
+        /// How accepted field names (PROJECT.md, "Field-level semantic
+        /// naming") render: `mechanical` never looks at the graph, every
+        /// field stays exactly as `stack_object.rs` rendered it;
+        /// `semantic`/`mixed` (the default) use an accepted name
+        /// wherever one exists, falling back to the mechanical form
+        /// otherwise -- never inventing a name that hasn't cleared the
+        /// same evidence/challenge bar every other accepted hypothesis
+        /// clears.
+        #[arg(long, value_enum, default_value_t = NamesChoice::Mixed)]
+        names: NamesChoice,
+    },
+    /// Proposes and verifies semantic names for stack-object fields
+    /// `debura recover` already discovered evidence for (PROJECT.md,
+    /// "Field-level semantic naming") -- run only after a recovery is
+    /// confirmed to build+link+run; static evidence only (the field's
+    /// defining function decompilation, its call graph, and sibling
+    /// fields already discovered on the same object). Skips any field
+    /// that already has an ACCEPTED name. A later `--dynamic` tier
+    /// (runtime value-transition evidence) is not implemented yet.
+    Semantic {
+        /// Project id, as printed by `debura new`
+        project: String,
+        /// Use only static evidence -- the only mode implemented so far.
+        /// Required explicitly so a future `--dynamic` addition is an
+        /// opt-in choice, not a silent default change.
+        #[arg(long = "static")]
+        static_pass: bool,
     },
     /// Classify a real linker's undefined-symbol output into the
     /// concrete recovery frontier (PROJECT.md M18): which unresolved
@@ -527,15 +571,19 @@ fn main() -> Result<()> {
                 println!("Nothing to apply or revert.");
             }
         }
-        Command::Recover { project, linker_log } => {
+        Command::Recover { project, linker_log, names } => {
             let root = debura_core::config::projects_dir().join(&project);
             anyhow::ensure!(root.is_dir(), "no such project: {project}");
+            let names_mode: debura_recovery::NamesMode = names.into();
 
             let conn = debura_storage::init_project_db(&root.join("project.sqlite"))?;
             let graph = debura_storage::knowledge::load(&conn)?;
 
             let (program, runtime_bodies_recovered) = match linker_log {
-                None => (debura_recovery::extract(&graph), 0usize),
+                None => (
+                    debura_recovery::extract_with_options(&graph, &std::collections::BTreeSet::new(), None, names_mode),
+                    0usize,
+                ),
                 Some(linker_log) => {
                     let entry = graph
                         .observations()
@@ -574,10 +622,11 @@ fn main() -> Result<()> {
                         .collect();
                     let entry_wrapper_symbol = literal_names.contains(&"SDL_main").then_some("SDL_main");
                     (
-                        debura_recovery::extract_with_required_runtime_bodies(
+                        debura_recovery::extract_with_options(
                             &graph,
                             &required_runtime_bodies,
                             entry_wrapper_symbol,
+                            names_mode,
                         ),
                         count,
                     )
@@ -595,6 +644,89 @@ fn main() -> Result<()> {
                 println!("  (exposing {target} as {symbol})");
             }
             println!("Written to: {}", root.join("recovered").display());
+        }
+        Command::Semantic { project, static_pass } => {
+            anyhow::ensure!(static_pass, "pass --static -- it's the only mode implemented so far");
+            let root = debura_core::config::projects_dir().join(&project);
+            anyhow::ensure!(root.is_dir(), "no such project: {project}");
+            let provider = make_provider(cli.provider)?;
+            let policy = debura_verifier::VerificationPolicy::default();
+
+            let conn = debura_storage::init_project_db(&root.join("project.sqlite"))?;
+            let mut graph = debura_storage::knowledge::load(&conn)?;
+
+            let program = debura_recovery::extract(&graph);
+            let functions_by_raw_name: std::collections::HashMap<&str, &debura_recovery::RecoveredFunction> =
+                program.functions.iter().map(|f| (f.raw_name.as_str(), f)).collect();
+
+            let (mut proposed, mut accepted, mut skipped_existing, mut skipped_no_function) = (0u32, 0u32, 0u32, 0u32);
+
+            for field in &program.discovered_fields {
+                let already_named = graph.hypotheses().any(|h| {
+                    h.subject == field.subject
+                        && h.predicate == "field_semantic_name"
+                        && h.status == debura_knowledge::HypothesisStatus::Accepted
+                });
+                if already_named {
+                    skipped_existing += 1;
+                    continue;
+                }
+                let Some(function) = functions_by_raw_name.get(field.function_raw_name.as_str()) else {
+                    skipped_no_function += 1;
+                    continue;
+                };
+
+                let sibling_fields: Vec<String> = program
+                    .discovered_fields
+                    .iter()
+                    .filter(|other| {
+                        other.function_raw_name == field.function_raw_name
+                            && other.base == field.base
+                            && other.offset != field.offset
+                    })
+                    .map(|other| format!("offset 0x{:x}, width {}, type {}", other.offset, other.width, other.declared_type))
+                    .collect();
+
+                let task = debura_agent::ProposeFieldNameTask::build(
+                    &graph,
+                    &field.subject,
+                    &function.address,
+                    &function.display_name,
+                    &function.decompilation,
+                    &field.base,
+                    field.offset,
+                    field.width,
+                    &field.declared_type,
+                    sibling_fields,
+                );
+
+                let result = provider.propose_field_name(&task)?;
+                for hypothesis in &result.hypotheses {
+                    if hypothesis.predicate != "field_semantic_name" {
+                        continue;
+                    }
+                    proposed += 1;
+                    let id = debura_agent::commit_hypothesis(&mut graph, &field.subject, hypothesis, None);
+                    debura_verifier::challenge_hypothesis(&mut graph, provider.as_ref(), id, &policy)?;
+                    if graph.hypothesis(id).map(|h| h.status) == Some(debura_knowledge::HypothesisStatus::Contested) {
+                        debura_verifier::resolve_contradiction(&mut graph, provider.as_ref(), id, &policy)?;
+                    }
+                    if let Some(h) = graph.hypothesis(id) {
+                        println!("{}: {} = {} ({:?})", field.subject, h.value, h.confidence, h.status);
+                        if h.status == debura_knowledge::HypothesisStatus::Accepted {
+                            accepted += 1;
+                        }
+                    }
+                }
+            }
+
+            debura_storage::knowledge::save(&conn, &graph)?;
+
+            println!("\nFields considered:      {}", program.discovered_fields.len());
+            println!("Already named:          {skipped_existing}");
+            println!("No recovered function:  {skipped_no_function}");
+            println!("Proposed this run:      {proposed}");
+            println!("Accepted this run:      {accepted}");
         }
         Command::Frontier { project, linker_log } => {
             let root = debura_core::config::projects_dir().join(&project);
