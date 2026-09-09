@@ -793,8 +793,15 @@ fn main() -> Result<()> {
                             && h.status == debura_knowledge::HypothesisStatus::Accepted
                     })
                     .max_by_key(|h| h.id.0)
-                    .map(|h| h.value.clone());
+                    .map(|h| (h.value.clone(), h.id));
 
+                // (role concept, the role hypothesis's own id -- carried
+                // through so the naming stage below can record a real
+                // DependsOn edge onto it, not just reuse its text) so that
+                // if this role is ever later invalidated, truth
+                // maintenance cascades the dependent name to Stale
+                // automatically instead of leaving it accepted on a
+                // premise that no longer holds.
                 let role = match accepted_role {
                     Some(role) => Some(role),
                     None => {
@@ -828,7 +835,8 @@ fn main() -> Result<()> {
                                     confidence,
                                     depends_on: Vec::new(),
                                 };
-                                let id = debura_agent::commit_hypothesis(&mut graph, &field.subject, &hypothesis, None);
+                                let role_id = debura_agent::commit_hypothesis(&mut graph, &field.subject, &hypothesis, None);
+                                let id = role_id;
                                 // PROJECT.md, "Predicate-aware challenge": a
                                 // field's semantic *role* has no caller/API
                                 // context to speak of -- it's not a
@@ -850,7 +858,7 @@ fn main() -> Result<()> {
                                 println!("{} (role): {} = {:.2} ({:?})", field.subject, hypothesis.value, confidence, status);
                                 if status == Some(debura_knowledge::HypothesisStatus::Accepted) {
                                     roles_accepted += 1;
-                                    Some(hypothesis.value)
+                                    Some((hypothesis.value, role_id))
                                 } else {
                                     None
                                 }
@@ -858,7 +866,7 @@ fn main() -> Result<()> {
                         }
                     }
                 };
-                let Some(role) = role else {
+                let Some((role, role_id)) = role else {
                     // No accepted role yet this run -- naming would have
                     // nothing real to spell, so it doesn't run at all.
                     continue;
@@ -889,7 +897,14 @@ fn main() -> Result<()> {
                         continue;
                     }
                     names_proposed += 1;
-                    let id = debura_agent::commit_hypothesis(&mut graph, &field.subject, hypothesis, None);
+                    // Depends on the accepted role hypothesis, not just its
+                    // text -- so if that role is later invalidated, this
+                    // name cascades to Stale through the graph's own
+                    // dependency-based truth maintenance rather than being
+                    // left ACCEPTED on a premise that no longer holds.
+                    let mut hypothesis = hypothesis.clone();
+                    hypothesis.depends_on = vec![role_id];
+                    let id = debura_agent::commit_hypothesis(&mut graph, &field.subject, &hypothesis, None);
                     // PROJECT.md, "Predicate-aware challenge": a proposed
                     // name has an already-ACCEPTED role to be judged
                     // against, not caller/API context -- the same
